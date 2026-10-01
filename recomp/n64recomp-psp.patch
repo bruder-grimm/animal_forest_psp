@@ -1,0 +1,377 @@
+diff --git a/include/recompiler/context.h b/include/recompiler/context.h
+index e7b4431..9cedd25 100644
+--- a/include/recompiler/context.h
++++ b/include/recompiler/context.h
+@@ -142,6 +142,9 @@ namespace N64Recomp {
+         bool unpaired_lo16_warnings;
+         bool all_sections_relocatable;
+         bool use_mdebug;
++        // PSP fork: if non-empty, HI16/LO16 relocs of relocatable sections are rebuilt from the game's own
++        // overlay relocation table found in the section named <section><overlay_reloc_suffix>.
++        std::string overlay_reloc_suffix;
+     };
+     
+     struct DataSymbol {
+diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
+index 94f85c5..f008ed4 100644
+--- a/src/cgenerator.cpp
++++ b/src/cgenerator.cpp
+@@ -395,9 +395,10 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
+ void N64Recomp::CGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
+     (void)func_index;
+     fmt::print(output_file,
+-        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
++        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* RECOMP_RESTRICT ctx) {{\n"
+         // these variables shouldn't need to be preserved across function boundaries, so make them local for more efficient output
+-        "    uint64_t hi = 0, lo = 0, result = 0;\n"
++        // (PSP fork: hi/lo are register-width so 32-bit targets don't carry 64-bit temporaries)
++        "    gpr hi = 0, lo = 0; uint64_t result = 0;\n"
+         "    int c1cs = 0;\n", // cop1 conditional signal
+         function_name);
+ }
+@@ -525,7 +526,8 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
+             break;
+         case InstrId::cpu_div:
+             // Cast to 64-bits before division to prevent artihmetic exception for s32(0x80000000) / -1
+-            fmt::print(output_file, "lo = S32(S64(S32({0})) / S64(S32({1}))); hi = S32(S64(S32({0})) % S64(S32({1})));\n", gpr_to_string(reg1), gpr_to_string(reg2));
++            // PSP fork: DIV32 lets the runtime avoid 64-bit division while keeping the INT_MIN / -1 case defined.
++            fmt::print(output_file, "DIV32(S32({0}), S32({1}), lo, hi);\n", gpr_to_string(reg1), gpr_to_string(reg2));
+             break;
+         case InstrId::cpu_ddiv:
+             fmt::print(output_file, "DDIV(S64({}), S64({}), &lo, &hi);\n", gpr_to_string(reg1), gpr_to_string(reg2));
+diff --git a/src/config.cpp b/src/config.cpp
+index 1066aff..4e792dd 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -360,6 +360,16 @@ N64Recomp::Config::Config(const char* path) {
+             bss_section_suffix = ".bss";
+         }
+ 
++        std::optional<bool> emit_section_relocs_opt = input_data["emit_section_relocs"].value<bool>();
++        if (emit_section_relocs_opt.has_value()) {
++            emit_section_relocs = emit_section_relocs_opt.value();
++        }
++
++        std::optional<std::string> overlay_reloc_suffix_opt = input_data["overlay_reloc_suffix"].value<std::string>();
++        if (overlay_reloc_suffix_opt.has_value()) {
++            overlay_reloc_suffix = overlay_reloc_suffix_opt.value();
++        }
++
+         std::optional<bool> single_file_output_opt = input_data["single_file_output"].value<bool>();
+         if (single_file_output_opt.has_value()) {
+             single_file_output = single_file_output_opt.value();
+@@ -451,6 +461,19 @@ N64Recomp::Config::Config(const char* path) {
+             // Stubs array (optional)
+             stubbed_funcs = get_stubbed_funcs(table);
+ 
++            // Stubbed sections array (optional, PSP fork)
++            const toml::node_view stubbed_sections_data = (*table)["stubbed_sections"];
++            if (stubbed_sections_data.is_array()) {
++                stubbed_sections_data.as_array()->for_each([this](auto&& el) {
++                    if constexpr (toml::is_string<decltype(el)>) {
++                        stubbed_sections.push_back(*el);
++                    }
++                    else {
++                        throw toml::parse_error("Invalid stubbed section", el.source());
++                    }
++                });
++            }
++
+             // Ignored funcs array (optional)
+             ignored_funcs = get_ignored_funcs(table);
+ 
+diff --git a/src/config.h b/src/config.h
+index 7d6db23..2214c8d 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -56,6 +56,12 @@ namespace N64Recomp {
+         std::filesystem::path relocatable_sections_path;
+         std::filesystem::path output_binary_path;
+         std::vector<std::string> stubbed_funcs;
++        // PSP fork: every function in these sections is emitted as an empty stub.
++        std::vector<std::string> stubbed_sections;
++        // PSP fork: suffix of per-overlay relocation table sections (Zelda-style .ovl tables).
++        std::string overlay_reloc_suffix;
++        // PSP fork: whether recomp_overlays.inl carries per-section relocation arrays.
++        bool emit_section_relocs = true;
+         std::vector<std::string> ignored_funcs;
+         std::vector<std::string> renamed_funcs;
+         std::vector<InstructionPatch> instruction_patches;
+diff --git a/src/elf.cpp b/src/elf.cpp
+index 4fbd1ce..42c08c0 100644
+--- a/src/elf.cpp
++++ b/src/elf.cpp
+@@ -354,6 +354,31 @@ ELFIO::section* read_sections(N64Recomp::Context& context, ELFIO::section*& mdeb
+ 
+     // TODO make sure that a reloc section was found for every section marked as relocatable
+ 
++    // PSP fork: vram ranges (text through bss) of relocatable sections. Decomp symbol lists define some
++    // mid-object labels as absolute symbols; relocations against those must still follow the overlay.
++    struct RelocatableRange { uint32_t start; uint32_t end; uint16_t index; };
++    std::vector<RelocatableRange> relocatable_ranges;
++    for (size_t range_section_index = 0; range_section_index < context.sections.size(); range_section_index++) {
++        const N64Recomp::Section& range_section = context.sections[range_section_index];
++        if (!range_section.relocatable || range_section.size == 0) {
++            continue;
++        }
++        uint32_t range_end = range_section.ram_addr + range_section.size;
++        auto range_bss = bss_sections_by_name.find(range_section.name);
++        if (range_bss != bss_sections_by_name.end()) {
++            range_end = std::max(range_end, static_cast<uint32_t>(range_bss->second->get_address() + range_bss->second->get_size()));
++        }
++        relocatable_ranges.push_back({ range_section.ram_addr, range_end, static_cast<uint16_t>(range_section_index) });
++    }
++    auto find_relocatable_range = [&relocatable_ranges](uint32_t vram) -> const RelocatableRange* {
++        for (const auto& range : relocatable_ranges) {
++            if (vram >= range.start && vram < range.end) {
++                return &range;
++            }
++        }
++        return nullptr;
++    };
++
+     // Process bss and reloc sections
+     for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+         N64Recomp::Section& section_out = context.sections[section_index];
+@@ -451,8 +476,16 @@ ELFIO::section* read_sections(N64Recomp::Context& context, ELFIO::section*& mdeb
+                     }
+                     else if (rel_symbol_section_index == ELFIO::SHN_ABS) {
+                         reloc_out.reference_symbol = false;
+-                        reloc_out.target_section = N64Recomp::SectionAbsolute;
+-                        rel_section_vram = 0;
++                        const RelocatableRange* abs_range = find_relocatable_range(static_cast<uint32_t>(rel_symbol_value));
++                        if (abs_range != nullptr) {
++                            // PSP fork: absolute label inside a relocatable section, relocate against that section.
++                            reloc_out.target_section = abs_range->index;
++                            rel_section_vram = context.sections[abs_range->index].ram_addr;
++                        }
++                        else {
++                            reloc_out.target_section = N64Recomp::SectionAbsolute;
++                            rel_section_vram = 0;
++                        }
+                     }
+                     else {
+                         reloc_out.reference_symbol = false;
+@@ -572,6 +605,101 @@ ELFIO::section* read_sections(N64Recomp::Context& context, ELFIO::section*& mdeb
+                 }
+             }
+ 
++            // PSP fork: rebuild HI16/LO16 relocations from the game's own overlay relocation table. Decomp ELFs can miss
++            // pairs in asm-only units or attribute them to unrelated symbols; the table is what the game applies at load
++            // time, so mirroring its pairing rules (per-register HI16 tracking, the 0x0F000000 validity check, relocation
++            // relative to the section's own vram) reproduces the runtime behavior exactly.
++            if (!elf_config.overlay_reloc_suffix.empty() && section_out.relocatable) {
++                const ELFIO::section* table_section = nullptr;
++                const std::string table_name = section_out.name + elf_config.overlay_reloc_suffix;
++                for (const auto& candidate : elf_file.sections) {
++                    if (candidate->get_name() == table_name) {
++                        table_section = candidate.get();
++                        break;
++                    }
++                }
++                if (table_section != nullptr && table_section->get_data() != nullptr && table_section->get_size() >= 20) {
++                    const char* table_data = table_section->get_data();
++                    auto read_be32 = [table_data](size_t offset) -> uint32_t {
++                        return byteswap(*reinterpret_cast<const uint32_t*>(table_data + offset));
++                    };
++                    uint32_t text_size = read_be32(0);
++                    uint32_t data_size = read_be32(4);
++                    uint32_t num_table_relocs = read_be32(16);
++                    uint32_t section_bases[4] = { 0, section_out.ram_addr, section_out.ram_addr + text_size, section_out.ram_addr + text_size + data_size };
++
++                    // Keep every non-HI16/LO16 reloc from the ELF (jal targets etc).
++                    std::vector<N64Recomp::Reloc> kept_relocs;
++                    kept_relocs.reserve(section_out.relocs.size());
++                    for (const auto& reloc : section_out.relocs) {
++                        if (reloc.type != N64Recomp::RelocType::R_MIPS_HI16 && reloc.type != N64Recomp::RelocType::R_MIPS_LO16) {
++                            kept_relocs.push_back(reloc);
++                        }
++                    }
++
++                    std::unordered_map<uint32_t, size_t> hi_reloc_by_address;
++                    uint32_t lui_addresses[32] = {};
++                    uint32_t lui_words[32] = {};
++                    auto read_code_word = [&](uint32_t vram) -> uint32_t {
++                        uint32_t rom_offset = section_out.rom_addr + (vram - section_out.ram_addr);
++                        return byteswap(*reinterpret_cast<const uint32_t*>(context.rom.data() + rom_offset));
++                    };
++
++                    for (uint32_t reloc_i = 0; reloc_i < num_table_relocs && (20 + reloc_i * 4 + 4) <= table_section->get_size(); reloc_i++) {
++                        uint32_t packed = read_be32(20 + reloc_i * 4);
++                        uint32_t section_id = packed >> 30;
++                        uint32_t reloc_kind = (packed >> 24) & 0x3F;
++                        uint32_t address = section_bases[section_id] + (packed & 0xFFFFFF);
++                        if (section_id == 0 || address < section_out.ram_addr || address >= section_out.ram_addr + section_out.size) {
++                            continue;
++                        }
++                        uint32_t word = read_code_word(address);
++                        if (reloc_kind == 5) { // R_MIPS_HI16
++                            uint32_t rt = (word >> 16) & 0x1F;
++                            lui_addresses[rt] = address;
++                            lui_words[rt] = word;
++                        }
++                        else if (reloc_kind == 6) { // R_MIPS_LO16
++                            uint32_t rs = (word >> 21) & 0x1F;
++                            if (lui_addresses[rs] == 0) {
++                                continue;
++                            }
++                            uint32_t value = ((lui_words[rs] & 0xFFFF) << 16) + (int16_t)(word & 0xFFFF);
++                            if ((value & 0x0F000000) != 0) {
++                                continue;
++                            }
++                            uint32_t target_offset = value - section_out.ram_addr;
++
++                            N64Recomp::Reloc lo_reloc{};
++                            lo_reloc.address = address;
++                            lo_reloc.target_section_offset = target_offset;
++                            lo_reloc.symbol_index = (uint32_t)-1;
++                            lo_reloc.target_section = static_cast<uint16_t>(section_index);
++                            lo_reloc.type = N64Recomp::RelocType::R_MIPS_LO16;
++                            lo_reloc.reference_symbol = false;
++                            kept_relocs.push_back(lo_reloc);
++
++                            // The game rewrites the paired LUI on every LO16, so the last pairing wins.
++                            N64Recomp::Reloc hi_reloc = lo_reloc;
++                            hi_reloc.address = lui_addresses[rs];
++                            hi_reloc.type = N64Recomp::RelocType::R_MIPS_HI16;
++                            auto hi_find = hi_reloc_by_address.find(hi_reloc.address);
++                            if (hi_find != hi_reloc_by_address.end()) {
++                                kept_relocs[hi_find->second] = hi_reloc;
++                            }
++                            else {
++                                hi_reloc_by_address.emplace(hi_reloc.address, kept_relocs.size());
++                                kept_relocs.push_back(hi_reloc);
++                            }
++                        }
++                    }
++                    section_out.relocs = std::move(kept_relocs);
++                }
++                else {
++                    fmt::print(stderr, "[PSP] No overlay relocation table {} for {}, using ELF relocations\n", table_name, section_out.name);
++                }
++            }
++
+             // Sort this section's relocs by address, which allows for binary searching and more efficient iteration during recompilation.
+             // This is safe to do as the entire full_immediate in present in relocs due to the pairing that was done earlier, so the HI16 does not
+             // need to directly preceed the matching LO16 anymore.
+diff --git a/src/main.cpp b/src/main.cpp
+index 669c4a1..8c471b1 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -13,6 +13,7 @@
+ #include "recompiler/context.h"
+ #include "config.h"
+ #include <set>
++#include <sstream>
+ 
+ void add_manual_functions(N64Recomp::Context& context, const std::vector<N64Recomp::ManualFunction>& manual_funcs) {
+     auto exit_failure = [](const std::string& error_str) {
+@@ -390,6 +391,7 @@ int main(int argc, char** argv) {
+             .unpaired_lo16_warnings = config.unpaired_lo16_warnings,
+             .all_sections_relocatable = false,
+             .use_mdebug = config.use_mdebug,
++            .overlay_reloc_suffix = config.overlay_reloc_suffix,
+         };
+ 
+         for (const auto& func_size : config.manual_func_sizes) {
+@@ -509,6 +511,19 @@ int main(int argc, char** argv) {
+ 
+     fmt::print("Working dir: {}\n", std::filesystem::current_path().string());
+ 
++    // PSP fork: stub out every function in the configured sections.
++    if (!config.stubbed_sections.empty()) {
++        std::unordered_set<std::string> stubbed_section_names{ config.stubbed_sections.begin(), config.stubbed_sections.end() };
++        size_t stubbed_count = 0;
++        for (auto& func : context.functions) {
++            if (func.section_index < context.sections.size() && stubbed_section_names.contains(context.sections[func.section_index].name)) {
++                func.stubbed = true;
++                stubbed_count++;
++            }
++        }
++        fmt::print("Stubbed {} functions in {} sections\n", stubbed_count, stubbed_section_names.size());
++    }
++
+     // Stub out any functions specified in the config file.
+     for (const std::string& stubbed_func : config.stubbed_funcs) {
+         // Check if the specified function exists.
+@@ -731,6 +746,27 @@ int main(int argc, char** argv) {
+ 
+     std::vector<size_t> export_function_indices{};
+ 
++    // PSP fork: recompile into a buffer so a failing function can be replaced by a runtime-reporting stub
++    // instead of aborting the whole run. Failures are collected into failed_functions.txt.
++    std::vector<std::string> failed_functions{};
++    auto recompile_tolerant = [&](size_t func_index) -> bool {
++        std::ostringstream func_buffer;
++        bool ok = N64Recomp::recompile_function(context, func_index, func_buffer, static_funcs_by_section, false);
++        const auto& cur_func = context.functions[func_index];
++        if (ok) {
++            current_output_file << func_buffer.str();
++        }
++        else {
++            failed_functions.push_back(fmt::format("{} 0x{:08X} {}", cur_func.name, cur_func.vram, context.sections[cur_func.section_index].name));
++            fmt::print(current_output_file,
++                "RECOMP_FUNC void {0}(uint8_t* rdram, recomp_context* RECOMP_RESTRICT ctx) {{\n"
++                "    recomp_unrecompiled(rdram, ctx, \"{0}\", 0x{1:08X});\n"
++                "}}\n",
++                cur_func.name, cur_func.vram);
++        }
++        return true;
++    };
++
+     bool failed_strict_mode = false;
+ 
+     //#pragma omp parallel for
+@@ -770,7 +806,7 @@ int main(int argc, char** argv) {
+ 
+             // Recompile the function.
+             if (config.single_file_output || config.functions_per_output_file > 1) {
+-                result = N64Recomp::recompile_function(context, i, current_output_file, static_funcs_by_section, false);
++                result = recompile_tolerant(i);
+                 if (!config.single_file_output) {
+                     cur_file_function_count++;
+                     if (cur_file_function_count >= config.functions_per_output_file) {
+@@ -785,7 +821,8 @@ int main(int argc, char** argv) {
+                 fmt::print(stderr, "Error recompiling {}\n", func.name);
+                 std::exit(EXIT_FAILURE);
+             }
+-        } else if (func.reimplemented) {
++        } else if (func.reimplemented || (func.ignored && !func.name.empty())) {
++            // PSP fork: also declare config-ignored functions, since the runtime provides them.
+             fmt::print(func_header_file,
+                        "void {}(uint8_t* rdram, recomp_context* ctx);\n", func.name);
+         }
+@@ -860,7 +897,7 @@ int main(int argc, char** argv) {
+             bool result;
+             size_t prev_num_statics = static_funcs_by_section[new_func.section_index].size();
+             if (config.single_file_output || config.functions_per_output_file > 1) {
+-                result = N64Recomp::recompile_function(context, new_func_index, current_output_file, static_funcs_by_section, false);
++                result = recompile_tolerant(new_func_index);
+                 if (!config.single_file_output) {
+                     cur_file_function_count++;
+                     if (cur_file_function_count >= config.functions_per_output_file) {
+@@ -892,6 +929,14 @@ int main(int argc, char** argv) {
+         }
+     }
+ 
++    {
++        std::ofstream failed_file{ config.output_func_path / "failed_functions.txt" };
++        for (const auto& line : failed_functions) {
++            fmt::print(failed_file, "{}\n", line);
++        }
++        fmt::print("Functions that failed to recompile (stubbed): {}\n", failed_functions.size());
++    }
++
+     if (config.has_entrypoint) {
+         std::ofstream lookup_file{ config.output_func_path / "lookup.cpp" };
+         
+@@ -929,7 +974,8 @@ int main(int argc, char** argv) {
+         for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
+             const auto& section = context.sections[section_index];
+             const auto& section_funcs = context.section_functions[section_index];
+-            const auto& section_relocs = section.relocs;
++            static const std::vector<N64Recomp::Reloc> no_relocs{};
++            const auto& section_relocs = config.emit_section_relocs ? section.relocs : no_relocs;
+ 
+             if (section.has_mips32_relocs || !section_funcs.empty()) {
+                 std::string_view section_name_trimmed{ section.name };

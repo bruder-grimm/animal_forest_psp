@@ -1,0 +1,17 @@
+# upstream checkouts, generated code and tool output
+work/
+build/
+logs/
+dist/
+backups/
+__pycache__/
+.DS_Store
+
+# never commit game data (RDRAM dumps hold the game's code and data)
+*.z64
+*.n64
+*.v64
+*.iso
+*.ciso
+*.gcm
+*.bin

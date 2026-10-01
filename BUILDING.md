@@ -1,0 +1,193 @@
+# Building
+
+This repository contains no game data -- no ROM, no game text, no extracted
+graphics (the EBOOT's icon and background in `assets/` are screenshots of the
+port's title screen). You supply your own dumps and one script builds everything from them:
+
+```bash
+./build.sh "Animal Crossing (Europe).iso" "Doubutsu no Mori (Japan).z64" "Animal Forest (U) [!].z64"
+```
+
+- the **European GameCube *Animal Crossing*** (GAFP01; `.iso`, `.gcm` or
+  `.ciso`): the English dialogue, names and letters;
+- the **Japanese N64 *Animal Forest*** (NUS-NAFJ; MD5
+  `a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`): the game's code
+  is recompiled from it;
+- the **English fan translation** *Animal Forest (U) [!]* (MD5
+  `f827d11ee513d5edde44a3a9598f0934`), a patch of the Japanese ROM: the ROM
+  the game plays, with its English title logo, menus and screens.
+
+The ROMs can be in any byte order and either order.
+
+It leaves `dist/AFPSP/` -- `EBOOT.PBP` (with the English text packed into
+it) and `baserom.z64` -- ready to copy to a PSP or PPSSPP ([Install](#7-install)).
+The first run takes a while (it clones and builds the decomp and N64Recomp);
+later runs only redo what changed. It needs the tools of section 1.
+
+The rest of this file describes what `build.sh` does, step by step, for
+working on the port.
+
+The build has four stages, each feeding the next:
+
+```
+your ROM ─► zeldaret/af decomp ─► animalforest-jp.elf ─► N64Recomp (PSP patch) ─► work/recomp_out/*.c ─┐
+                                                                                                     ├─► psp-gcc ─► EBOOT.PBP
+                                                                  runtime/ (the PSP runtime) ────────┘
+```
+
+The first three only need re-running when the decomp, the N64Recomp patch or
+`recomp/af.jp.toml` change; day to day it is just `gmake`.
+
+It was developed on macOS (Apple Silicon); Linux should work with the same
+tools. Everything that is downloaded or generated goes under `work/`, which
+is not tracked.
+
+## 1. Tools
+
+| What | Needed for | Notes |
+|---|---|---|
+| [PSPDEV](https://pspdev.github.io/) toolchain | the EBOOT | `psp-gcc`, PSPSDK, `pack-pbp`, `mksfoex`, `psp-prxgen`. Found at `$PSPDEV`, else `~/pspdev`. Built with psp-gcc 15.2. |
+| [psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core) | the EBOOT | Build it and install into `$PSPDEV/psp`: the Makefile links `-lme-core` and includes `<me-core-mapper/me-core.h>`. Keep its `kcall.prx` for installing on a PSP. |
+| GNU make 4 | everything | On macOS, Homebrew's `make`, run as `gmake` (Apple's make 3.81 is too old). |
+| The AF decomp's prerequisites | stage 2 | See the decomp's own README: MIPS binutils (`mips-linux-gnu-*`), python3, clang, git. On macOS, `scripts/build_n64.sh` expects the binutils in `/opt/cross/bin` and uses `mips-linux-gnu-ar` (the decomp's Makefile asks for `gar`). |
+| git, CMake, Ninja, a C++20 compiler | stage 3 | To build N64Recomp. |
+| Python 3 | the ROM and text tools | Standard library only. |
+
+## 2. The ROMs
+
+You need your own dumps.
+
+- **Japanese *Animal Forest*** (NUS-NAFJ) -- the decomp is built from it.
+  Any byte order; `prepare_rom.py` normalises it and checks its MD5
+  (`a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`):
+
+  ```bash
+  scripts/prepare_rom.py path/to/your/rom.z64            # -> work/af/baseroms/jp/baserom.z64
+  ```
+
+- **The ROM the port plays**: the English fan translation *Animal Forest
+  (U) [!]* (MD5 `f827d11ee513d5edde44a3a9598f0934`), a data-only patch of the
+  Japanese ROM. `recomp/af.jp.toml` applies its five changed instructions to
+  the recompiled code, so the build expects it. `prepare_rom.py` recognises
+  it too:
+
+  ```bash
+  scripts/prepare_rom.py "path/to/Animal Forest (U) [!].z64"   # -> work/af/baseroms/en/baserom.z64
+  ```
+
+  To play the Japanese ROM instead, delete the "English fan translation"
+  block from `recomp/af.jp.toml`, re-run step 4 and build with
+  `gmake BASEROM=work/af/baseroms/jp/baserom.z64`.
+
+## 3. Build the decomp
+
+```bash
+scripts/build_n64.sh
+```
+
+This clones zeldaret/af into `work/af` (at the commit in
+`recomp/af-decomp-commit.txt`) if it is not there, sets up the decomp's
+Python environment, extracts the ROM and builds it; it should end with `animalforest-jp.z64: OK` (and the same for the
+compressed ROM), and leaves `work/af/build/animalforest-jp.elf`. The full log
+is `logs/n64_build.log`.
+
+## 4. Recompile the game
+
+```bash
+scripts/setup_recomp.sh    # clones N64Recomp at recomp/n64recomp-base-commit.txt, applies recomp/n64recomp-psp.patch, builds it
+scripts/recompile.sh       # work/af/build/animalforest-jp.elf -> work/recomp_out/
+```
+
+`recompile.sh` prints the function count and any functions it could not
+recompile (log: `logs/recompile.log`), and gives every recompiled function a
+preemption point (see `runtime/README.md`).
+
+## 5. English dialogue
+
+The fan translation leaves most dialogue in Japanese. From your own copy of the European GameCube *Animal Crossing*
+(GAFP01, `.iso` or `.ciso`), this builds the English dialogue, names and
+letters for the port:
+
+```bash
+scripts/make_text_en.sh "path/to/Animal Crossing (Europe) (En,Fr,De,Es,It).ciso"
+```
+
+It writes `work/text/text_en.bin` and `work/text/names_en.bin`, which the
+next step packs into the EBOOT. They take precedence over the ROM's text
+wherever they have an entry; `gmake` warns if they are missing, since the
+game then shows only the fan translation's text. Messages the GameCube
+release has no usable counterpart for come from `tools/text_en_manual.txt`,
+translated for this port.
+
+## 6. Build the EBOOT
+
+```bash
+gmake -j10
+```
+
+The result is `build/psp/EBOOT.PBP` (and `build/psp/afpsp.prx`, the same
+program for PSPLink). The generated code takes a few minutes the first time;
+after that only what changed is rebuilt.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PSPDEV` | `~/pspdev` | the PSP toolchain |
+| `BASEROM` | `work/af/baseroms/en/baserom.z64` | the ROM `gmake install` copies |
+| `TEXT_EN`, `NAMES_EN` | `work/text/*.bin` | the English text `gmake install` copies |
+| `PPSSPP_GAME_DIR` | `~/.config/ppsspp/PSP/GAME/AFPSP` | where `gmake install` installs |
+| `GEN_OPT` | `-O2` | optimisation of the generated code (`-Os` was slower) |
+| `PROF=1` | off | timing slots in the frame stats line (costs ~1 ms a frame) |
+| `GFXPROF=1` | off | the renderer's sampling profiler |
+
+`gmake clean` removes `build/psp`.
+
+## 7. Install
+
+**PPSSPP.** `gmake install` copies the EBOOT, the ROM and the English text
+into PPSSPP's memory stick (`PPSSPP_GAME_DIR`). PPSSPP doesn't emulate the
+Media Engine; the runtime notices and runs the audio on the main CPU (a
+`no_me.txt` next to the EBOOT forces that).
+
+**A real PSP** needs custom firmware (tested: ARK on 6.60, PSP-1000 and
+PSP-2000). Copy `dist/AFPSP` from `build.sh` to `ms0:/PSP/GAME/` and add
+`kcall.prx`; or, by hand, copy these into `ms0:/PSP/GAME/AFPSP/`:
+
+- `build/psp/EBOOT.PBP`
+- `kcall.prx` from psp-media-engine-custom-core (the Media Engine's kernel helper)
+- the ROM, named `baserom.z64`
+
+The English text is inside the EBOOT (its `DATA.PSAR` section, which the
+Makefile fills from `work/text/`), so there are no text files to copy; the
+log's `text_en:` and `names_en:` lines say where the text came from. Only a
+PRX run on its own (PSPLink) reads `text_en.bin` and `names_en.bin` next to
+it: copy them there from `work/text/`.
+
+The save (`flash.bin`) and clock offset (`rtc.bin`) are written next to them.
+Controls: cross A, square B, L Z, R R, START start, triangle and circle C-up
+and C-right, d-pad and stick as themselves; SELECT + d-pad gives the four C
+buttons and SELECT + L the N64's L.
+
+## Debugging
+
+The runtime logs to `afpsp.log` next to the EBOOT and has a set of debug
+switches (files next to the EBOOT: scripted input, screenshots, frame dumps
+and replays, profilers); `runtime/README.md` lists them and explains the log.
+
+## Troubleshooting
+
+- **`Missing work/recomp_out: run scripts/recompile.sh first`** -- stages 3
+  and 4 haven't run yet (`./build.sh` runs them all).
+- **`MD5 ... is not an Animal Forest ROM this port knows`** -- the ROM is
+  neither the Japanese release nor the fan translation named above (the 32 MB
+  English ROM with header `NAFE` is a different build and is not supported).
+- **`make: *** No rule` or odd syntax errors from make** -- that's Apple's
+  make; use `gmake`.
+- **`psp-gcc: command not found`** -- set `PSPDEV`, or install the toolchain in
+  `~/pspdev`.
+- **undefined `meLib*`/`kcall` symbols** -- psp-media-engine-custom-core isn't
+  installed into `$PSPDEV/psp`.
+- **The decomp build fails** -- check `logs/n64_build.log`. A vanilla N64
+  build that doesn't match points at the ROM or the MIPS toolchain, not at
+  this port.
+- **The game shows "ROM not found"** -- `baserom.z64` must sit next to the
+  EBOOT, or `rom_path.txt` there must name it.

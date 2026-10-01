@@ -1,0 +1,271 @@
+# N64Recomp configuration for Animal Forest (JP), PSP fork of N64Recomp.
+# Paths are relative to this file. Run via scripts/recompile.sh.
+
+[input]
+elf_path = "../work/af/build/animalforest-jp.elf"
+output_func_path = "../work/recomp_out"
+relocatable_sections_path = "overlays.txt"
+functions_per_output_file = 150
+recomp_include = "#include \"recomp_psp.h\""
+# The decomp's asm-only units produce many harmless LO16 pairing notes.
+unpaired_lo16_warnings = false
+# AF names overlay bss sections ".ovl_X_bss" (and ".code_bss", ".boot_bss").
+bss_section_suffix = "_bss"
+# Rebuild overlay HI16/LO16 relocations from the ROM's own .ovl tables.
+overlay_reloc_suffix = "_reloc"
+# The game relocates overlays itself; the runtime only needs section load addresses.
+emit_section_relocs = false
+
+# func_80874184_jp (tag_ovl) was split by splat; its tail is D_808742A8_jp.
+function_sizes = [
+    { name = "func_80874184_jp", size = 0x1A4 },
+]
+
+[patches]
+# Hand-written 6502 emulator with a custom calling convention (NES furniture).
+# Stubbed until it gets a native implementation.
+stubbed_sections = [".ovl_famicom_emu"]
+
+stubs = []
+
+# libultra functions not covered by N64Recomp's built-in lists that touch
+# hardware or OS state. The PSP runtime provides these.
+ignored = [
+    "__osInitialize_autodetect",
+    "osEPiLinkHandle",
+    "osAfterPreNMI",
+    "__osGetActiveQueue",
+    "__osGetCurrFaultedThread",
+    "__osGetFpcCsr",
+    "osGbpakInit",
+    "__osFlashGetAddr",
+    # AF's inlined osAiSetNextBuffer (writes AI registers directly).
+    "func_800EFD40_jp",
+    # The game's sleep (libc64: a timer and a wait for it). The graph thread
+    # polls with it, 100 us at a time, for a free framebuffer slot -- 900 times
+    # a second; the scheduler does it without the timer (rt_sched_sleep).
+    "csleep",
+]
+
+# The scheduler polls the RSP status register (0xA4040010) directly. Point
+# those reads at a runtime-owned word that always reads "halted"
+# (RT_SP_STATUS in runtime/src/rt.h): the runtime reports a task's end with
+# the SP and DP events, never through that register.
+[[patches.instruction]]
+func = "func_800D76A0_jp"
+vram = 0x800D76D0
+value = 0x3C118000 # lui $s1, 0x8000
+
+[[patches.instruction]]
+func = "func_800D7794_jp"
+vram = 0x800D77C0
+value = 0x3C118000 # lui $s1, 0x8000
+
+# --- English fan translation ("Animal Forest (U) [!]", md5 f827d11e...) ----------
+# That ROM is a data-only patch of the JP build: dmadata is byte-identical, boot and
+# code do not differ, and every changed overlay byte is .data/.rodata -- which the
+# game DMAs out of the ROM at runtime, so it needs nothing here -- except the five
+# .text bytes below, which the recompiler would otherwise take from the JP ELF.
+# NOTE: this makes the build ROM-specific. Drop this block to go back to the JP ROM.
+
+# Translation replaces "bne $t8, $zero, +0xD" with a discarded 64-bit load
+# (ldl $zero) purely to delete the branch; emit a plain nop instead, so the
+# 32-bit Allegrex backend never sees an LDL.
+[[patches.instruction]]
+func = "func_80884120_jp"
+vram = 0x80884150
+value = 0x00000000 # nop (was: bne $t8, $zero, +0xD)
+
+# ovl_Animal_Logo: title-logo data offset and its fade constants.
+[[patches.instruction]]
+func = "func_80AA0C98_jp"
+vram = 0x80AA0DDC
+value = 0x254A20E8 # addiu $t2, $t2, 0x20E8 (was 0x20C0)
+
+[[patches.instruction]]
+func = "func_80AA0C98_jp"
+vram = 0x80AA0E48
+value = 0x358D00FF # ori $t5, $t4, 0xFF (was 0x78)
+
+[[patches.instruction]]
+func = "func_80AA0C98_jp"
+vram = 0x80AA0EA8
+value = 0x35F80078 # ori $t8, $t7, 0x78 (was 0xFF)
+
+[[patches.instruction]]
+func = "func_80AA0C98_jp"
+vram = 0x80AA0F5C
+value = 0x35880078 # ori $t0, $t4, 0x78 (was 0xFF)
+
+# The translation left the string table's date and time units in Japanese
+# ("9がつ25にち2026ねん", "ごご3じ11ふん"), which the N64 shows too. With the
+# English ROM these write "Sep 25, 2026" and "3:11pm" instead and return early
+# (runtime/src/strings_en.c); with any other ROM the game's own code runs.
+[[patches.hook]]
+func = "mString_Load_YearStringFromRom"
+text = "if (rt_str_year(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_MonthStringFromRom"
+text = "if (rt_str_month(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_DayStringFromRom"
+text = "if (rt_str_day(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_WeekStringFromRom"
+text = "if (rt_str_week(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_HourStringFromRom"
+text = "if (rt_str_hour(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_MinStringFromRom"
+text = "if (rt_str_min(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_SecStringFromRom"
+text = "if (rt_str_sec(rdram, ctx)) return;"
+
+# English dialogue converted from the GameCube release (runtime/src/text_en.c,
+# tools/make_text_en.py): func_8009E558_jp loads one message into a window's
+# buffer; with text_en.bin present the hook fills it from that file instead.
+[[patches.hook]]
+func = "func_8009E558_jp"
+text = "if (rt_text_en_load(rdram, ctx)) return;"
+
+# ... and gives its ASCII letters proportional widths (func_8009028C_jp is
+# the font's character width).
+[[patches.hook]]
+func = "func_8009028C_jp"
+text = "if (rt_text_en_width(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_8009069C_jp"
+text = "if (rt_text_en_glyph(rdram, ctx)) return;"
+
+# English villager names, choices, strings and item names from the GameCube
+# release (runtime/src/names_en.c, tools/make_names_en.py). The four loaders
+# write the English string, or its first bytes and a token when it does not
+# fit the N64 buffer; the font's line drawing and string width, and the
+# message window's copies (after each length query, and the copy itself),
+# expand tokens again.
+[[patches.hook]]
+func = "mNpc_LoadNpcNameString"
+text = "if (rt_names_villager(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mChoice_Load_ChoseStringFromRom"
+text = "if (rt_names_choice(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mString_Load_StringFromRom"
+text = "if (rt_names_string(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_80096710_jp"
+text = "if (rt_names_item(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_80090CC0_jp"
+text = "rt_names_draw(rdram, ctx);"
+
+[[patches.hook]]
+func = "mFont_GetStringWidth"
+text = "rt_names_width(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8009EB44_jp"
+text = "rt_names_msg_copy(rdram, ctx);"
+
+[[patches.hook]]
+func = "mMsg_CopyMonth"
+before_vram = 0x8009EF34
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+
+[[patches.hook]]
+func = "mMsg_CopyWeek"
+before_vram = 0x8009EFBC
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+
+[[patches.hook]]
+func = "mMsg_CopyTalkName"
+before_vram = 0x8009ED5C
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+
+[[patches.hook]]
+func = "mMsg_CopyTail"
+before_vram = 0x8009EE18
+text = "rt_names_msg_tail(rdram, ctx, (uint32_t)MEM_W(0x28, ctx->r29));"
+
+[[patches.hook]]
+func = "mMsg_CopyFree"
+before_vram = 0x8009F298
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
+
+[[patches.hook]]
+func = "mMsg_CopyItem"
+before_vram = 0x8009F61C
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
+
+[[patches.hook]]
+func = "mMsg_CopyCountryName"
+before_vram = 0x8009F4C0
+text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x38);"
+
+[[patches.hook]]
+func = "mMsg_CopyDetermination"
+before_vram = 0x8009F3EC
+text = "rt_names_msg_det(rdram, ctx, (uint32_t)MEM_W(0x30, ctx->r29) + 0x21C);"
+
+# Register each overlay's load address with the runtime before the game's
+# own loader copies and relocates it (stack args: vramStart, vramEnd,
+# allocatedRamAddr, ovlRelocs).
+[[patches.hook]]
+func = "Overlay_Load"
+text = "recomp_overlay_load_hook(rdram, ctx);"
+
+# English letters (runtime/src/names_en.c): the three loaders write the English
+# header, footer and a body of line tokens plus a record of the letter and its
+# names; the font's line drawing (rt_names_draw above) lays the body out again,
+# and the letter screen's footer is aligned by its drawn width.
+[[patches.hook]]
+func = "mHandbill_Load_HandbillFromRom"
+text = "if (rt_names_letter(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mHandbill_Load_HandbillFromRom2"
+text = "if (rt_names_letter2(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "mHandbillz_load"
+text = "if (rt_names_letterz(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_808899E4_jp"
+before_vram = 0x80889A84
+text = "rt_names_letter_footer(rdram, ctx);"
+
+# The pocket menu's letter tag, drawn in English (names_en.c; the option
+# labels are translated by rt_names_draw).
+[[patches.hook]]
+func = "func_80877B0C_jp"
+text = "if (rt_names_mail_tag(rdram, ctx)) return;"
+
+# The Happy Room Academy's letters name the room's theme through a free string.
+[[patches.hook]]
+func = "mHandbill_Set_free_str"
+text = "rt_names_free_str(rdram, ctx);"
+
+# The text entry keyboard opens on its ABC page (names_en.c).
+[[patches.hook]]
+func = "func_8088587C_jp"
+before_vram = 0x8088595C
+text = "rt_names_keyboard(rdram, ctx);"
+
+# Debug (letter_test.txt only): Z + START opens the pockets on any save.
+[[patches.hook]]
+func = "mSM_submenu_ctrl"
+text = "rt_names_test_submenu(rdram, ctx);"
