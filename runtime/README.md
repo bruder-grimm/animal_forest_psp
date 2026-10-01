@@ -27,7 +27,7 @@ runtime/
     vi.c                retraces and framebuffer swaps
     sp.c                RSP tasks: graphics to gfx/, audio to audio.c
     audio.c             audio tasks, the AI, sound output
-    audio/              the audio microcode (aspmain.c) and the Media Engine (me_audio.c)
+    audio/              the audio microcode (aspmain.c) and the Media Engine (me_audio.c, me_boot.S)
     gfx/                the renderer (see gfx/gfx_internal.h)
     data.c              opens the data files packed into EBOOT.PBP (or next to a bare PRX)
     text_en.c           English dialogue (text_en.bin)
@@ -120,6 +120,7 @@ file.
 | `prof_sample.txt` | sample game code every ms to `afpsp_samples.txt` (format in prof.h) | preempt.c |
 | `flash_test.txt` | exercise the save path at boot (writes junk to the save) | flash.c |
 | `exit_test.txt` | `seconds [1]`: take the HOME exit path by itself | main.c |
+| `standby_test.txt` | `seconds [times]`: go into standby by itself; the firmware wakes the PSP at once, with the power left on (so the Media Engine keeps its state, unlike in a real standby). PSPLink does not survive its next reset after one | main.c |
 | `kana_log.txt` | log each distinct line of text drawn with Japanese still in it (decode with tools/afcharset.py) | names_en.c |
 | `letter_test.txt` | build English test letters and log them; puts four in the pockets, and Z + START opens the pockets on any save | names_en.c |
 

@@ -25,6 +25,7 @@
  * next to the EBOOT; PPSSPP doesn't emulate it) tasks run on the main CPU.
  */
 #include <stdio.h>
+#include <string.h>
 
 #include <pspkernel.h>
 #include <pspthreadman.h>
@@ -47,6 +48,10 @@ typedef struct {
     u32 rdram;      /* RDRAM base for the ME */
     u32 out;        /* sample buffer of the last task the ME finished */
     u32 quit;       /* 1 = main CPU asks the ME to stop, 2 = ME halted */
+    u32 starts;     /* times the ME has started our code */
+    u32 fcr31;      /* its FPU control word at the first start, set again at every later one */
+    u32 fcr31_found; /* what the last start found there */
+    u32 boot_tags;  /* cache tags the last start found set (me_boot.S): instruction << 16 | data */
     AspTask task;
 } MeShared;
 
@@ -58,10 +63,14 @@ static int probe_kernel(void) {
     return 0x1234;
 }
 
+/* me_boot.S: empties the ME's caches before the library's start-up code runs. */
+extern char rt_me_boot[], rt_me_boot_end[];
+
 /*
  * Starts the ME core, in kernel mode. This is meLibDefaultInit() without its
  * sleep/wake hook (install_sleep_hook below does that part, once the ME is
- * known to be there).
+ * known to be there), and its meLibReset() with me_boot.S put in front of the
+ * library's code at the reset vector.
  */
 static int start_me_core(void) {
     int table = meCoreGetTableIdFromWitnessWord();
@@ -69,7 +78,14 @@ static int start_me_core(void) {
         return ERROR_ON_ME_IMG;
     }
     meCoreSelectSystemTable(table);
-    meLibReset();
+    u32 boot_size = (u32)(rt_me_boot_end - rt_me_boot);
+    memcpy((void*)ME_HANDLER_BASE, rt_me_boot, boot_size);
+    memcpy((void*)(ME_HANDLER_BASE + boot_size), &__start__me_section, (u32)(&__stop__me_section - &__start__me_section));
+    sceKernelDcacheWritebackInvalidateAll();
+    sceKernelIcacheInvalidateAll();
+    HW_SYS_RESET_ENABLE = SC_HW_RESET;
+    HW_SYS_RESET_ENABLE = 0;
+    meLibSync();
     return table;
 }
 
@@ -97,6 +113,24 @@ static u32 bench_work(u32 rounds) {
 
 void meLibOnProcess(void) {
     volatile MeShared* sh = SHARED;
+    u32 tags;
+    asm volatile("mfc0 %0, $14" : "=r"(tags)); /* left there by me_boot.S */
+    sh->boot_tags = tags;
+    /*
+     * The FPU's control word (rounding, traps) is the one the firmware's ME
+     * code left the first time, and whatever the hardware came up with after
+     * a standby: the audio code has to find the same one every time.
+     */
+    u32 fcr31;
+    asm volatile("cfc1 %0, $31" : "=r"(fcr31));
+    sh->fcr31_found = fcr31;
+    if (sh->starts == 0) {
+        sh->fcr31 = fcr31;
+    } else {
+        fcr31 = sh->fcr31;
+        asm volatile("ctc1 %0, $31" : : "r"(fcr31));
+    }
+    sh->starts = sh->starts + 1;
     u32 done = sh->ack;
     for (;;) {
         if (sh->bench != 0) {
@@ -131,6 +165,15 @@ void meLibOnProcess(void) {
             meLibDelayPipeline();
         }
     }
+}
+
+/* The state the ME came out of its reset in: after a standby it is the hardware's, not the firmware's. */
+static void log_start(void) {
+    volatile MeShared* sh = SHARED;
+    u32 tags = sh->boot_tags;
+    rt_log("me: start %u found %u instruction and %u data cache tags set, FPU control %08X (using %08X)",
+           (unsigned)sh->starts, (unsigned)(tags >> 16), (unsigned)(tags & 0xFFFF), (unsigned)sh->fcr31_found,
+           (unsigned)sh->fcr31);
 }
 
 /* How fast is the ME, compared with the main CPU? */
@@ -211,6 +254,7 @@ void rt_me_audio_resume(void) {
         rt_log("me: did not restart after the resume (%d), audio stays on the main CPU", table);
         return;
     }
+    log_start();
     speed_test(" after the resume:");
     sSubmitTime = sceKernelGetSystemTimeLow();
     sAliveMark = sh->alive;
@@ -311,6 +355,7 @@ void rt_me_audio_init(void) {
     sh->seq = sh->ack = 0;
     sh->alive = 0;
     sh->quit = 0;
+    sh->starts = 0;
     int loaded = meLibLoadPrx();
     if (loaded < 0) {
         rt_log("me: no kernel module (%d), audio runs on the main CPU", loaded);
@@ -336,6 +381,7 @@ void rt_me_audio_init(void) {
     }
     sMeReady = true;
     rt_log("me: audio tasks run on the Media Engine (core image %d)", table);
+    log_start();
 
     speed_test("");
 

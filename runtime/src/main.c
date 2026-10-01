@@ -125,9 +125,17 @@ static int exit_callback(int arg1, int arg2, void* common) {
     return 0;
 }
 
-/* Debug: for 20 s after a resume, logs twice a second whether the game runs
- * and what every thread of ours is waiting for. */
-static int resume_watch(SceSize args, void* argp) {
+/*
+ * After a resume, on a thread of its own: starts the ME again, then (debug)
+ * logs twice a second for 20 s whether the game runs and what every thread of
+ * ours is waiting for. The log is written out before and after the ME's
+ * start, so that it shows how far things got if the PSP stops there.
+ */
+static int resume_thread(SceSize args, void* argp) {
+    rt_log_flush();
+    rt_me_audio_resume();
+    rt_log("power: resume handled");
+    rt_log_flush();
     for (int i = 0; i < 40; i++) {
         rt_log("resume +%d.%ds: frame %u, polls %u, indirect calls %u (last %08X)", i / 2, (i % 2) * 5,
                (unsigned)rt_gfx_frame_count(), (unsigned)rt_input_polls(), (unsigned)g_indirect_calls,
@@ -157,32 +165,47 @@ static int resume_watch(SceSize args, void* argp) {
  * Standby: memory stick I/O holds the power lock (rt_io_begin), so none of it
  * overlaps the suspend; files kept open (ROM, text) are reopened when a read
  * fails afterwards (rt_read_at), and the log is never left open. The ME is
- * stopped by me_audio.c's system event handler and started again here.
+ * stopped by me_audio.c's system event handler and started again by
+ * resume_thread.
  */
 static int power_callback(int unknown, int flags, void* common) {
     rt_log("power: callback flags %08X", (unsigned)flags);
     if (flags & PSP_POWER_CB_RESUME_COMPLETE) {
-        SceUID w = sceKernelCreateThread("rt_resume_watch", resume_watch, 0x10, 16 * 1024, PSP_THREAD_ATTR_USER, NULL);
-        if (w >= 0) {
-            sceKernelStartThread(w, 0, NULL);
+        SceUID thid = sceKernelCreateThread("rt_resume", resume_thread, 0x10, 32 * 1024, PSP_THREAD_ATTR_USER, NULL);
+        if (thid < 0 || sceKernelStartThread(thid, 0, NULL) < 0) {
+            rt_me_audio_resume();
         }
-        rt_me_audio_resume();
-        rt_log("power: resume handled");
     }
     return 0;
 }
+
+/* In libpsppower, but not in its header: a standby the firmware ends by itself. */
+int scePowerRequestSuspendTouchAndGo(void);
 
 static int callback_thread(SceSize args, void* argp) {
     int cbid = sceKernelCreateCallback("exit_callback", exit_callback, NULL);
     sceKernelRegisterExitCallback(cbid);
     int pcbid = sceKernelCreateCallback("power_callback", (SceKernelCallbackFunction)power_callback, NULL);
     scePowerRegisterCallback(-1, pcbid);
+    /* Debug: standby_test.txt "<seconds> [times]" puts the PSP into standby
+     * that long after the start (and that long after each resume); the
+     * firmware wakes it again by itself at once, so nobody has to work the
+     * power switch. The ME's power stays on, unlike in a real standby. */
+    uint32_t standby[2] = {0, 1};
+    if (rt_load_number_list("standby_test.txt", standby, 2) > 0) {
+        for (uint32_t i = 0; i < standby[1]; i++) {
+            sceKernelDelayThreadCB(standby[0] * 1000000u);
+            rt_log("power: standby test %u of %u", (unsigned)(i + 1), (unsigned)standby[1]);
+            scePowerRequestSuspendTouchAndGo();
+        }
+    }
     /* Debug: exit_test.txt "<seconds> [1]" takes the HOME exit path by itself
      * after that long (1 = leave the ME running, as before the fix), for
-     * testing it over PSPLink, where nobody presses HOME. */
+     * testing it over PSPLink, where nobody presses HOME. It is also how a
+     * test run there has to end: PSPLink's own reset leaves the ME running. */
     uint32_t test[2] = {0, 0};
     if (rt_load_number_list("exit_test.txt", test, 2) > 0) {
-        sceKernelDelayThread(test[0] * 1000000u);
+        sceKernelDelayThreadCB(test[0] * 1000000u);
         exit_game(test[1] != 1);
     }
     sceKernelSleepThreadCB();
@@ -190,7 +213,7 @@ static int callback_thread(SceSize args, void* argp) {
 }
 
 static void setup_callbacks(void) {
-    /* The power callback logs and restarts the ME: 4 KB was too tight. */
+    /* The exit callback logs, stops the ME and saves: 4 KB was too tight. */
     SceUID thid = sceKernelCreateThread("rt_callbacks", callback_thread, 0x11, 32 * 1024, PSP_THREAD_ATTR_USER, NULL);
     if (thid >= 0) {
         sceKernelStartThread(thid, 0, NULL);
