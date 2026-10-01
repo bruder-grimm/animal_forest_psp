@@ -274,6 +274,69 @@ def spread_scale(msg, keep=True):
     return bytes(out)
 
 
+DEFAULT_COLOR = bytes([50, 60, 50])  # msg_color.bmc entry 0, the window's own text colour
+INSERTS = set(range(26, 65))  # codes the program replaces with a string
+
+
+def spread_color(msg, keep=True):
+    """The GC colour tag holds until the next one. Converter.tag() writes it as
+    code 5, but on the N64 that sets the colour of the whole line it is on (the
+    JP text has it at line starts): a highlighted word coloured its line, and
+    the tag ending the highlight turned the line dark again as it was typed.
+    Words are coloured with code 80 (colour + number of characters), which the
+    font counts down within a line, so each coloured stretch becomes one code 80
+    per line. Where the program puts a string into the stretch its length is
+    not known: the count is then the largest there is, and a code 80 for one
+    character in the default colour before the next dark character ends it.
+    keep=False drops the colours (for messages that would get too long)."""
+    out, col = [], DEFAULT_COLOR
+    run, count, inserts = None, 0, False  # this line's open stretch: its place in out
+    stop = False  # a stretch of unknown length has to be ended before the next character
+
+    def close():
+        nonlocal run, count, inserts, stop
+        if run is not None and inserts:
+            out[run] = bytes([0x7F, 80]) + col + b"\xff"
+            stop = True
+        elif run is not None and count:
+            out[run] = bytes([0x7F, 80]) + col + bytes([min(count, 0xFF)])
+        run, count, inserts = None, 0, False
+
+    def before_char():
+        nonlocal run, stop
+        if col != DEFAULT_COLOR:
+            if run is None:
+                run = len(out)
+                out.append(b"")
+            stop = False
+        elif stop:
+            out.append(bytes([0x7F, 80]) + DEFAULT_COLOR + b"\x01")
+            stop = False
+
+    for kind, t in msgfmt.tokens(msg, N64_SIZES):
+        if kind == "c" and t[1] == 5:
+            close()
+            if keep:
+                col = t[2:5]
+        elif kind == "c":
+            if t[1] in INSERTS:
+                before_char()
+                inserts = run is not None
+            elif t[1] == 2:
+                close()
+            out.append(t)
+        else:
+            for b in t:
+                if b == 0xCD:
+                    close()
+                else:
+                    before_char()
+                    count += run is not None
+                out.append(bytes([b]))
+    close()
+    return b"".join(out)
+
+
 def logic(msg):
     codes = [t[1] for t in msgfmt.tokens(msg, N64_SIZES) if t[0] == "c"]
     body = Counter(c.hex() for c in codes if c[1] in LOGIC)
@@ -400,6 +463,9 @@ def main():
             reason = "uses a string the N64 does not fill"
         else:
             reason = None
+            # last, as fix_filled looks for the colours in their GC form
+            spread = spread_color(c)
+            c = spread if len(spread) <= MAX_LEN else spread_color(c, keep=False)
         if reason:
             why[reason] += 1
             lines.append(f"{n}\t{reason}")
