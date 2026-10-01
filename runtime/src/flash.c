@@ -4,6 +4,11 @@
  * The 128KB image is kept in memory and written back once writes have been
  * quiet for a moment (rt_save_tick), so a multi-page save becomes a single
  * file write. The asynchronous N64 API completes every request at once.
+ *
+ * The file is written by a thread of its own, from a copy of the image: the
+ * write takes 0.5-0.75 s on a memory stick, and done on the VI thread it held
+ * back the retraces for as long -- picture and sound stopped a second after
+ * every save, and after loading one, which marks the save as in use.
  */
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
@@ -21,12 +26,67 @@
 #define FLASH_MAKER 0x00C20001u
 
 static uint8_t sImage[FLASH_TOTAL_BYTES];
+static uint8_t sSnapshot[FLASH_TOTAL_BYTES]; /* the copy that goes to the file */
 static uint8_t sWriteBuffer[FLASH_PAGE_BYTES];
-static bool sDirty = false;
+static uint32_t sChanges = 0;    /* counts the writes to sImage */
+static uint32_t sSnapshotOf = 0; /* sChanges when sSnapshot was taken */
+static uint32_t sSaved = 0;      /* sChanges of the snapshot in the file */
 static uint32_t sQuietTicks = 0;
+static SceUID sFileLock = -1;    /* guards sSnapshot and the file */
+static SceUID sPending = -1;     /* wakes the writer */
+static SceUID sWriter = -1;
 
 static const char* flash_path(char* out, size_t size) {
     return rt_data_path("flash.bin", out, size);
+}
+
+/* Writes sSnapshot to the file. The caller holds sFileLock. */
+static void write_snapshot(void) {
+    char path[256];
+    char tmp_path[256];
+    flash_path(path, sizeof(path));
+    rt_data_path("flash.tmp", tmp_path, sizeof(tmp_path));
+
+    /* Write to a temporary file and rename, so a power loss can't corrupt the save. */
+    rt_io_begin();
+    SceUID fd = sceIoOpen(tmp_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    int written = -1;
+    if (fd >= 0) {
+        written = sceIoWrite(fd, sSnapshot, sizeof(sSnapshot));
+        sceIoClose(fd);
+        if (written == (int)sizeof(sSnapshot)) {
+            sceIoRemove(path);
+            sceIoRename(tmp_path, path);
+        }
+    }
+    rt_io_end();
+    if (fd < 0) {
+        rt_log("flash: cannot open %s (%08X)", tmp_path, (unsigned)fd);
+        return;
+    }
+    if (written != (int)sizeof(sSnapshot)) {
+        rt_log("flash: short write (%d)", written);
+        return;
+    }
+    sSaved = sSnapshotOf;
+    rt_log("flash: saved");
+}
+
+static void take_snapshot(void) {
+    sSnapshotOf = sChanges;
+    memcpy(sSnapshot, sImage, sizeof(sSnapshot));
+}
+
+static int writer_thread(SceSize args, void* argp) {
+    for (;;) {
+        sceKernelWaitSema(sPending, 1, NULL);
+        sceKernelWaitSema(sFileLock, 1, NULL);
+        if (sSnapshotOf != sSaved) {
+            write_snapshot();
+        }
+        sceKernelSignalSema(sFileLock, 1);
+    }
+    return 0;
 }
 
 void rt_save_init(void) {
@@ -40,54 +100,45 @@ void rt_save_init(void) {
     } else {
         rt_log("flash: no save at %s, starting erased", path);
     }
-}
 
-static void flush(void) {
-    char path[256];
-    char tmp_path[256];
-    flash_path(path, sizeof(path));
-    rt_data_path("flash.tmp", tmp_path, sizeof(tmp_path));
-
-    /* Write to a temporary file and rename, so a power loss can't corrupt the save. */
-    rt_io_begin();
-    SceUID fd = sceIoOpen(tmp_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    int written = -1;
-    if (fd >= 0) {
-        written = sceIoWrite(fd, sImage, sizeof(sImage));
-        sceIoClose(fd);
-        if (written == (int)sizeof(sImage)) {
-            sceIoRemove(path);
-            sceIoRename(tmp_path, path);
-        }
+    sFileLock = sceKernelCreateSema("rt_save", 0, 1, 1, NULL);
+    sPending = sceKernelCreateSema("rt_save_pending", 0, 0, 1, NULL);
+    /* Below the game and the renderer, like the log's writer: it only waits for the stick. */
+    sWriter = sceKernelCreateThread("rt_save", writer_thread, RT_GAME_THREAD_PRIORITY + 2, 16 * 1024,
+                                    PSP_THREAD_ATTR_USER, NULL);
+    if (sWriter >= 0 && sceKernelStartThread(sWriter, 0, NULL) < 0) {
+        sWriter = -1;
     }
-    rt_io_end();
-    if (fd < 0) {
-        rt_log("flash: cannot open %s (%08X)", tmp_path, (unsigned)fd);
-        return;
-    }
-    if (written != (int)sizeof(sImage)) {
-        rt_log("flash: short write (%d)", written);
-        return;
-    }
-    sDirty = false;
-    rt_log("flash: saved");
 }
 
 void rt_save_tick(void) {
-    /* Runs every half second: write once a whole interval has passed without writes. */
-    if (sDirty && ++sQuietTicks >= 2) {
-        flush();
+    /* Runs every half second, on the VI thread: once a whole interval has passed
+     * without writes, copy the image -- no game thread runs meanwhile, so the
+     * copy is of one moment -- and leave the file to the writer. If the writer
+     * is still busy with the previous copy, the next tick tries again. */
+    if (sChanges == sSaved || ++sQuietTicks < 2 || sceKernelPollSema(sFileLock, 1) < 0) {
+        return;
     }
+    take_snapshot();
+    if (sWriter < 0) {
+        write_snapshot(); /* no writer thread: here, as a last resort */
+    }
+    sceKernelSignalSema(sFileLock, 1);
+    sceKernelSignalSema(sPending, 1);
 }
 
+/* On exit: waits for a write in progress, then writes what is newer than the file. */
 void rt_save_flush(void) {
-    if (sDirty) {
-        flush();
+    sceKernelWaitSema(sFileLock, 1, NULL);
+    if (sChanges != sSaved) {
+        take_snapshot();
+        write_snapshot();
     }
+    sceKernelSignalSema(sFileLock, 1);
 }
 
 static void mark_dirty(void) {
-    sDirty = true;
+    sChanges++;
     sQuietTicks = 0;
 }
 
