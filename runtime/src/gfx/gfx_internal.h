@@ -518,6 +518,7 @@ typedef struct {
     int wrap_u, wrap_v;
     uint32_t env;
     int decal;
+    int stencil;           /* GU_STENCIL_*: the screen's stencil test as the batches left it */
     int fog;
     const void* tex_pixels;
     int tex_swizzled;
@@ -537,6 +538,16 @@ void gfx_gu_texture_image(const GuTexture* tex);
 void gfx_gu_texturing(bool on);
 void gfx_gu_tex_func(const CombinerFit* fit);
 void gfx_apply_render_state(bool depth_allowed);
+/* The screen's stencil test (gGu.stencil), set by the batches as they need it. */
+#define GU_STENCIL_OFF 0
+#define GU_STENCIL_FLAT 1    /* writes "not upright" where depth is written */
+#define GU_STENCIL_UPRIGHT 2 /* writes "upright" where depth is written */
+#define GU_STENCIL_DECAL 3   /* passes where nothing upright is */
+#define GU_STENCIL_KEEP 4    /* on, passing and writing nothing (between batches that write) */
+/* Anything else that draws on the screen turns the batches' stencil test off first. */
+void gfx_gu_stencil_off(void);
+/* Does the screen's stencil say which surfaces stand upright (see sStencilClass)? */
+bool gfx_stencil_classes(void);
 void gfx_apply_aa_edge(const GuTexture* tex, const CombinerFit* fit);
 /* The other modes changed: the draw state is dirty, and gRdp.keeps_memory is worked out again. */
 void gfx_other_mode_changed(void);
@@ -645,6 +656,8 @@ bool gfx_screen_position(uint32_t addr, uint32_t* fb, float* x, float* y);
 void gfx_copy_from_screen(uint32_t fb, float dx0, float dy0, float dx1, float dy1, float sx0, float sy0,
                           float sx1, float sy1);
 void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_t height);
+/* A rectangle of the coverage image the game saves of a framebuffer: not drawn (true), every pixel covered. */
+bool gfx_coverage_rect(float x0, float y0, float x1, float y1);
 /* Closes the frame and shows it (on the renderer thread). */
 void gfx_present_frame(uint32_t framebuffer);
 

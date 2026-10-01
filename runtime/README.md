@@ -100,7 +100,7 @@ file.
 | `skip_draws.txt` | leave out these draws (1-based) | gfx_debug.c |
 | `dump_tex.txt` | write the first 400 textures built | gfx_tex.c |
 | `soften.txt` | softening strength in percent (0 = off; default 30) | gfx_frame.c |
-| `no_snap.txt`, `no_weld.txt`, `no_cut.txt`, `no_split.txt`, `hard_edges.txt` | turn off vertex snapping, welding of nearly coincident vertices, stencil cut-outs, split combiners, soft texture edges | gfx_draw.c, gfx_combiner.c |
+| `no_snap.txt`, `no_weld.txt`, `no_cut.txt`, `no_split.txt`, `hard_edges.txt`, `no_upright.txt` | turn off vertex snapping, welding of nearly coincident vertices, stencil cut-outs, split combiners, soft texture edges, keeping ground decals (shadows) off upright surfaces | gfx_draw.c, gfx_combiner.c |
 | `no_target_tex.txt` | never sample a render target where it is in VRAM: copy it back to RDRAM and build a texture | gfx_frame.c |
 | `no_yield.txt` | ignore the game's graphics task yields | gfx_worker.c |
 | `no_me.txt` | run audio on the main CPU | audio/me_audio.c |

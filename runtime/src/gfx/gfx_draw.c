@@ -121,6 +121,7 @@ typedef struct {
     uint16_t idx[BATCH_MAX_INDICES];
     int nverts;
     int nidx;
+    int nidx_up;       /* indices of upright triangles, kept at the end of idx (see sClassify) */
     uint8_t fog_max;
 } Batch;
 
@@ -293,6 +294,7 @@ static WeldSlot sWeld[WELD_SLOTS] __attribute__((aligned(64)));
 static uint32_t sWeldUsed[128 * 128 / 32] __attribute__((aligned(64)));
 static int sWeldFill = -1;     /* -1: the table needs clearing */
 static bool sWeldOff;
+static bool sUprightOff;       /* no_upright.txt: the stencil doesn't keep what stands upright (see sStencilClass) */
 /* Snapped positions are cached per vertex (pack_vertex) while this stays the
  * same: it changes with the viewport, the projection and every task. */
 static uint32_t sSnapGen = 1;
@@ -307,6 +309,7 @@ void gfx_weld_reset(void) {
         sWeldFill = 0;
     }
     sWeldOff = RT_SWITCH("no_weld.txt");
+    sUprightOff = RT_SWITCH("no_upright.txt");
     sSnapGen++;
 }
 
@@ -688,6 +691,10 @@ static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit
  * has. AF uses such passes to rewrite only the coverage bits (the pocket
  * screen's portrait: I8 rectangles, alpha from coverage), which the port
  * doesn't keep; drawn as ordinary rectangles they covered the portrait black.
+ *
+ * The same goes for P * 0 + BLEND * memory alpha, which turns a picture into
+ * its coverage values (PreRender, see gfx_coverage_rect): there are none here,
+ * and the picture is left as it is.
  */
 static bool blender_keeps_memory(void) {
     uint32_t l = gRdp.other_l;
@@ -699,7 +706,7 @@ static bool blender_keeps_memory(void) {
     int a = two_cycle ? (l >> 24) & 3 : (l >> 26) & 3;
     int m = two_cycle ? (l >> 20) & 3 : (l >> 22) & 3;
     int b = two_cycle ? (l >> 16) & 3 : (l >> 18) & 3;
-    return a == 3 && m == 1 && b == 2;
+    return a == 3 && ((m == 1 && b == 2) || (m == 2 && b == 1));
 }
 
 void gfx_other_mode_changed(void) {
@@ -731,6 +738,126 @@ static void gu_blend_func(void) {
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
 }
 
+/*
+ * A decal on the ground (a shadow) also passes the depth test on whatever
+ * stands in it, near its foot: a tree trunk, the legs of the notice board, a
+ * wall. The RDP darkens a row or two of those as well; without its blur that
+ * shows as dark pixels at their feet. So every surface that writes depth to
+ * the screen also writes what it is to the stencil (the screen's alpha, not
+ * used otherwise): upright or not, by the way its depth runs on the screen.
+ * A decal that lies flat leaves upright surfaces alone.
+ *
+ * The triangles of an opaque batch are sorted for this, the upright ones to
+ * the end of the batch's indices, and drawn as two ranges. About 0.3-0.5 ms a
+ * frame on the PSP. The functions for it are kept out of line: inlined into
+ * the batch and triangle code they cost 0.7 ms more, even switched off.
+ * no_upright.txt: none of this.
+ */
+#define STENCIL_UPRIGHT 0x2A   /* a value the cut passes don't leave behind */
+static bool sStencilClass = false; /* the batch writes depth to the screen: the stencil gets its class */
+static bool sClassify = false;     /* ... and its triangles are sorted by class (opaque) */
+static bool sDecalFlat = true;     /* every triangle of the decal batch lies flat */
+
+bool gfx_stencil_classes(void) {
+    return !sUprightOff;
+}
+
+static __attribute__((noinline)) void gu_stencil(int mode) {
+    if (mode == gGu.stencil) {
+        return;
+    }
+    if (mode == GU_STENCIL_OFF) {
+        sceGuDisable(GU_STENCIL_TEST);
+    } else {
+        if (gGu.stencil <= GU_STENCIL_OFF) {
+            sceGuEnable(GU_STENCIL_TEST);
+        }
+        bool writes = gGu.stencil == GU_STENCIL_FLAT || gGu.stencil == GU_STENCIL_UPRIGHT;
+        if (mode == GU_STENCIL_KEEP) {
+            sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP); /* (the test stays as it was: it passes, or it is unknown) */
+            if (!writes) {
+                sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
+            }
+        } else if (mode == GU_STENCIL_DECAL) {
+            sceGuStencilFunc(GU_NOTEQUAL, STENCIL_UPRIGHT, 0xFF);
+            if (gGu.stencil != GU_STENCIL_KEEP) {
+                sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP);
+            }
+        } else {
+            if (!writes) {
+                sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+            }
+            sceGuStencilFunc(GU_ALWAYS, mode == GU_STENCIL_UPRIGHT ? STENCIL_UPRIGHT : 0, 0xFF);
+        }
+    }
+    gGu.stencil = mode;
+}
+
+/* (a render target's stencil is its coverage, and its own business) */
+void gfx_gu_stencil_off(void) {
+    if (!gTarget.bound) {
+        gu_stencil(GU_STENCIL_OFF);
+    }
+}
+
+/* Does the triangle stand upright? Up the screen it does not get farther
+ * away as the ground does: it comes nearer, or its distance changes sideways
+ * more than upward. (1/w is linear on the screen; the differences below are
+ * those of 1/w times the product of the three w, which is positive.) */
+static __attribute__((noinline)) bool tri_upright(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2) {
+    if (v0->cw <= 0 || v1->cw <= 0 || v2->cw <= 0) {
+        return false;
+    }
+    float x1 = v1->nx - v0->nx, y1 = v1->ny - v0->ny;
+    float x2 = v2->nx - v0->nx, y2 = v2->ny - v0->ny;
+    float q1 = (v0->cw - v1->cw) * v2->cw;
+    float q2 = (v0->cw - v2->cw) * v1->cw;
+    float dqdx = q1 * y2 - q2 * y1, dqdy = x1 * q2 - x2 * q1;
+    if (x1 * y2 - x2 * y1 < 0) {
+        dqdy = -dqdy;
+    }
+    return dqdy >= -0.25f * fabsf(dqdx); /* 1/w falls with distance */
+}
+
+/*
+ * Decals (ZMODE_DEC: shadows, the light from a door) lie on or near the
+ * surface they mark. The RDP draws them where their depth is within a
+ * tolerance of the surface's: the depth a pixel spans (|dz/dx| + |dz/dy|),
+ * rounded up to a power of two and doubled, so one to two pixels' worth. Here
+ * they are pulled toward the eye instead (gGu.decal is the offset in use), by
+ * two pixels' worth (DECAL_SLOPES): snapping moves vertices on the screen and
+ * not in depth, which shifts the depth of a surface at a pixel by up to
+ * another 0.7 of a pixel's.
+ *
+ * A fixed offset of 32 was one pixel's worth in the village. The police
+ * station's door light lies on the ground, 0.9 of that under the top of the
+ * doorstep: part of the step was left unlit, along its diagonal or a jagged
+ * line, differently at every camera position.
+ */
+#define DECAL_MIN_OFFSET 32 /* depth buffer units */
+#define DECAL_SLOPES 2.0f
+static bool sDecal = false;                 /* the batch is a decal */
+static int sDecalOffset = DECAL_MIN_OFFSET; /* the largest tolerance of its triangles */
+
+/* The offset a decal triangle needs, in depth buffer units. */
+static int decal_tolerance(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2) {
+    if (v0->cw <= 0 || v1->cw <= 0 || v2->cw <= 0) {
+        return DECAL_MIN_OFFSET;
+    }
+    /* N64 pixels and the RDP's 15-bit depth (viewport scale 511, 5 fraction bits) */
+    float x1 = (v1->nx - v0->nx) * (N64_SCREEN_W / 2), y1 = (v1->ny - v0->ny) * (N64_SCREEN_H / 2);
+    float x2 = (v2->nx - v0->nx) * (N64_SCREEN_W / 2), y2 = (v2->ny - v0->ny) * (N64_SCREEN_H / 2);
+    float z0 = v0->cz / v0->cw;
+    float z1 = (v1->cz / v1->cw - z0) * (511 * 32), z2 = (v2->cz / v2->cw - z0) * (511 * 32);
+    float area = x1 * y2 - x2 * y1;
+    if (fabsf(area) < 1e-3f) {
+        return DECAL_MIN_OFFSET;
+    }
+    float dzdx = fabsf((z1 * y2 - z2 * y1) / area), dzdy = fabsf((x1 * z2 - x2 * z1) / area);
+    float tolerance = (dzdx + dzdy) * DECAL_SLOPES * 2; /* 15 bits of depth to the PSP's 16 */
+    return tolerance < 0xFFFF ? (int)tolerance : 0xFFFF;
+}
+
 void gfx_apply_render_state(bool depth_allowed) {
     uint32_t l = gRdp.other_l;
     bool zbuf = depth_allowed && (gRsp.geometry_mode & G_ZBUFFER) != 0;
@@ -752,9 +879,11 @@ void gfx_apply_render_state(bool depth_allowed) {
         sceGuDepthMask(depth_mask ? 0 : 1);
         gGu.depth_mask = depth_mask;
     }
-    if (decal != gGu.decal) {
-        sceGuDepthOffset(decal ? 32 : 0);
-        gGu.decal = decal;
+    /* a decal's offset is set with its triangles (see decal_tolerance) */
+    sDecal = decal;
+    if (!decal && gGu.decal != 0) {
+        sceGuDepthOffset(0);
+        gGu.decal = 0;
     }
     int fog = 0;
     bool two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
@@ -789,6 +918,9 @@ void gfx_apply_render_state(bool depth_allowed) {
     if (variant != gProjVariant) {
         gfx_upload_projection(variant);
     }
+
+    sStencilClass = depth_mask && depth_allowed && !gTarget.bound && !sUprightOff;
+    sClassify = sStencilClass && depth_test && !blend && !decal;
 
     if (blend != gGu.blend) {
         if (blend) {
@@ -994,7 +1126,7 @@ static void pass_texture(const GuTexture* to, const GuTexture* from) {
 
 /* The fog pass draws the same triangles again in the fog colour, from the
  * batch's fog vertices and with its indices. */
-static void draw_fog_pass(const Batch* b, const uint16_t* indices) {
+static void draw_fog_pass(const Batch* b, const uint16_t* indices, int nidx) {
     const GuVertex* fv = b->fogv;
     if (!b->in_arena) {
         GuVertex* mem = sceGuGetMemory(b->nverts * sizeof(GuVertex));
@@ -1010,7 +1142,7 @@ static void draw_fog_pass(const Batch* b, const uint16_t* indices) {
     sceGuDepthFunc(GU_EQUAL);
     if (gGu.depth_mask) sceGuDepthMask(1);
     if (gGu.alpha_test) sceGuDisable(GU_ALPHA_TEST);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx, indices, fv);
+    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, fv);
     if (gGu.texture) sceGuEnable(GU_TEXTURE_2D);
     if (!gGu.blend) sceGuDisable(GU_BLEND);
     if (!gGu.depth_test) sceGuDisable(GU_DEPTH_TEST);
@@ -1089,6 +1221,7 @@ static void draw_cut_soft(const GuVertex* verts, const uint16_t* indices, int ni
 
     /* back to the batch's state */
     sceGuDisable(GU_STENCIL_TEST);
+    gGu.stencil = GU_STENCIL_OFF;
     gu_blend_func();
     sceGuEnable(GU_ALPHA_TEST);
     sceGuAlphaFunc(GU_GREATER, gGu.alpha_ref, 0xFF);
@@ -1137,11 +1270,36 @@ static void draw_cut(const GuVertex* verts, const uint16_t* indices, int nidx) {
 
     /* back to the batch's state */
     sceGuDisable(GU_STENCIL_TEST);
+    gGu.stencil = GU_STENCIL_OFF;
     sceGuEnable(GU_ALPHA_TEST);
     sceGuTexScale(1.0f, 1.0f);
     sceGuTexOffset(0.0f, 0.0f);
     pass_texture(t1, t2);
     sceGuTexWrap(gGu.wrap_u, gGu.wrap_v);
+}
+
+/* A batch that writes depth to the screen: where it does, so is the class of
+ * the surface written, the two ranges of its indices in turn. */
+static __attribute__((noinline)) void draw_classes(const Batch* b, const GuVertex* verts, const uint16_t* indices,
+                                                   bool more_passes) {
+    if (b->nidx > 0) {
+        gu_stencil(GU_STENCIL_FLAT);
+        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx, indices, verts);
+    }
+    if (b->nidx_up > 0) {
+        gu_stencil(GU_STENCIL_UPRIGHT);
+        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx_up, indices + b->nidx, verts);
+    }
+    if (more_passes && b->nidx > 0 && b->nidx_up > 0) {
+        gu_stencil(GU_STENCIL_KEEP); /* the passes over both ranges would write one class for all of it */
+    }
+}
+
+/* Any other batch: a decal on the ground stays off what stands in it. */
+static __attribute__((noinline)) void batch_stencil(void) {
+    if (!gTarget.bound) {
+        gu_stencil(sDecal && sDecalFlat && !sUprightOff ? GU_STENCIL_DECAL : GU_STENCIL_OFF);
+    }
 }
 
 static void draw_batch(Batch* b) {
@@ -1154,18 +1312,29 @@ static void draw_batch(Batch* b) {
         memcpy(mem, b->verts, b->nverts * sizeof(GuVertex));
         verts = mem;
     }
-    uint16_t* indices = sceGuGetMemory(b->nidx * sizeof(uint16_t));
+    /* the upright triangles' indices follow the others */
+    int nidx = b->nidx + b->nidx_up;
+    uint16_t* indices = sceGuGetMemory(nidx * sizeof(uint16_t));
     memcpy(indices, b->idx, b->nidx * sizeof(uint16_t));
+    memcpy(indices + b->nidx, &b->idx[BATCH_MAX_INDICES - b->nidx_up], b->nidx_up * sizeof(uint16_t));
     if (sCutTex != NULL && gGu.texture) {
-        draw_cut(verts, indices, b->nidx);
+        draw_cut(verts, indices, nidx);
         return;
     }
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx, indices, verts);
-    if (sBatchTex2 != NULL && gGu.texture) {
-        draw_split_pass(verts, indices, b->nidx);
+    bool split = sBatchTex2 != NULL && gGu.texture, fog = sFogPass && b->fog_max > 0;
+    if (sStencilClass) {
+        draw_classes(b, verts, indices, split || fog);
+    } else {
+        if (gGu.stencil != GU_STENCIL_OFF || sDecal) {
+            batch_stencil();
+        }
+        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
     }
-    if (sFogPass && b->fog_max > 0) {
-        draw_fog_pass(b, indices);
+    if (split) {
+        draw_split_pass(verts, indices, nidx);
+    }
+    if (fog) {
+        draw_fog_pass(b, indices, nidx);
     }
 }
 
@@ -1173,15 +1342,16 @@ void gfx_flush_batch(void) {
     Batch* normal = &sBatches[DEPTH_NORMAL];
     Batch* near = &sBatches[DEPTH_NEAR];
     Batch* far = &sBatches[DEPTH_FAR];
-    int total = normal->nidx + near->nidx + far->nidx;
+    int nnormal = normal->nidx + normal->nidx_up;
+    int total = nnormal + near->nidx + far->nidx;
     if (total == 0) {
         return;
     }
     if (gTracing) {
-        const Batch* b = normal->nidx ? normal : near->nidx ? near : far;
+        const Batch* b = nnormal ? normal : near->nidx ? near : far;
         const GuVertex* d = &b->verts[0];
         rt_log("  draw#%u %3d+%d+%d zw %.4f/%.1f v (%.1f %.1f %.1f) uv (%.3f %.3f) col %08X | fit %d ta %d w %d tex %p %08X f%u s%u %ux%u var %X | cc %06X %08X prim %08X env %08X | gm %06X oml %08X omh %06X | z %d/%d bl %d at %d fog %d/%d",
-               gStats.draw_calls, normal->nidx, near->nidx, far->nidx, sTraceZ, sTraceW, d->x, d->y, d->z, d->u, d->v,
+               gStats.draw_calls, nnormal, near->nidx, far->nidx, sTraceZ, sTraceW, d->x, d->y, d->z, d->u, d->v,
                d->color, gFit.mode, gFit.tex_alpha, gFit.white_rgb, gBatchTex,
                (unsigned)(sTraceKey.addr_bits >> 3), sTraceKey.fmt, sTraceKey.siz, sTraceKey.tile_w, sTraceKey.tile_h,
                (unsigned)sTraceKey.variant,
@@ -1190,7 +1360,11 @@ void gfx_flush_batch(void) {
                sFogPass ? 2 : gGu.fog, normal->fog_max);
     }
     if (gfx_draw_enabled()) {
-        if (normal->nidx > 0) {
+        if (sDecal && sDecalOffset != gGu.decal) {
+            sceGuDepthOffset(sDecalOffset);
+            gGu.decal = sDecalOffset;
+        }
+        if (nnormal > 0) {
             draw_batch(normal);
         }
         if (near->nidx > 0 || far->nidx > 0) {
@@ -1212,8 +1386,11 @@ void gfx_flush_batch(void) {
     for (int i = 0; i < 3; i++) {
         sBatches[i].nverts = 0;
         sBatches[i].nidx = 0;
+        sBatches[i].nidx_up = 0;
         sBatches[i].fog_max = 0;
     }
+    sDecalOffset = DECAL_MIN_OFFSET;
+    sDecalFlat = true;
     if (sArenaReady) {
         arena_reserve();
     }
@@ -1293,9 +1470,16 @@ static void pack_vertex(const RspVertex* v, int index) {
  * hot path. A vertex is packed once per render state and put in the batch's
  * vertex array once per batch; the triangle itself is three indices.
  */
-static void emit_plain_tri(int i0, int i1, int i2) {
+static void emit_plain_tri(int i0, int i1, int i2, bool upright) {
     const int idx[3] = { i0, i1, i2 };
     Batch* b = BATCH;
+    uint16_t* out = b->idx + b->nidx;
+    if (upright) {
+        b->nidx_up += 3;
+        out = &b->idx[BATCH_MAX_INDICES - b->nidx_up];
+    } else {
+        b->nidx += 3;
+    }
     for (int k = 0; k < 3; k++) {
         int i = idx[k];
         if (sPackedBatch[i] != sVertGen) {
@@ -1316,14 +1500,14 @@ static void emit_plain_tri(int i0, int i1, int i2) {
             sPackedIndex[i] = (uint16_t)at;
             sPackedBatch[i] = sVertGen;
         }
-        b->idx[b->nidx++] = sPackedIndex[i];
+        out[k] = sPackedIndex[i];
     }
 }
 
 /* Appends a clipped vertex. These are made on the spot and shared by nothing,
  * so each one gets its own slot and an index straight to it. */
-static inline void emit_vertex(Batch* b, const ClipVertex* v) {
-    if (sBatches[0].nidx + sBatches[1].nidx + sBatches[2].nidx == 0) {
+static inline uint16_t emit_vertex(Batch* b, const ClipVertex* v) {
+    if (b->nverts == 0 && sBatches[0].nverts + sBatches[1].nverts + sBatches[2].nverts == 0) {
         sTraceZ = v->cw != 0 ? v->cz / v->cw : 0;
         sTraceW = v->cw;
     }
@@ -1353,7 +1537,7 @@ static inline void emit_vertex(Batch* b, const ClipVertex* v) {
             b->fog_max = (uint8_t)f;
         }
     }
-    b->idx[b->nidx++] = (uint16_t)at;
+    return (uint16_t)at;
 }
 
 #define PLANE_NEAR_Z 5
@@ -1423,7 +1607,7 @@ static void split_poly(const ClipVertex* in, int n, int plane, ClipVertex* keep,
     }
 }
 
-static void emit_poly(const ClipVertex* poly, int n, int depth) {
+static void emit_poly(const ClipVertex* poly, int n, int depth, bool upright) {
     if (gTracing) {
         char line[512];
         int len = 0;
@@ -1436,9 +1620,16 @@ static void emit_poly(const ClipVertex* poly, int n, int depth) {
     }
     Batch* b = &sBatches[depth];
     for (int i = 1; i + 1 < n; i++) {
-        emit_vertex(b, &poly[0]);
-        emit_vertex(b, &poly[i]);
-        emit_vertex(b, &poly[i + 1]);
+        uint16_t* out = b->idx + b->nidx;
+        if (upright) {
+            b->nidx_up += 3;
+            out = &b->idx[BATCH_MAX_INDICES - b->nidx_up];
+        } else {
+            b->nidx += 3;
+        }
+        out[0] = emit_vertex(b, &poly[0]);
+        out[1] = emit_vertex(b, &poly[i]);
+        out[2] = emit_vertex(b, &poly[i + 1]);
     }
 }
 
@@ -1484,11 +1675,23 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
         int len = 0;
         for (int k = 0; k < 3; k++) {
             float w = vs[k]->cw;
-            len += snprintf(line + len, sizeof(line) - len, " (%.3f,%.3f z%.2f w%.0f uv %.0f,%.0f a%.2f)",
+            len += snprintf(line + len, sizeof(line) - len, " (%.3f,%.3f z%.6f w%.2f uv %.0f,%.0f a%.2f)",
                             w != 0 ? (vs[k]->cx / w + 1) * 160 : 0, w != 0 ? (1 - vs[k]->cy / w) * 120 : 0,
                             w != 0 ? vs[k]->cz / w : 0, w, vs[k]->u / 32, vs[k]->v / 32, vs[k]->a);
         }
-        rt_log("    tri%s", line);
+        rt_log("    tri%s%s", line, sClassify && tri_upright(v0, v1, v2) ? " upright" : "");
+    }
+    bool upright = false;
+    if (sClassify) {
+        upright = tri_upright(v0, v1, v2);
+    } else if (sDecal) {
+        int tolerance = decal_tolerance(v0, v1, v2);
+        if (tolerance > sDecalOffset) {
+            sDecalOffset = tolerance;
+        }
+        if (sDecalFlat && tri_upright(v0, v1, v2)) {
+            sDecalFlat = false;
+        }
     }
     uint16_t flags = v0->clip | v1->clip | v2->clip;
     /* The PSP drops a whole triangle if any vertex lies outside the depth
@@ -1499,7 +1702,7 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
     if (!(flags & (CLIP_NEAR | CLIP_GUARD)) && !split_depth) {
         /* Whole triangle, three corners: the only batch that can fill up. */
         Batch* b = BATCH;
-        if (b->nverts + 3 > BATCH_MAX_VERTS || b->nidx + 3 > BATCH_MAX_INDICES) {
+        if (b->nverts + 3 > BATCH_MAX_VERTS || b->nidx + b->nidx_up + 3 > BATCH_MAX_INDICES) {
             gfx_flush_batch();
         }
         if (gTracing) {
@@ -1507,9 +1710,9 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
             to_clip_vertex(&tri[0], v0);
             to_clip_vertex(&tri[1], v1);
             to_clip_vertex(&tri[2], v2);
-            emit_poly(tri, 3, DEPTH_NORMAL);
+            emit_poly(tri, 3, DEPTH_NORMAL, upright);
         } else {
-            emit_plain_tri(i0 & 0x3F, i1 & 0x3F, i2 & 0x3F);
+            emit_plain_tri(i0 & 0x3F, i1 & 0x3F, i2 & 0x3F, upright);
         }
         return;
     }
@@ -1517,7 +1720,7 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
     /* Clipping can turn one triangle into a fan in each of the three batches. */
     for (int i = 0; i < 3; i++) {
         if (sBatches[i].nverts + 3 * MAX_POLY > BATCH_MAX_VERTS ||
-            sBatches[i].nidx + 3 * MAX_POLY > BATCH_MAX_INDICES) {
+            sBatches[i].nidx + sBatches[i].nidx_up + 3 * MAX_POLY > BATCH_MAX_INDICES) {
             gfx_flush_batch();
             break;
         }
@@ -1543,21 +1746,21 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
         }
     }
     if (!split_depth) {
-        emit_poly(in, n, DEPTH_NORMAL);
+        emit_poly(in, n, DEPTH_NORMAL, upright);
         return;
     }
     ClipVertex outside[MAX_POLY];
     int n_out;
     split_poly(in, n, PLANE_NEAR_Z, out, &n, outside, &n_out);
     if (n_out >= 3) {
-        emit_poly(outside, n_out, DEPTH_NEAR);
+        emit_poly(outside, n_out, DEPTH_NEAR, false);
     }
     split_poly(out, n, PLANE_FAR_Z, in, &n, outside, &n_out);
     if (n_out >= 3) {
-        emit_poly(outside, n_out, DEPTH_FAR);
+        emit_poly(outside, n_out, DEPTH_FAR, false);
     }
     if (n >= 3) {
-        emit_poly(in, n, DEPTH_NORMAL);
+        emit_poly(in, n, DEPTH_NORMAL, upright);
     }
 }
 

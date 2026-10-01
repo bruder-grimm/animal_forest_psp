@@ -360,6 +360,7 @@ void rt_gfx_init(void) {
 static uint32_t sDisplayFbs[4];
 static int sNumDisplayFbs = 0;
 static uint32_t sLastShownFb = 0;
+static uint32_t sDrawingFb = 0;   /* the screen colour image of the frame being drawn */
 
 bool gfx_is_display_fb(uint32_t addr) {
     addr &= 0x1FFFFFFF;
@@ -406,7 +407,8 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
             return;
         }
     }
-    bool from_back = src != sLastShownFb;
+    /* The frame being drawn is in the draw buffer; a finished one is on screen. */
+    bool from_back = src == sDrawingFb || src != sLastShownFb;
     uint32_t vram = kColorBufs[from_back ? sDrawBuf : sShownBuf];
     gfx_target_need(dst, width * height * 2); /* a target's picture there goes in first, under the capture */
 
@@ -438,9 +440,42 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
             MEM_HU(0, dst + 2 * (y * width + x)) = v;
         }
     }
+    /* A texture made from the last picture saved there (the screen behind a menu) is out of date. */
+    gfx_tex_invalidate_range(dst, width * height * 2);
     if (gTracing) {
         rt_log("  capture fb %08X (%s) -> %08X %ux%u", src, from_back ? "back" : "front", dst, width, height);
     }
+}
+
+/*
+ * The game saving a frame's coverage (PreRender, before a menu opens over the
+ * frozen screen): the framebuffer, turned into coverage values by a fill, is
+ * drawn into its own memory as an 8-bit image, a byte a pixel, for the game's
+ * edge filter on the CPU to read. The port's picture has no N64 coverage, so
+ * the fill is left out (blender_keeps_memory) and every pixel counts as fully
+ * covered: that is what the image gets, and the filter leaves the saved picture
+ * as it is. Drawn on the screen like any rectangle, the image covered the frame
+ * with whatever the framebuffer's memory held, and a present that was still on
+ * its way showed that.
+ *
+ * True if the rectangle (in pixels of the colour image) was such a draw.
+ */
+bool gfx_coverage_rect(float x0, float y0, float x1, float y1) {
+    if (gRdp.cimg_siz != G_IM_SIZ_8b || !gfx_drawing_to_display()) {
+        return false;
+    }
+    if (gfx_is_display_fb(gRdp.cimg)) {
+        uint32_t width = gRdp.cimg_width < N64_SCREEN_W ? gRdp.cimg_width : N64_SCREEN_W;
+        uint32_t left = x0 > 0 ? (uint32_t)x0 : 0, right = x1 < (float)width ? (uint32_t)x1 : width;
+        uint32_t top = y0 > 0 ? (uint32_t)y0 : 0, bottom = y1 < N64_SCREEN_H ? (uint32_t)y1 : N64_SCREEN_H;
+        uint8_t* rdram = g_rdram;
+        for (uint32_t y = top; y < bottom; y++) {
+            for (uint32_t x = left; x < right; x++) {
+                MEM_BU(0, gRdp.cimg + y * gRdp.cimg_width + x) = 0xFF;
+            }
+        }
+    }
+    return true;
 }
 
 /* ---- render targets ----------------------------------------------------- */
@@ -490,7 +525,6 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
 
 RenderTarget gTarget;
 uint32_t gDisplayZimg = 0;
-static uint32_t sDrawingFb = 0;   /* the screen colour image of the frame being drawn */
 /* Staging for block transfers: the GE moves pixels to and from VRAM (the CPU
    reading VRAM directly works on hardware, but emulators don't see it). */
 static uint32_t sRtPixels[RT_MAX * RT_MAX] __attribute__((aligned(64)));
@@ -642,6 +676,7 @@ static void ge_draw_to_target(void) {
     sceGuEnable(GU_STENCIL_TEST);
     sceGuStencilFunc(GU_ALWAYS, 0xFF, 0xFF);
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+    gGu.stencil = -1;
     gMap.scale_x = gMap.scale_y = 1.0f;
     gMap.crop_x = gMap.crop_y = 0.0f;
     gMap.x0 = 0;
@@ -667,6 +702,7 @@ void gfx_target_leave(void) {
     sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
     sceGuDepthBuffer((void*)DEPTH_VRAM, BUF_WIDTH);
     sceGuDisable(GU_STENCIL_TEST);
+    gGu.stencil = GU_STENCIL_OFF;
     gfx_set_viewport();
     gfx_set_scissor();
 }

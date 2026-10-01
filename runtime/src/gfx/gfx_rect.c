@@ -15,6 +15,7 @@ bool gfx_draw_rect(float x0, float y0, float x1, float y1, float u0, float v0, f
                    uint32_t color, const GuTexture* tex, bool flip) {
     gfx_open_frame();
     gfx_flush_batch();
+    gfx_gu_stencil_off();
     if (gGu.fog) {
         sceGuDisable(GU_FOG);
         gGu.fog = 0;
@@ -132,9 +133,14 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
     gfx_flush_batch();
 
     if (gRdp.cimg == gRdp.zimg) {
-        /* Depth buffer clear */
+        /* Depth buffer clear; on the screen, with what stood where (see sStencilClass) */
         sceGuClearDepth(0);
-        sceGuClear(GU_DEPTH_BUFFER_BIT);
+        if (to_rt || !gfx_stencil_classes()) {
+            sceGuClear(GU_DEPTH_BUFFER_BIT);
+        } else {
+            sceGuClearStencil(0);
+            sceGuClear(GU_DEPTH_BUFFER_BIT | GU_STENCIL_BUFFER_BIT);
+        }
         return;
     }
 
@@ -221,7 +227,7 @@ void gfx_tex_rect(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, bool flip)
         x1 += 1.0f;
         y1 += 1.0f;
     }
-    if (x1 <= x0 || y1 <= y0) {
+    if (x1 <= x0 || y1 <= y0 || gfx_coverage_rect(x0, y0, x1, y1)) {
         return;
     }
     if (!gfx_drawing_to_display()) {
