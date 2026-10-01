@@ -2,13 +2,18 @@
 
 This repository contains no game data -- no ROM, no game text, no extracted
 graphics (the EBOOT's icon and background in `assets/` are screenshots of the
-port's title screen). You supply your own dumps and one script builds everything from them:
+port's title screen). You supply your own dumps by putting them in the `roms/`
+folder, and one script builds everything from them:
 
 ```bash
-./build.sh "Animal Crossing (Europe).iso" "Doubutsu no Mori (Japan).z64" "Animal Forest (U) [!].z64"
+./build.sh
 ```
 
-The last file is optional; see the third item below.
+Each file is recognised by its content (`scripts/find_inputs.py`), so its name
+does not matter, nor where it is in `roms/`, and a ROM can be in any byte order.
+`./build.sh` says what it made of every file and what is missing; files named on
+the command line (`./build.sh ~/dumps/disc.iso ...`) are looked at too. The
+files are:
 
 - the **European GameCube *Animal Crossing*** (GAFP01; `.iso`, `.gcm` or
   `.ciso`): the English dialogue, names and letters;
@@ -23,12 +28,14 @@ The last file is optional; see the third item below.
   stay Japanese. The two builds differ in the recompiled code too (see
   section 2), so going from one to the other recompiles the game.
 
-The ROMs can be in any byte order and either order.
+`roms/README.md` has the MD5 of every accepted ROM dump (all three byte orders)
+and says what else is recognised and refused.
 
 It leaves `dist/AFPSP/` -- `EBOOT.PBP` (with the English text packed into
 it) and `baserom.z64` -- ready to copy to a PSP or PPSSPP ([Install](#7-install)).
 The first run takes a while (it clones and builds the decomp and N64Recomp);
-later runs only redo what changed. It needs the tools of section 1.
+later runs only redo what changed. It needs the tools of section 1, or
+[Docker](#building-with-docker) instead.
 
 The rest of this file describes what `build.sh` does, step by step, for
 working on the port.
@@ -48,6 +55,43 @@ It was developed on macOS (Apple Silicon); Linux should work with the same
 tools. Everything that is downloaded or generated goes under `work/`, which
 is not tracked.
 
+## Building with Docker
+
+If installing the tools below is more than you want, `docker-build.sh` runs
+`build.sh` in a container that has all of them. The only thing to install is
+[Docker](https://docs.docker.com/get-docker/):
+
+```bash
+./docker-build.sh
+```
+
+It finds the dumps in `roms/` like `build.sh` does (and takes the same optional
+file arguments) and leaves the same `dist/AFPSP/`, owned by you, with `kcall.prx`
+included (the image has psp-media-engine-custom-core's). Files named on the
+command line are mounted read-only.
+
+- The `Dockerfile` pins everything: Ubuntu 24.04, the PSPDEV release
+  (v20260701, psp-gcc 15.2, checked against a SHA-256: the one the port was
+  developed and tested on a PSP with) and the psp-media-engine-custom-core
+  commit. It holds no game data and not even this
+  repository, which is mounted when it runs.
+- The image is `linux/amd64`, because the decomp downloads x86-64 Linux builds
+  of the IDO compilers. On an Apple Silicon Mac or other ARM machine Docker
+  emulates it, which is slower but works: a whole first build (decomp,
+  N64Recomp, the game, the EBOOT) took about ten minutes on 4 cores that way.
+  Give Docker's VM enough memory (4 GB or more) and as many cores as you can
+  spare; `JOBS=n` limits the parallel jobs.
+- The decomp, N64Recomp and the object files live in two Docker volumes,
+  `afpsp-work` and `afpsp-build`, not in `work/` and `build/` on the host, so a
+  host build and a Docker build cannot disturb each other, and a later run only
+  redoes what changed. `docker volume rm afpsp-work afpsp-build` starts from
+  scratch; `docker run --rm -it --entrypoint bash -v afpsp-work:/src/work
+  -v afpsp-build:/src/build afpsp-build` opens a shell in them.
+- Without a shell script (Windows without WSL): `docker build --platform
+  linux/amd64 -t afpsp-build .`, then `docker run --rm --platform linux/amd64
+  -v "%cd%:/src" -v afpsp-work:/src/work -v afpsp-build:/src/build
+  afpsp-build`, with the dumps in `roms\`.
+
 ## 1. Tools
 
 | What | Needed for | Notes |
@@ -63,8 +107,12 @@ is not tracked.
 
 You need your own dumps.
 
-- **Japanese *Animal Forest*** (NUS-NAFJ) -- the decomp is built from it.
-  Any byte order; `prepare_rom.py` normalises it and checks its MD5
+`./build.sh` does all of this by itself (`scripts/find_inputs.py`); to do it by
+hand, `prepare_rom.py` identifies a ROM by its MD5, in any byte order, and
+normalises it to where the build expects it. `prepare_rom.py --list` shows the
+hashes it knows (also in `roms/README.md`).
+
+- **Japanese *Animal Forest*** (NUS-NAFJ) -- the decomp is built from it
   (`a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`):
 
   ```bash
@@ -200,6 +248,11 @@ nothing is logged. `runtime/README.md` lists them and explains the log.
   (No git history, e.g. a zip? `sed -i 's/\r$//' build.sh scripts/* tools/*
   Makefile recomp/*` does it.) Under WSL, keep the checkout on WSL's own
   filesystem (`~/`), not `/mnt/c/...`.
+- **`Missing: the Japanese N64 Animal Forest ROM ...`** (or the disc) -- the
+  file is not in `roms/`, or is not what it looks like. `scripts/find_inputs.py`
+  prints what it makes of every file there; a ROM it does not know shows its MD5,
+  to compare with the table in `roms/README.md`. Archives (`.zip`, `.7z`) have to
+  be unpacked first.
 - **`Missing work/recomp_out: run scripts/recompile.sh first`** -- stages 3
   and 4 haven't run yet (`./build.sh` runs them all).
 - **`MD5 ... is not an Animal Forest ROM this port knows`** -- the ROM is

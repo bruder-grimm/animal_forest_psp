@@ -15,3 +15,7 @@ __pycache__/
 *.ciso
 *.gcm
 *.bin
+
+# the dumps you put in roms/ (the folder itself and its README stay)
+/roms/*
+!/roms/README.md

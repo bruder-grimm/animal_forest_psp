@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Builds the Animal Forest PSP port from your own game dumps, start to finish.
 #
-#   ./build.sh <Animal Crossing GameCube disc> <Japanese N64 ROM> [<fan translation N64 ROM>]
+#   ./build.sh [FILE...]
+#
+# Put your dumps in the roms/ folder (roms/README.md says what and how). Each file
+# is recognised by its content, so its name, the order and the byte order of a ROM
+# do not matter; files named on the command line are looked at too.
 #
 #   GameCube disc    the European Animal Crossing (GAFP01), .iso/.gcm/.ciso:
 #                    the English dialogue, names and letters
@@ -13,9 +17,8 @@
 #                    dialogue, names and letters are still English, but the
 #                    title screen, menus and signs are Japanese.
 #
-# The ROMs can be in any byte order and either order; they are told apart by
-# their MD5 (scripts/prepare_rom.py). The build is specific to the ROM the game
-# plays: switching between the two recompiles the game.
+# (scripts/find_inputs.py and scripts/prepare_rom.py tell them apart.) The build is
+# specific to the ROM the game plays: switching between the two recompiles the game.
 #
 # The repo holds no game data (bar the EBOOT's icon and background, screenshots
 # of the port's title screen): everything comes from these files. The result
@@ -34,12 +37,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 1; }
-[ $# -ge 2 ] && [ $# -le 3 ] || usage
-DISC="$1"; shift
-for f in "$DISC" "$@"; do
-    [ -f "$f" ] || { echo "No such file: $f"; exit 1; }
-done
+case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;; esac
 
 export PSPDEV="${PSPDEV:-$HOME/pspdev}"
 export PATH="$PSPDEV/bin:$PATH"
@@ -63,31 +61,15 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 
 # --- the inputs ----------------------------------------------------------
-step "Checking the disc and the ROMs"
-PYTHONPATH="$ROOT/tools" python3 - "$DISC" <<'EOF'
-import sys
-import gc_disc
-try:
-    img = gc_disc.open_image(sys.argv[1])
-    game = img.disc.read(0, 6)
-except Exception as e:
-    sys.exit(f"{sys.argv[1]}: not a GameCube disc image ({e})")
-if game != b"GAFP01" or "tgc/forest_Eng_Final_PAL50.tgc" not in img.files:
-    sys.exit(f"{sys.argv[1]}: this is {game!r}; the European Animal Crossing (GAFP01) is needed")
-print("disc: Animal Crossing (Europe), GAFP01")
-EOF
-ROMS="$(python3 scripts/prepare_rom.py "$@")"
-echo "$ROMS" | sed 's/^/rom: /'
-echo "$ROMS" | grep -q '^jp ' || {
-    echo "The Japanese Animal Forest ROM is missing: the game's code is recompiled from it."
-    exit 1
-}
+step "Looking for the disc and the ROMs (in roms/ and on the command line)"
+INPUTS="$(python3 scripts/find_inputs.py "$@")" || exit 1
+DISC="$(echo "$INPUTS" | sed -n 's/^disc //p')"
 # The ROM the game plays, and so the variant of the recompiled code.
-if echo "$ROMS" | grep -q '^en '; then
+if echo "$INPUTS" | grep -q '^en '; then
     ROM=en
 else
     ROM=jp
-    echo "No English fan translation ROM (Animal Forest (U) [!]) given: the game will play the"
+    echo "No English fan translation ROM (Animal Forest (U) [!]) found: the game will play the"
     echo "Japanese ROM, with the English dialogue from the disc but Japanese title screen and menus."
 fi
 

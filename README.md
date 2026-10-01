@@ -3,20 +3,25 @@
 ## Building
 
 This repository contains no game data (only two title-screen screenshots,
-used as the EBOOT's icon and background). You supply your own dumps:
+used as the EBOOT's icon and background). You supply your own dumps, by putting
+them in the [`roms/`](roms/README.md) folder; the build finds them by their
+content, so what they are called does not matter:
 
-- the **Japanese N64 *Animal Forest*** ROM (NUS-NAFJ; MD5
-  `a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`), which the game's
-  code is recompiled from
-- optionally the **English fan translation** ROM *Animal Forest (U) [!]*
-  (MD5 `f827d11ee513d5edde44a3a9598f0934`), which the game then plays, with
-  its English title logo, menus and screens. Without it the game plays the
-  Japanese ROM: the dialogue, names and letters are still English, but the
-  title screen, menus and signs stay Japanese
+- the **Japanese N64 *Animal Forest*** ROM (NUS-NAFJ; `.z64`, `.v64` or `.n64`),
+  which the game's code is recompiled from
+- optionally the **English fan translation** ROM *Animal Forest (U) [!]*, which
+  the game then plays, with its English title logo, menus and screens. Without
+  it the game plays the Japanese ROM: the dialogue, names and letters are still
+  English, but the title screen, menus and signs stay Japanese
 - the **European GameCube *Animal Crossing*** disc image (GAFP01; `.iso`,
   `.gcm` or `.ciso`), for the English text
 
+[`roms/README.md`](roms/README.md) lists the accepted MD5s.
+
 ### 1. Install the tools
+
+(Or skip steps 1 and 2 and [build in Docker](#or-build-in-docker): the only thing
+to install is Docker.)
 
 - [PSPDEV](https://pspdev.github.io/) toolchain, in `~/pspdev` or at `$PSPDEV`
 - [psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core),
@@ -29,12 +34,22 @@ used as the EBOOT's icon and background). You supply your own dumps:
 ### 2. Build
 
 ```bash
-./build.sh "Animal Crossing (Europe).iso" "Doubutsu no Mori (Japan).z64" "Animal Forest (U) [!].z64"
+./build.sh
 ```
 
-(Leave out the last file to build for the Japanese ROM.) The ROMs can be in any byte order. The first run takes a while: it clones and
-builds the decomp and N64Recomp, recompiles the game and builds the English
-text. Later runs only redo what changed.
+It says what it made of each file in `roms/` and what is missing. The first run
+takes a while: it clones and builds the decomp and N64Recomp, recompiles the
+game and builds the English text. Later runs only redo what changed.
+
+### Or: build in Docker
+
+```bash
+./docker-build.sh
+```
+
+The same files in `roms/` and the same result as `build.sh` (`dist/AFPSP/`, with
+`kcall.prx` already in it), but every tool comes from a Docker image, built
+for you by the script. See [BUILDING.md](BUILDING.md#building-with-docker).
 
 ### 3. Install
 

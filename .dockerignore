@@ -1,0 +1,3 @@
+# The image holds only tools: the repository is mounted when it runs, so nothing
+# is sent to the daemon as build context.
+*

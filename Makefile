@@ -2,7 +2,7 @@
 # (work/recomp_out, see scripts/recompile.sh) and the runtime (runtime/).
 # BUILDING.md has the whole procedure and the variables below.
 #
-#   ./build.sh <GameCube disc> <Japanese ROM> [<fan translation ROM>]   does everything, up to dist/AFPSP
+#   ./build.sh   finds the dumps in roms/ and does everything, up to dist/AFPSP
 #   gmake           -> build/psp/EBOOT.PBP
 #   gmake install   -> copy the EBOOT, the ROM and the English text into PPSSPP's memory stick
 #   gmake clean
