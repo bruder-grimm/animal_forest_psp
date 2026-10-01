@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Builds the Animal Forest PSP port from your own game dumps, start to finish.
 #
-#   ./build.sh <Animal Crossing GameCube disc> <Japanese N64 ROM> <fan translation N64 ROM>
+#   ./build.sh <Animal Crossing GameCube disc> <Japanese N64 ROM> [<fan translation N64 ROM>]
 #
 #   GameCube disc    the European Animal Crossing (GAFP01), .iso/.gcm/.ciso:
 #                    the English dialogue, names and letters
 #   Japanese ROM     Animal Forest (NUS-NAFJ): the game's code is recompiled
 #                    from it
-#   fan translation  "Animal Forest (U) [!]", a patch of the Japanese ROM: the
-#                    ROM the game plays (English logo, menus and screens)
+#   fan translation  optional: "Animal Forest (U) [!]", a patch of the Japanese
+#                    ROM, which the game then plays (English logo, menus and
+#                    screens). Without it the game plays the Japanese ROM: the
+#                    dialogue, names and letters are still English, but the
+#                    title screen, menus and signs are Japanese.
 #
 # The ROMs can be in any byte order and either order; they are told apart by
-# their MD5 (scripts/prepare_rom.py).
+# their MD5 (scripts/prepare_rom.py). The build is specific to the ROM the game
+# plays: switching between the two recompiles the game.
 #
 # The repo holds no game data (bar the EBOOT's icon and background, screenshots
 # of the port's title screen): everything comes from these files. The result
@@ -31,7 +35,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 1; }
-[ $# -eq 3 ] || usage
+[ $# -ge 2 ] && [ $# -le 3 ] || usage
 DISC="$1"; shift
 for f in "$DISC" "$@"; do
     [ -f "$f" ] || { echo "No such file: $f"; exit 1; }
@@ -78,10 +82,14 @@ echo "$ROMS" | grep -q '^jp ' || {
     echo "The Japanese Animal Forest ROM is missing: the game's code is recompiled from it."
     exit 1
 }
-echo "$ROMS" | grep -q '^en ' || {
-    echo "The English fan translation ROM (Animal Forest (U) [!]) is missing: the game plays it."
-    exit 1
-}
+# The ROM the game plays, and so the variant of the recompiled code.
+if echo "$ROMS" | grep -q '^en '; then
+    ROM=en
+else
+    ROM=jp
+    echo "No English fan translation ROM (Animal Forest (U) [!]) given: the game will play the"
+    echo "Japanese ROM, with the English dialogue from the disc but Japanese title screen and menus."
+fi
 
 # --- the decomp: work/af/build/animalforest-jp.elf -----------------------
 ELF="$ROOT/work/af/build/animalforest-jp.elf"
@@ -102,11 +110,12 @@ scripts/setup_recomp.sh
 STAMP="$ROOT/work/recomp_out/stamp.txt"
 stamp="$(cat "$ELF" recomp/af.jp.toml recomp/overlays.txt recomp/n64recomp-psp.patch \
     recomp/n64recomp-base-commit.txt scripts/recompile.sh | cksum)"
+[ "$ROM" = en ] || stamp="$stamp $ROM"
 if [ -f work/recomp_out/funcs.h ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$stamp" ]; then
     step "Recompiled code is up to date (work/recomp_out)"
 else
-    step "Recompiling the game to C"
-    scripts/recompile.sh
+    step "Recompiling the game to C (for the $ROM ROM)"
+    scripts/recompile.sh "$ROM"
     echo "$stamp" > "$STAMP"
 fi
 
@@ -122,7 +131,7 @@ step "Building the EBOOT"
 step "Collecting $OUT"
 mkdir -p "$OUT"
 cp build/psp/EBOOT.PBP "$OUT/EBOOT.PBP"
-cp work/af/baseroms/en/baserom.z64 "$OUT/baserom.z64"
+cp "work/af/baseroms/$ROM/baserom.z64" "$OUT/baserom.z64"
 # The English text is inside the EBOOT; loose copies from an older build would only mislead.
 rm -f "$OUT/text_en.bin" "$OUT/names_en.bin"
 if [ -n "${KCALL_PRX:-}" ]; then

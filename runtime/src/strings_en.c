@@ -1,5 +1,6 @@
 /*
- * strings_en.c -- English dates and times for the English fan translation.
+ * strings_en.c -- English dates and times, for the English fan translation
+ * and for the GameCube dialogue.
  *
  * The game builds a date or time out of a number and a unit word from its
  * string table (m_string.c): "9" + "がつ" (month), "25" + "にち" (day),
@@ -22,8 +23,9 @@
  * names don't fit their buffers and go through names_en.c's tokens.
  *
  * recomp/af.jp.toml hooks the start of each mString_Load_*StringFromRom;
- * a hook that returns true has done the work. With any other ROM they
- * return false and the game's own code runs.
+ * a hook that returns true has done the work. With the Japanese ROM and no
+ * English dialogue (text_en.bin) they return false and the game's own code
+ * runs.
  */
 #include <stdio.h>
 #include <string.h>
@@ -37,9 +39,11 @@ static bool english(void) {
     if (sEnglish < 0) {
         uint8_t title[20];
         rt_rom_read(0x20, title, sizeof(title));
-        sEnglish = memcmp(title, "ANIMAL FOREST", 13) == 0;
+        bool fan = memcmp(title, "ANIMAL FOREST", 13) == 0;
+        /* The GameCube dialogue is English whatever ROM it is read over. */
+        sEnglish = fan || rt_text_en_active();
         if (sEnglish) {
-            rt_log("strings: English ROM, dates and times in English");
+            rt_log("strings: %s, dates and times in English", fan ? "English ROM" : "English dialogue");
         }
     }
     return sEnglish != 0;

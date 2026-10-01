@@ -8,14 +8,20 @@ port's title screen). You supply your own dumps and one script builds everything
 ./build.sh "Animal Crossing (Europe).iso" "Doubutsu no Mori (Japan).z64" "Animal Forest (U) [!].z64"
 ```
 
+The last file is optional; see the third item below.
+
 - the **European GameCube *Animal Crossing*** (GAFP01; `.iso`, `.gcm` or
   `.ciso`): the English dialogue, names and letters;
 - the **Japanese N64 *Animal Forest*** (NUS-NAFJ; MD5
   `a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`): the game's code
   is recompiled from it;
-- the **English fan translation** *Animal Forest (U) [!]* (MD5
+- optionally the **English fan translation** *Animal Forest (U) [!]* (MD5
   `f827d11ee513d5edde44a3a9598f0934`), a patch of the Japanese ROM: the ROM
-  the game plays, with its English title logo, menus and screens.
+  the game plays, with its English title logo, menus and screens. Without it
+  the game plays the Japanese ROM: the dialogue, names and letters are still
+  English (they come from the disc), but the title screen, menus and signs
+  stay Japanese. The two builds differ in the recompiled code too (see
+  section 2), so going from one to the other recompiles the game.
 
 The ROMs can be in any byte order and either order.
 
@@ -65,19 +71,22 @@ You need your own dumps.
   scripts/prepare_rom.py path/to/your/rom.z64            # -> work/af/baseroms/jp/baserom.z64
   ```
 
-- **The ROM the port plays**: the English fan translation *Animal Forest
-  (U) [!]* (MD5 `f827d11ee513d5edde44a3a9598f0934`), a data-only patch of the
-  Japanese ROM. `recomp/af.jp.toml` applies its five changed instructions to
-  the recompiled code, so the build expects it. `prepare_rom.py` recognises
-  it too:
+- **The English fan translation** *Animal Forest (U) [!]* (MD5
+  `f827d11ee513d5edde44a3a9598f0934`), optional: a data-only patch of the
+  Japanese ROM, and the ROM the port plays when you have it.
+  `recomp/af.jp.toml` applies its five changed instructions to the recompiled
+  code, so the generated code is specific to the ROM played. `prepare_rom.py`
+  recognises it too:
 
   ```bash
   scripts/prepare_rom.py "path/to/Animal Forest (U) [!].z64"   # -> work/af/baseroms/en/baserom.z64
   ```
 
-  To play the Japanese ROM instead, delete the "English fan translation"
-  block from `recomp/af.jp.toml`, re-run step 4 and build with
-  `gmake BASEROM=work/af/baseroms/jp/baserom.z64`.
+  Without it the game plays the Japanese ROM, and step 4 is run as
+  `scripts/recompile.sh jp`, which leaves those five instructions out
+  (everything between the `fan-translation` markers in the toml).
+  `work/recomp_out/rom.txt` records which of the two the generated code is for,
+  and `gmake install` copies that ROM; `BASEROM=...` overrides it.
 
 ## 3. Build the decomp
 
@@ -95,7 +104,7 @@ is `logs/n64_build.log`.
 
 ```bash
 scripts/setup_recomp.sh    # clones N64Recomp at recomp/n64recomp-base-commit.txt, applies recomp/n64recomp-psp.patch, builds it
-scripts/recompile.sh       # work/af/build/animalforest-jp.elf -> work/recomp_out/
+scripts/recompile.sh       # work/af/build/animalforest-jp.elf -> work/recomp_out/ (for the fan translation ROM; `recompile.sh jp` for the Japanese ROM)
 ```
 
 `recompile.sh` prints the function count and any functions it could not
@@ -104,7 +113,8 @@ preemption point (see `runtime/README.md`).
 
 ## 5. English dialogue
 
-The fan translation leaves most dialogue in Japanese. From your own copy of the European GameCube *Animal Crossing*
+The fan translation leaves most dialogue in Japanese (and the Japanese ROM all
+of it). From your own copy of the European GameCube *Animal Crossing*
 (GAFP01, `.iso` or `.ciso`), this builds the English dialogue, names and
 letters for the port:
 
@@ -115,7 +125,7 @@ scripts/make_text_en.sh "path/to/Animal Crossing (Europe) (En,Fr,De,Es,It).ciso"
 It writes `work/text/text_en.bin` and `work/text/names_en.bin`, which the
 next step packs into the EBOOT. They take precedence over the ROM's text
 wherever they have an entry; `gmake` warns if they are missing, since the
-game then shows only the fan translation's text. Messages the GameCube
+game then shows only the ROM's own text. Messages the GameCube
 release has no usable counterpart for come from `tools/text_en_manual.txt`,
 translated for this port.
 
@@ -132,7 +142,7 @@ after that only what changed is rebuilt.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PSPDEV` | `~/pspdev` | the PSP toolchain |
-| `BASEROM` | `work/af/baseroms/en/baserom.z64` | the ROM `gmake install` copies |
+| `BASEROM` | the ROM `work/recomp_out/rom.txt` names (`en` unless recompiled with `jp`) | the ROM `gmake install` copies |
 | `TEXT_EN`, `NAMES_EN` | `work/text/*.bin` | the English text `gmake install` copies |
 | `PPSSPP_GAME_DIR` | `~/.config/ppsspp/PSP/GAME/AFPSP` | where `gmake install` installs |
 | `GEN_OPT` | `-O2` | optimisation of the generated code (`-Os` was slower) |
@@ -169,12 +179,27 @@ bars (a file `no_stretch.txt` next to the EBOOT starts the game at 4:3).
 
 ## Debugging
 
-The runtime logs to `afpsp.log` next to the EBOOT and has a set of debug
-switches (files next to the EBOOT: scripted input, screenshots, frame dumps
-and replays); `runtime/README.md` lists them and explains the log.
+The runtime has a set of debug switches (files next to the EBOOT: scripted
+input, screenshots, frame dumps and replays). One of them, an empty file
+`log.txt`, makes it write a log to `afpsp.log` next to the EBOOT; without it
+nothing is logged. `runtime/README.md` lists them and explains the log.
 
 ## Troubleshooting
 
+- **`env: bash\r: No such file or directory`** (or `python3\r`, `\r: command
+  not found`, a patch that won't apply) -- the files have Windows (CRLF) line
+  endings, usually from Git for Windows' `core.autocrlf=true`. The repo's
+  `.gitattributes` forces LF, so a fresh `git clone` of a current checkout is
+  fine; for an existing copy, convert it in place:
+
+  ```bash
+  git config core.autocrlf false
+  git rm --cached -r -q . && git reset --hard -q   # re-checkout as LF (drops local edits)
+  ```
+
+  (No git history, e.g. a zip? `sed -i 's/\r$//' build.sh scripts/* tools/*
+  Makefile recomp/*` does it.) Under WSL, keep the checkout on WSL's own
+  filesystem (`~/`), not `/mnt/c/...`.
 - **`Missing work/recomp_out: run scripts/recompile.sh first`** -- stages 3
   and 4 haven't run yet (`./build.sh` runs them all).
 - **`MD5 ... is not an Animal Forest ROM this port knows`** -- the ROM is

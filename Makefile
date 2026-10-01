@@ -2,7 +2,7 @@
 # (work/recomp_out, see scripts/recompile.sh) and the runtime (runtime/).
 # BUILDING.md has the whole procedure and the variables below.
 #
-#   ./build.sh <GameCube disc> <Japanese ROM> <fan translation ROM>   does everything, up to dist/AFPSP
+#   ./build.sh <GameCube disc> <Japanese ROM> [<fan translation ROM>]   does everything, up to dist/AFPSP
 #   gmake           -> build/psp/EBOOT.PBP
 #   gmake install   -> copy the EBOOT, the ROM and the English text into PPSSPP's memory stick
 #   gmake clean
@@ -99,8 +99,9 @@ PIC1 := assets/PIC1.PNG
 # The ROM the runtime loads. The English fan translation is a data-only patch of
 # the JP build (same dmadata, same code segment bar five .text bytes, which
 # recomp/af.jp.toml replicates), so it needs no separate recompile -- only this
-# file swapped. Override on the command line to go back: BASEROM=work/af/baseroms/jp/baserom.z64
-BASEROM ?= work/af/baseroms/en/baserom.z64
+# file swapped. The generated code is for one of the two ROMs (scripts/recompile.sh
+# leaves which in rom.txt); override to play the other: BASEROM=work/af/baseroms/jp/baserom.z64
+BASEROM ?= work/af/baseroms/$(firstword $(shell cat $(GEN)/rom.txt 2>/dev/null) en)/baserom.z64
 
 ICON0_ARG = $(if $(wildcard $(ICON0)),$(ICON0),NULL)
 PIC1_ARG = $(if $(wildcard $(PIC1)),$(PIC1),NULL)

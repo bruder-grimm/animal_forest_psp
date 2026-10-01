@@ -48,8 +48,9 @@ bool gfx_draw_enabled(void) {
 /* ---- screenshots -------------------------------------------------------- */
 
 /* Debug aid: frames listed in shot_frames.txt are copied back from VRAM and saved as BMP. */
-static uint32_t sShotFrames[32];
+static uint32_t sShotFrames[64];
 static int sNumShotFrames = -1;
+static bool sShotDue;          /* a listed frame came by with no picture drawn: the next one drawn is saved */
 static uint32_t* sShotPixels = NULL; /* allocated on the first screenshot */
 
 static bool sCaptureShot;      /* see maybe_capture */
@@ -57,7 +58,7 @@ static uint32_t sCaptureCount;
 
 static bool shot_wanted(uint32_t frame) {
     if (sNumShotFrames < 0) {
-        sNumShotFrames = rt_load_number_list("shot_frames.txt", sShotFrames, 32);
+        sNumShotFrames = rt_load_number_list("shot_frames.txt", sShotFrames, 64);
     }
     for (int i = 0; i < sNumShotFrames; i++) {
         if (sShotFrames[i] == frame) {
@@ -110,10 +111,14 @@ static void write_bmp(uint32_t frame) {
     rt_log("screenshot %s", path);
 }
 
-uint32_t* gfx_debug_shot_buffer(uint32_t frame) {
-    if (!shot_wanted(frame) && !sCaptureShot) {
+uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn) {
+    sShotDue = sShotDue || shot_wanted(frame);
+    /* A present with nothing drawn since the last one shows no new picture:
+     * the buffer it would be read from holds an old frame. */
+    if (!drawn || (!sShotDue && !sCaptureShot)) {
         return NULL;
     }
+    sShotDue = false;
     if (sShotPixels == NULL) {
         /* Whole cache lines: the invalidate after the copy must not drop a neighbour's. */
         sShotPixels = memalign(64, BUF_WIDTH * PSP_SCREEN_H * 4);

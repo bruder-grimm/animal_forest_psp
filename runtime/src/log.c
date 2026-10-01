@@ -1,6 +1,11 @@
 /*
  * log.c -- the runtime log and memory stick access.
  *
+ * There is a log only if log.txt (or sync_log.txt) is next to the EBOOT: a
+ * game being played has no use for a line of statistics on its memory stick
+ * every few seconds. Without it rt_log does nothing; only a fatal stop still
+ * leaves its reason in afpsp.log.
+ *
  * The log goes to afpsp.log next to the EBOOT and to stdout (which PSPLink
  * shows in its shell). rt_log only puts the line in a buffer; a thread of its
  * own writes the buffer out, so that nobody who logs waits for the memory
@@ -72,6 +77,9 @@ static void write_out(const char* text, int len) {
 /* Writes out everything in the buffer, on the calling thread. */
 void rt_log_flush(void) {
     static char chunk[LOG_CHUNK];
+    if (sBufferLock < 0) {
+        return;
+    }
     sceKernelWaitSema(sWriteLock, 1, NULL);
     for (;;) {
         sceKernelWaitSema(sBufferLock, 1, NULL);
@@ -104,6 +112,10 @@ static int writer_thread(SceSize args, void* argp) {
 }
 
 void rt_log_init(void) {
+    sSync = rt_data_file_exists("sync_log.txt");
+    if (!sSync && !rt_data_file_exists("log.txt")) {
+        return; /* no log: rt_log finds no buffer to put a line in */
+    }
     sBufferLock = sceKernelCreateSema("rt_log", 0, 1, 1, NULL);
     sWriteLock = sceKernelCreateSema("rt_log_write", 0, 1, 1, NULL);
     sPending = sceKernelCreateSema("rt_log_pending", 0, 0, 1, NULL);
@@ -112,7 +124,6 @@ void rt_log_init(void) {
         sceIoClose(fd);
         sLogOk = true;
     }
-    sSync = rt_data_file_exists("sync_log.txt");
     /* Below the game and the renderer: it needs next to no CPU, only to wait for the stick. */
     SceUID thid = sceKernelCreateThread("rt_log", writer_thread, RT_GAME_THREAD_PRIORITY + 2, 16 * 1024,
                                         PSP_THREAD_ATTR_USER, NULL);
@@ -120,9 +131,6 @@ void rt_log_init(void) {
 }
 
 static void put_line(const char* line, int len) {
-    if (sBufferLock < 0) {
-        return; /* before rt_log_init */
-    }
     for (;;) {
         sceKernelWaitSema(sBufferLock, 1, NULL);
         bool room = LOG_BUFFER - (sHead - sTail) >= (uint32_t)len;
@@ -148,6 +156,9 @@ static void put_line(const char* line, int len) {
 
 /* One line, prefixed with the time since boot in seconds. */
 static void log_va(const char* fmt, va_list args) {
+    if (sBufferLock < 0) {
+        return; /* no log (or not yet: before rt_log_init) */
+    }
     char line[512];
     uint64_t now = sceKernelGetSystemTimeWide();
     int prefix = snprintf(line, sizeof(line), "[%6u.%03u] ", (unsigned)(now / 1000000), (unsigned)((now / 1000) % 1000));
@@ -176,7 +187,22 @@ void rt_log(const char* fmt, ...) {
 void rt_fatal(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    log_va(fmt, args);
+    if (sBufferLock < 0) {
+        /* no log: the reason still goes to afpsp.log, by itself */
+        char line[256];
+        int len = vsnprintf(line, sizeof(line) - 1, fmt, args);
+        SceUID fd = open_log(PSP_O_TRUNC);
+        if (fd >= 0) {
+            if (len > 0) {
+                len = len < (int)sizeof(line) - 1 ? len : (int)sizeof(line) - 2;
+                line[len++] = '\n';
+                sceIoWrite(fd, line, len);
+            }
+            sceIoClose(fd);
+        }
+    } else {
+        log_va(fmt, args);
+    }
     va_end(args);
     rt_log("FATAL: stopping");
     rt_log_flush();

@@ -17,7 +17,18 @@
 
 #include "gfx_internal.h"
 
-static unsigned int sGuList[256 * 1024] __attribute__((aligned(16)));
+/*
+ * The display list, in cache lines of its own. pspgu writes it through the
+ * uncached mirror; a variable sharing its first line and written the usual way
+ * (gFrameOpen did, as the linker happened to lay things out) leaves that line
+ * dirty in the cache with an old copy of the list's first commands -- the ones
+ * that name the colour buffer to draw into -- and whenever it was written back
+ * between sceGuStart and the GE getting there, the frame's first half went to
+ * the buffer of a frame before. Seen on the PSP only (the pocket screen
+ * flickered: its second half is drawn after another buffer command).
+ */
+static unsigned int sGuList[256 * 1024] __attribute__((aligned(64)));
+_Static_assert(sizeof(sGuList) % 64 == 0, "the display list must end on a cache line");
 static bool sGuReady = false;
 bool gFrameOpen = false;
 int gProjVariant = -1;
@@ -388,7 +399,8 @@ static uint32_t* sCapturePixels = NULL; /* allocated on the first capture */
 void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_t height) {
     src &= 0x1FFFFFFF;
     if (sCapturePixels == NULL) {
-        sCapturePixels = memalign(16, BUF_WIDTH * PSP_SCREEN_H * 4);
+        /* whole cache lines: the invalidate after the GE has written it must not drop a neighbour's */
+        sCapturePixels = memalign(64, BUF_WIDTH * PSP_SCREEN_H * 4);
         if (sCapturePixels == NULL) {
             RT_LOG_ONCE("gfx: no memory for framebuffer captures");
             return;
@@ -449,13 +461,28 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
  *
  * A copy-back has to wait for the GE to finish everything queued, and the
  * pocket screen leaves its targets seven times a frame, which made it the one
- * screen far from 30 fps. So the copy is put off until something reads the
- * picture from RDRAM (gfx_target_need: a texture made from it, another target
- * laid over it, the end of the task): while the display list is merely away
- * drawing on the screen or clearing a depth buffer, the picture stays in
- * VRAM and the target is taken up again as it is. And a fill of the whole
- * target with one colour is repeated in RDRAM directly (gfx_target_filled),
- * which needs nothing back from the GE at all.
+ * screen far from 30 fps. On the N64 none of this costs anything: the RDP
+ * draws into RDRAM and the next texture load reads the same memory. So the
+ * copy is avoided wherever the same can be said here:
+ *
+ * - It is put off until something reads the picture from RDRAM
+ *   (gfx_target_need: a texture built from it, another target laid over it,
+ *   the end of the task). While the display list is merely away drawing on
+ *   the screen or clearing a depth buffer, the picture stays in VRAM and the
+ *   target is taken up again as it is.
+ * - A texture that is the picture itself, whole, is not built at all: the GE
+ *   samples it where it drew it (gfx_target_texture), as the RDP would.
+ * - A fill of the whole target with one colour is repeated in RDRAM directly
+ *   (gfx_target_filled). Where the fill keeps the coverage bits, that takes
+ *   knowing them: RDRAM's are right if nothing was drawn since the last
+ *   copy, and they are all set once rectangles have covered the target from
+ *   the top down (gfx_target_covered), as the portrait's background does.
+ * - Loading goes the same way: the picture in RDRAM is not brought into VRAM
+ *   before something is drawn that shows through to it (gfx_target_ready).
+ *
+ * With these the pocket screen moves no pixels between RDRAM and VRAM at all:
+ * each of its pictures starts with a clear or with rectangles that cover it,
+ * is drawn, sampled from VRAM, and painted over before the task ends.
  */
 #define RT_VRAM 0x1DC000       /* 128x128x4 */
 #define RT_DEPTH_VRAM 0x1EC000 /* 128x128x2, ends at 0x1F4000 */
@@ -552,12 +579,13 @@ static uint32_t pixels_to_rdram(const uint32_t* px) {
     return target_rdram_sum();
 }
 
-/* The target in RDRAM as pixels for the GE (RT_MAX to a row). */
-static void rdram_to_pixels(uint32_t* px) {
+/* The target's rows from `first` down, as they are in RDRAM, as pixels for the GE (its width to a row). */
+static void rdram_to_pixels(uint32_t* px, uint32_t first) {
     uint32_t width = gTarget.width, height = gTarget.height;
     const uint32_t* words = target_words();
     if (words != NULL) {
-        for (uint32_t y = 0; y < height; y++, px += RT_MAX) {
+        words += first * width / 2;
+        for (uint32_t y = first; y < height; y++, px += width) {
             for (uint32_t x = 0; x < width; x += 2) {
                 uint32_t word = *words++;
                 px[x] = from_rgba16(word >> 16);
@@ -567,7 +595,7 @@ static void rdram_to_pixels(uint32_t* px) {
         return;
     }
     uint8_t* rdram = g_rdram;
-    for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t y = first; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t i = y * width + x, c;
             if (gTarget.siz == G_IM_SIZ_32b) {
@@ -576,8 +604,34 @@ static void rdram_to_pixels(uint32_t* px) {
             } else {
                 c = from_rgba16(MEM_HU(0, gTarget.addr + 2 * i));
             }
-            px[y * RT_MAX + x] = c;
+            px[(y - first) * width + x] = c;
         }
+    }
+}
+
+/*
+ * Brings the target's picture from RDRAM into VRAM, if that is still to do
+ * (gTarget.unloaded): the rows from solid_rows down, the ones above having
+ * been drawn over since. The pixels go through the display list's own memory:
+ * the GE fetches them when it gets there, which can be after the next load.
+ */
+void gfx_target_ready(void) {
+    if (!gTarget.unloaded) {
+        return;
+    }
+    gTarget.unloaded = false;
+    uint32_t first = gTarget.solid_rows;
+    if (first >= gTarget.height) {
+        return;
+    }
+    uint32_t rows = gTarget.height - first;
+    gfx_flush_batch();
+    uint32_t* px = sceGuGetMemory((int)(rows * gTarget.width * 4));
+    rdram_to_pixels(px, first);
+    sceGuCopyImage(GU_PSM_8888, 0, 0, gTarget.width, rows, gTarget.width, px, 0, first, RT_MAX, VRAM_ADDR(RT_VRAM));
+    sceGuTexSync();
+    if (gTracing) {
+        rt_log("  render target %08X %ux%u loaded from row %u", gTarget.addr, gTarget.width, gTarget.height, first);
     }
 }
 
@@ -602,6 +656,11 @@ void gfx_target_leave(void) {
     if (!gTarget.bound) {
         return;
     }
+    if (gTarget.unloaded && !gTarget.dirty) {
+        gTarget.unloaded = false; /* nothing was drawn: RT_VRAM never got the picture, and holds none */
+        gTarget.vram_addr = 0;
+    }
+    gfx_target_ready();
     gfx_flush_batch();
     gTarget.bound = false;
     map_screen();
@@ -610,6 +669,59 @@ void gfx_target_leave(void) {
     sceGuDisable(GU_STENCIL_TEST);
     gfx_set_viewport();
     gfx_set_scissor();
+}
+
+/*
+ * A draw that sets the coverage of every pixel in its rectangle: a fill with a
+ * covered colour, a copy from the screen. Rows covered all the way across are
+ * counted from the top, which is how the game lays such rectangles down.
+ */
+void gfx_target_covered(float x0, float y0, float x1, float y1) {
+    float top = gRdp.scissor[1] / 4.0f, bottom = gRdp.scissor[3] / 4.0f;
+    if (y0 < top) y0 = top;
+    if (y1 > bottom) y1 = bottom;
+    if (!gTarget.bound || x0 > 0.0f || x1 < (float)gTarget.width || gRdp.scissor[0] != 0 ||
+        gRdp.scissor[2] < gTarget.width * 4 || y0 > (float)gTarget.solid_rows || y1 <= (float)gTarget.solid_rows) {
+        return;
+    }
+    gTarget.solid_rows = y1 >= (float)gTarget.height ? gTarget.height : (uint32_t)y1;
+}
+
+/* A fill with an uncovered colour: which pixels are covered is no longer known. */
+void gfx_target_uncovered(void) {
+    gTarget.solid_rows = 0;
+}
+
+/*
+ * The target's picture as a texture, sampled where the GE drew it. The texture
+ * has to be the whole picture read as what it is, 16-bit colour with the
+ * coverage bit for alpha (here the stencil: 0 or 255), and the GE must not be
+ * drawing into it. Anything else is built from RDRAM after a copy-back.
+ * no_target_tex.txt: never.
+ */
+const GuTexture* gfx_target_texture(uint32_t addr, uint32_t row_texels, uint32_t siz, uint32_t width, uint32_t height,
+                                    bool clamp_s, bool clamp_t) {
+    static GuTexture sPicture;
+    if (!gTarget.dirty || gTarget.bound || gTarget.siz != G_IM_SIZ_16b || siz != G_IM_SIZ_16b ||
+        ((addr ^ gTarget.addr) & RDRAM_MASK) != 0 || row_texels != gTarget.width || width != gTarget.width ||
+        height != gTarget.height || width < 4 || (width & (width - 1)) != 0 || (height & (height - 1)) != 0 ||
+        RT_SWITCH("no_target_tex.txt")) {
+        return NULL;
+    }
+    memset(&sPicture, 0, sizeof(sPicture));
+    sPicture.pixels = VRAM_ADDR(RT_VRAM);
+    sPicture.psm = GU_PSM_8888;
+    sPicture.gu_width = (uint16_t)width;
+    sPicture.gu_height = (uint16_t)height;
+    sPicture.buf_width = RT_MAX;
+    sPicture.clamp_s = clamp_s;
+    sPicture.clamp_t = clamp_t;
+    sPicture.sub_x = sPicture.sub_y = 1;
+    sPicture.alpha_binary = true;
+    if (gTracing) {
+        rt_log("  render target %08X %ux%u sampled in VRAM", gTarget.addr, gTarget.width, gTarget.height);
+    }
+    return &sPicture;
 }
 
 /* The target's picture has changed in RDRAM; RT_VRAM holds the same. */
@@ -631,6 +743,7 @@ void gfx_target_flush(void) {
         return;
     }
     uint32_t t0 = sceKernelGetSystemTimeLow();
+    gfx_target_ready();
     gfx_flush_batch();
     sceGuCopyImage(GU_PSM_8888, 0, 0, gTarget.width, gTarget.height, RT_MAX, VRAM_ADDR(RT_VRAM), 0, 0, RT_MAX,
                    sRtPixels);
@@ -678,18 +791,32 @@ static bool scissor_covers_target(void) {
            gRdp.scissor[3] >= gTarget.height * 4;
 }
 
+/* The whole bound target is about to be overwritten (a clear): what RDRAM holds is not needed in VRAM. */
+void gfx_target_overwritten(void) {
+    if (scissor_covers_target()) {
+        gTarget.unloaded = false;
+    } else {
+        gfx_target_ready();
+    }
+}
+
 /*
  * Can a fill of the whole bound target be repeated in RDRAM without asking the
  * GE (gfx_target_filled)? keep_alpha: the fill leaves the coverage bits alone,
  * which must then be up to date in RDRAM.
  */
 bool gfx_target_fill_known(bool keep_alpha) {
-    return gTarget.bound && target_words() != NULL && scissor_covers_target() && (!keep_alpha || gTarget.was_clean);
+    return gTarget.bound && target_words() != NULL && scissor_covers_target() &&
+           (!keep_alpha || gTarget.was_clean || gTarget.solid_rows >= gTarget.height);
 }
 
 /* The GE has filled the whole target with `pixel` (RGBA5551); RDRAM gets the same. */
 void gfx_target_filled(uint32_t pixel, bool keep_alpha) {
     uint32_t* words = target_words();
+    if (keep_alpha && gTarget.solid_rows >= gTarget.height) {
+        pixel |= 1; /* every pixel is covered: nothing to look up */
+        keep_alpha = false;
+    }
     uint32_t fill = keep_alpha ? (pixel & 0xFFFE) * 0x10001u : (pixel & 0xFFFF) * 0x10001u;
     uint32_t kept = keep_alpha ? 0x00010001u : 0;
     uint32_t sum = 0;
@@ -733,6 +860,7 @@ static void target_bind(void) {
     gfx_target_flush();
     gfx_open_frame();
     gfx_flush_batch();
+    bool again = same && gTarget.height == h; /* the target of last time, which RT_VRAM may still hold */
     gTarget.addr = gRdp.cimg;
     gTarget.width = gRdp.cimg_width;
     gTarget.height = h;
@@ -740,14 +868,11 @@ static void target_bind(void) {
     gTarget.bound = true;
     gTarget.dirty = false;
 
-    /* Load the target from RDRAM unless RT_VRAM already holds exactly that. */
-    if (gTarget.vram_addr != gTarget.addr || gTarget.vram_sum != target_rdram_sum()) {
-        rdram_to_pixels(sRtPixels);
-        sceKernelDcacheWritebackRange(sRtPixels, staging_bytes());
-        sceGuCopyImage(GU_PSM_8888, 0, 0, gTarget.width, gTarget.height, RT_MAX, sRtPixels, 0, 0, RT_MAX,
-                       VRAM_ADDR(RT_VRAM));
-        sceGuTexSync();
+    /* The target is to be loaded from RDRAM (when it comes to that: gfx_target_ready) unless RT_VRAM holds exactly that. */
+    if (!again || gTarget.vram_addr != gTarget.addr || gTarget.vram_sum != target_rdram_sum()) {
+        gTarget.unloaded = true;
         gTarget.vram_addr = 0;
+        gTarget.solid_rows = 0;
     }
     ge_draw_to_target();
     if (gTracing) {
@@ -767,7 +892,7 @@ void gfx_color_image_changed(void) {
     gScreenSelected = false;
 }
 
-bool gfx_select_target_slow(void) {
+bool gfx_select_target_slow(bool load) {
     if (gfx_drawing_to_display()) {
         gfx_target_leave();
         gDisplayZimg = gRdp.zimg & 0x1FFFFFFF;
@@ -789,6 +914,9 @@ bool gfx_select_target_slow(void) {
     }
     gTarget.was_clean = !gTarget.dirty;
     gTarget.dirty = true;
+    if (load) {
+        gfx_target_ready();
+    }
     return true;
 }
 
@@ -799,6 +927,15 @@ bool gfx_select_target_slow(void) {
  */
 void gfx_copy_from_screen(uint32_t fb, float dx0, float dy0, float dx1, float dy1, float sx0, float sy0,
                           float sx1, float sy1) {
+    /* The rows this covers of a target still to be loaded needn't be; anywhere else, what it is drawn
+     * over has to be there first. */
+    uint32_t solid = gTarget.solid_rows;
+    if (gfx_draw_enabled()) {
+        gfx_target_covered(dx0, dy0, dx1, dy1);
+    }
+    if (gTarget.solid_rows == solid) {
+        gfx_target_ready();
+    }
     gfx_flush_batch();
     /* The frame being drawn is in the draw buffer; a finished one is on screen. */
     bool from_back = (fb & 0x1FFFFFFF) == sDrawingFb || (fb & 0x1FFFFFFF) != sLastShownFb;
@@ -1007,12 +1144,10 @@ static void log_stats(void) {
 void gfx_present_frame(uint32_t framebuffer) {
     gStats.frames++;
     note_display_fb(framebuffer);
-    uint32_t* shot = gfx_debug_shot_buffer(gStats.frames);
-    if (gFrameOpen || shot != NULL) {
-        bool drawn = gFrameOpen;
-        gfx_open_frame();
+    uint32_t* shot = gfx_debug_shot_buffer(gStats.frames, gFrameOpen);
+    if (gFrameOpen) {
         gfx_flush_batch();
-        if (drawn && !gTarget.bound) {
+        if (!gTarget.bound) {
             soften_frame();
         }
         if (shot != NULL) {

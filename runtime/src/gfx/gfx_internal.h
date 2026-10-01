@@ -448,12 +448,17 @@ typedef struct {
     float mean[4];        /* average RGBA (0..1) over the image */
     float dev;            /* largest per-channel standard deviation */
     bool alpha_binary;    /* every texel's alpha is 0 or 255 (partial only where filtered) */
+    uint16_t buf_width;   /* a render target's picture in VRAM (gfx_target_texture): texels from a row to the
+                             next; what it shows changes with the pointer staying the same. 0 for any other. */
 } GuTexture;
 
 void gfx_tex_init(void);
 void gfx_tex_new_frame(void);
 /* Returns a decoded texture for key (cached; content-hashed for RAM textures). */
 const GuTexture* gfx_tex_get(const TexKey* key);
+/* The same for a texture that is only drawn with, never looked at: a render
+ * target's picture is then sampled where it is in VRAM (gfx_target_texture). */
+const GuTexture* gfx_tex_get_to_draw(const TexKey* key);
 /* Texture builds (and two-texture bakes among them) and their time since the last call. */
 void gfx_tex_take_build_stats(uint32_t* builds, uint32_t* bakes, uint32_t* us);
 /* Bakes put off by the per-frame budget since the last call (an older bake of the pair was used). */
@@ -576,6 +581,8 @@ typedef struct {
     bool bound;            /* the GE draws into the target */
     bool dirty;            /* RT_VRAM holds drawing that RDRAM doesn't have yet */
     bool was_clean;        /* ... and didn't before the draw now being set up (gfx_select_target) */
+    uint32_t solid_rows;   /* its rows above this one are covered all the way across (see gfx_target_covered) */
+    bool unloaded;         /* RT_VRAM has yet to get its picture from RDRAM (below solid_rows; see gfx_target_ready) */
     uint32_t addr, width, height, siz;
     uint32_t vram_addr, vram_sum; /* what RT_VRAM holds: RDRAM address and checksum when they last agreed */
     uint32_t pending_zclear; /* a depth image the game cleared as a colour image (0: none) */
@@ -599,10 +606,17 @@ bool gfx_is_display_fb(uint32_t addr);
  * render target; false if a draw there is skipped (depth images, large
  * off-screen buffers). The screen, the usual answer, is remembered. */
 extern bool gScreenSelected;
-bool gfx_select_target_slow(void);
+bool gfx_select_target_slow(bool load);
 static inline bool gfx_select_target(void) {
-    return gScreenSelected || gfx_select_target_slow();
+    return gScreenSelected || gfx_select_target_slow(true);
 }
+/* The same for a rectangle that may cover a render target, which then needn't be loaded
+ * from RDRAM first: gfx_target_ready before anything that draws over what is there. */
+static inline bool gfx_select_target_unloaded(void) {
+    return gScreenSelected || gfx_select_target_slow(false);
+}
+void gfx_target_ready(void);
+void gfx_target_overwritten(void);
 /* G_SETCIMG / G_SETZIMG: the target has to be chosen again. */
 void gfx_color_image_changed(void);
 /* The display list leaves the target for the screen; its picture stays in VRAM. */
@@ -620,6 +634,13 @@ static inline void gfx_target_need(uint32_t addr, uint32_t len) {
 bool gfx_target_fill_known(bool keep_alpha);
 void gfx_target_filled(uint32_t pixel, bool keep_alpha);
 void gfx_target_not_drawn(void);
+/* A rectangle was drawn into the bound target that covers every pixel it spans / a fill took coverage away. */
+void gfx_target_covered(float x0, float y0, float x1, float y1);
+void gfx_target_uncovered(void);
+/* The target's picture as a texture where the GE drew it, if that is what the
+ * texture described reads; NULL if it has to come from RDRAM. */
+const GuTexture* gfx_target_texture(uint32_t addr, uint32_t row_texels, uint32_t siz, uint32_t width, uint32_t height,
+                                    bool clamp_s, bool clamp_t);
 bool gfx_screen_position(uint32_t addr, uint32_t* fb, float* x, float* y);
 void gfx_copy_from_screen(uint32_t fb, float dx0, float dy0, float dx1, float dy1, float sx0, float sy0,
                           float sx1, float sy1);
@@ -655,8 +676,8 @@ extern GfxStats gStats;
 void gfx_debug_task_start(uint32_t task_number, uint32_t task);
 /* False for a draw left out (skip_draws.txt, replay step mode). */
 bool gfx_draw_enabled(void);
-/* A buffer for this frame's screenshot, or NULL if none is wanted. */
-uint32_t* gfx_debug_shot_buffer(uint32_t frame);
+/* A buffer for this frame's screenshot, or NULL if none is wanted (or nothing was drawn to take one of). */
+uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn);
 void gfx_debug_save_shot(uint32_t frame);
 
 #endif

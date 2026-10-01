@@ -1005,7 +1005,17 @@ static void extend_bake_axis(Axis* a, const Axis* a2, float ratio) {
     }
 }
 
-const GuTexture* gfx_tex_get(const TexKey* key_in) {
+static const GuTexture* tex_get(const TexKey* key_in, bool to_draw);
+
+const GuTexture* gfx_tex_get(const TexKey* key) {
+    return tex_get(key, false);
+}
+
+const GuTexture* gfx_tex_get_to_draw(const TexKey* key) {
+    return tex_get(key, true);
+}
+
+static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
     if (key_in->tile_w == 0 || key_in->tile_h == 0) {
         return NULL;
     }
@@ -1045,6 +1055,15 @@ const GuTexture* gfx_tex_get(const TexKey* key_in) {
         src2_end = src2_start + texel_bytes(&k2);
     }
     if (gTarget.dirty) {
+        /* The picture itself, whole and plain: the GE samples it in VRAM, as the RDP reads RDRAM it has just drawn. */
+        if (to_draw && key->variant == 0 && key->fmt == G_IM_FMT_RGBA && (key->addr_bits & 7) == 0 && !ax.mirror &&
+            !ay.mirror) {
+            const GuTexture* picture = gfx_target_texture(key->addr_bits >> 3, key->row_bits / kTexelBits[key->siz & 3],
+                                                          key->siz, ax.size, ay.size, ax.clamp, ay.clamp);
+            if (picture != NULL) {
+                return picture;
+            }
+        }
         gfx_target_need(src_start, src_end - src_start);
         gfx_target_need(src2_start, src2_end - src2_start);
         gfx_target_need(key->tlut_addr, 512);

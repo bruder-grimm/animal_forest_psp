@@ -1,0 +1,5 @@
+# The build is shell/python scripts, a Makefile, a patch and files holding
+# commit hashes: CRLF breaks all of them (`env: bash\r: No such file or
+# directory`). Always check text out as LF, even on Windows with
+# core.autocrlf=true.
+* text=auto eol=lf

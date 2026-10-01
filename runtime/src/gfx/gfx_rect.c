@@ -116,11 +116,16 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
             gTarget.pending_zclear = gRdp.cimg & 0x1FFFFFFF;
             return;
         }
-        if (!gfx_select_target()) {
+        if (!gfx_select_target_unloaded()) {
             return;
         }
         to_rt = true;
         full = x0 <= 0 && y0 <= 0 && x1 >= gTarget.width && y1 >= gTarget.height;
+        if (cycle == G_CYC_FILL && full) {
+            gfx_target_overwritten();
+        } else {
+            gfx_target_ready();
+        }
     }
 
     gfx_open_frame();
@@ -147,12 +152,20 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
                 sceGuClearColor(color);
                 sceGuClearStencil(a ? 0xFF : 0);
                 sceGuClear(GU_COLOR_BUFFER_BIT | GU_STENCIL_BUFFER_BIT);
+                if (a) {
+                    gfx_target_covered(x0, y0, x1, y1);
+                } else {
+                    gfx_target_uncovered();
+                }
                 if (gfx_target_fill_known(false)) {
                     gfx_target_filled(c, false); /* the fill colour is the pixel, coverage bit and all */
                 }
                 return;
             }
             sceGuStencilFunc(GU_ALWAYS, a ? 0xFF : 0, 0xFF);
+            if (!a) {
+                gfx_target_uncovered();
+            }
         } else if (full) {
             sceGuClearColor(color);
             sceGuClear(GU_COLOR_BUFFER_BIT);
@@ -215,7 +228,7 @@ void gfx_tex_rect(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, bool flip)
         TileDesc* src_tile = &gRdp.tiles[tile_index];
         uint32_t src_bits = gfx_tmem_bits(src_tile->tmem);
         uint32_t src = src_bits == TMEM_INVALID ? 0 : src_bits >> 3;
-        if (!gfx_select_target()) {
+        if (!gfx_select_target_unloaded()) {
             /* Framebuffer-to-buffer copies (PreRender) with a texrect: capture the screen instead.
                PreRender may use the depth buffer's memory as its save buffer. */
             if (gfx_is_display_fb(src)) {
@@ -236,6 +249,7 @@ void gfx_tex_rect(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, bool flip)
                                  sy + ft + dty * (y1 - y0));
             return;
         }
+        gfx_target_ready();
     } else {
         gfx_select_target();
     }
@@ -343,7 +357,7 @@ void gfx_s2dex_bg(uint32_t addr, bool copy) {
     }
 
     if (!gfx_drawing_to_display()) {
-        if (!gfx_select_target()) {
+        if (!gfx_select_target_unloaded()) {
             /* PreRender may use the depth buffer's memory as its save buffer. */
             if (gfx_is_display_fb(image_ptr)) {
                 gfx_capture_framebuffer(image_ptr, gRdp.cimg, gRdp.cimg_width, N64_SCREEN_H);
@@ -357,6 +371,7 @@ void gfx_s2dex_bg(uint32_t addr, bool copy) {
                                  sy + tex_y + span_h);
             return;
         }
+        gfx_target_ready();
     } else {
         gfx_select_target();
     }
@@ -402,7 +417,7 @@ void gfx_s2dex_bg(uint32_t addr, bool copy) {
     gFit = fit;
     gRdp.state_dirty = true;
 
-    const GuTexture* tex = gfx_tex_get(&key);
+    const GuTexture* tex = gfx_tex_get_to_draw(&key);
     if (tex == NULL) {
         return;
     }

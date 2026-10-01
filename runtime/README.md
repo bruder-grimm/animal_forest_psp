@@ -81,7 +81,7 @@ to a ring buffer that a thread plays through sceAudio (audio.c).
 | `kcall.prx` | the Media Engine library's kernel module (real hardware only) |
 | `text_en.bin`, `names_en.bin` | English dialogue and names (`scripts/make_text_en.sh`): read from the EBOOT, where the Makefile packs them; next to a bare PRX otherwise (data.c) |
 | `flash.bin`, `rtc.bin` | the save and the clock offset, written by the runtime |
-| `afpsp.log` | the log |
+| `afpsp.log` | the log, written only if `log.txt` is there (see the debug switches) |
 
 ### Debug switches
 
@@ -91,7 +91,7 @@ file.
 | File | Effect | Where |
 |---|---|---|
 | `input_script.txt` | scripted controller input (format in si.c) | si.c |
-| `shot_frames.txt` | save these frames as `shot_NNNNN.bmp` | gfx_debug.c |
+| `shot_frames.txt` | save these frames (up to 64) as `shot_NNNNN.bmp`; a frame nothing was drawn for gives the next one that was | gfx_debug.c |
 | SELECT + R (not a file) | save the next frame's RDRAM and picture as `capture_N*` | gfx_debug.c |
 | `no_stretch.txt` | start with the picture at 4:3 between black bars (START + SELECT switches) | gfx_frame.c |
 | `dump_frames.txt` | save the RDRAM of these graphics tasks | gfx_debug.c |
@@ -101,14 +101,17 @@ file.
 | `dump_tex.txt` | write the first 400 textures built | gfx_tex.c |
 | `soften.txt` | softening strength in percent (0 = off; default 30) | gfx_frame.c |
 | `no_snap.txt`, `no_weld.txt`, `no_cut.txt`, `no_split.txt`, `hard_edges.txt` | turn off vertex snapping, welding of nearly coincident vertices, stencil cut-outs, split combiners, soft texture edges | gfx_draw.c, gfx_combiner.c |
+| `no_target_tex.txt` | never sample a render target where it is in VRAM: copy it back to RDRAM and build a texture | gfx_frame.c |
 | `no_yield.txt` | ignore the game's graphics task yields | gfx_worker.c |
 | `no_me.txt` | run audio on the main CPU | audio/me_audio.c |
-| `sync_log.txt` | write every log line before going on (for a crash that loses the last lines) | log.c |
+| `log.txt` | write the log (`afpsp.log`, and to PSPLink's shell); without it nothing is logged, and only a fatal stop leaves its reason in `afpsp.log` | log.c |
+| `sync_log.txt` | the log, with every line written before going on (for a crash that loses the last lines) | log.c |
 | `audio_wav.txt` | `start length` (s): record the output to `afpsp_audio.wav` | audio.c |
 | `dump_audio.txt` | dump these audio tasks' RDRAM as `aspt_<n>.bin` | audio.c |
 
 ## Reading the log
 
+(With `log.txt` next to the EBOOT; the test scripts put it there.)
 Every 120 frames the renderer logs where the time went, and every 600 audio
 tasks the audio side does:
 

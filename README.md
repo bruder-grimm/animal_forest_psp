@@ -8,8 +8,11 @@ used as the EBOOT's icon and background). You supply your own dumps:
 - the **Japanese N64 *Animal Forest*** ROM (NUS-NAFJ; MD5
   `a4f7c57c180297b2e7ba5a5feb44fe0b` as big-endian `.z64`), which the game's
   code is recompiled from
-- the **English fan translation** ROM *Animal Forest (U) [!]* (MD5
-  `f827d11ee513d5edde44a3a9598f0934`), which the game plays
+- optionally the **English fan translation** ROM *Animal Forest (U) [!]*
+  (MD5 `f827d11ee513d5edde44a3a9598f0934`), which the game then plays, with
+  its English title logo, menus and screens. Without it the game plays the
+  Japanese ROM: the dialogue, names and letters are still English, but the
+  title screen, menus and signs stay Japanese
 - the **European GameCube *Animal Crossing*** disc image (GAFP01; `.iso`,
   `.gcm` or `.ciso`), for the English text
 
@@ -29,7 +32,7 @@ used as the EBOOT's icon and background). You supply your own dumps:
 ./build.sh "Animal Crossing (Europe).iso" "Doubutsu no Mori (Japan).z64" "Animal Forest (U) [!].z64"
 ```
 
-The ROMs can be in any byte order. The first run takes a while: it clones and
+(Leave out the last file to build for the Japanese ROM.) The ROMs can be in any byte order. The first run takes a while: it clones and
 builds the decomp and N64Recomp, recompiles the game and builds the English
 text. Later runs only redo what changed.
 

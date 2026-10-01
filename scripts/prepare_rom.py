@@ -8,7 +8,7 @@ Each ROM is recognised by its MD5 and written to work/af/baseroms/<id>/baserom.z
 
   jp  the Japanese release (NUS-NAFJ) -- the decomp is built from it
   en  the English fan translation "Animal Forest (U) [!]", a data-only patch of jp --
-      the ROM the port plays
+      the ROM the port plays when it is given (without it, jp)
 
 Prints one line "<id> <path>" per ROM.
 """

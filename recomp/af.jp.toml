@@ -66,7 +66,9 @@ value = 0x3C118000 # lui $s1, 0x8000
 # code do not differ, and every changed overlay byte is .data/.rodata -- which the
 # game DMAs out of the ROM at runtime, so it needs nothing here -- except the five
 # .text bytes below, which the recompiler would otherwise take from the JP ELF.
-# NOTE: this makes the build ROM-specific. Drop this block to go back to the JP ROM.
+# NOTE: this makes the build ROM-specific. scripts/recompile.sh jp drops everything
+# between the two markers (build.sh without a fan translation), for the JP ROM.
+# [fan-translation-begin]
 
 # Translation replaces "bne $t8, $zero, +0xD" with a discarded 64-bit load
 # (ldl $zero) purely to delete the branch; emit a plain nop instead, so the
@@ -96,6 +98,7 @@ value = 0x35F80078 # ori $t8, $t7, 0x78 (was 0xFF)
 func = "func_80AA0C98_jp"
 vram = 0x80AA0F5C
 value = 0x35880078 # ori $t0, $t4, 0x78 (was 0xFF)
+# [fan-translation-end]
 
 # The translation left the string table's date and time units in Japanese
 # ("9がつ25にち2026ねん", "ごご3じ11ふん"), which the N64 shows too. With the

@@ -61,13 +61,13 @@ void gfx_gu_reset_cache(void) {
 
 /* Points the GE at a texture's pixels. */
 void gfx_gu_texture_image(const GuTexture* tex) {
-    if (gGu.tex_pixels != tex->pixels) {
+    if (gGu.tex_pixels != tex->pixels || tex->buf_width != 0) {
         if (tex->swizzled != gGu.tex_swizzled || tex->psm != gGu.tex_psm) {
             sceGuTexMode(tex->psm, 0, 0, tex->swizzled);
             gGu.tex_swizzled = tex->swizzled;
             gGu.tex_psm = tex->psm;
         }
-        sceGuTexImage(0, tex->gu_width, tex->gu_height, tex->gu_width, tex->pixels);
+        sceGuTexImage(0, tex->gu_width, tex->gu_height, tex->buf_width ? tex->buf_width : tex->gu_width, tex->pixels);
         sceGuTexFlush();
         gGu.tex_pixels = tex->pixels;
     }
@@ -593,7 +593,13 @@ static void fill_src2(TexKey* key, const TexKey* k2) {
 static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit) {
     TileDesc* tile = &gRdp.tiles[tile_index & 7];
     TexKey key;
-    if (!gfx_make_tile_key(tile, fit->white_rgb, &key)) {
+    /* Modulated by black, a texture's colour is all the same: the plain one will do
+     * (and can be a render target's picture as it is -- the shadow under a pocket item). */
+    bool black = fit->mode == TEX_MODULATE;
+    for (int ch = 0; ch < 3; ch++) {
+        black = black && fit->base[ch] == 0.0f && fit->s[ch] == 0.0f && fit->sa[ch] == 0.0f;
+    }
+    if (!gfx_make_tile_key(tile, fit->white_rgb && !black, &key)) {
         return NULL;
     }
     if (!fit->product && !fit->combine2 && aa_edge_mode()) {
@@ -639,7 +645,7 @@ static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit
         key.bake_kind = BAKE_Y;
         return gfx_tex_get(&key);
     }
-    const GuTexture* tex = gfx_tex_get(&key);
+    const GuTexture* tex = gfx_tex_get_to_draw(&key);
     if (tex == NULL) {
         return NULL;
     }
@@ -827,12 +833,18 @@ void gfx_apply_render_state(bool depth_allowed) {
  * stencil (the framebuffer's alpha), then the colour tile where it was set,
  * each from its own cached texture. Without an alpha test the alpha does
  * nothing and the colour tile is simply drawn on its own.
+ *
+ * Either tile may be the mask. The pocket screen's windows are the other way
+ * round from the name-entry one -- TEXEL0 is the polka dots, which scroll a
+ * texel every three frames, TEXEL1 the window's shape -- and were baked for
+ * that reason: three new textures per window and step, 10 ms each on the
+ * PSP, most of them put off by the bake budget and the pattern drawn stale.
  */
 static const GuTexture* sCutTex = NULL; /* the colour tile, drawn through the batch texture's alpha */
 static float sCutScaleU, sCutScaleV, sCutOffU, sCutOffV; /* its UVs from the batch's */
 
-/* The baked alpha is the base tile's own alpha, whatever the other's. */
-static bool alpha_is_tile(int base) {
+/* The baked alpha is tile `base`'s own alpha (0: TEXEL0, 1: TEXEL1), whatever the other's. */
+static bool alpha_is_tile_probe(int base) {
     static const uint8_t v[] = { 0, 1, 63, 127, 128, 191, 254, 255 };
     for (unsigned i = 0; i < sizeof(v); i++) {
         for (unsigned j = 0; j < sizeof(v); j++) {
@@ -845,21 +857,49 @@ static bool alpha_is_tile(int base) {
     return true;
 }
 
+/* The same, remembered per combiner state: a window is a dozen draws, each of which asks. */
+static bool alpha_is_tile(int base) {
+    static struct {
+        uint32_t state[5];
+        bool known[2], is_tile[2];
+    } sMemo[8];
+    static unsigned sNext = 0;
+    uint32_t lod;
+    memcpy(&lod, &gRdp.prim_lod_frac, 4);
+    const uint32_t state[5] = { gRdp.combine0, gRdp.combine1, gRdp.prim, gRdp.env, lod };
+    unsigned at = 8;
+    for (unsigned i = 0; i < 8; i++) {
+        if (memcmp(sMemo[i].state, state, sizeof(state)) == 0) {
+            at = i;
+            break;
+        }
+    }
+    if (at == 8) {
+        at = sNext++ & 7;
+        memcpy(sMemo[at].state, state, sizeof(state));
+        sMemo[at].known[0] = sMemo[at].known[1] = false;
+    }
+    if (!sMemo[at].known[base]) {
+        sMemo[at].known[base] = true;
+        sMemo[at].is_tile[base] = alpha_is_tile_probe(base);
+    }
+    return sMemo[at].is_tile[base];
+}
+
 static bool bind_cut(void) {
-    if (RT_SWITCH("no_cut.txt") || !gFit.combine2 || gFit.split || gFit.bake_rgb_tile == gFit.bake_base || gTarget.bound ||
-        gGu.blend || sFogPass) {
+    if (RT_SWITCH("no_cut.txt") || !gFit.combine2 || gFit.split || gTarget.bound || gGu.blend || sFogPass) {
         return false;
     }
+    int colour_tile = gFit.bake_rgb_tile, mask_tile = colour_tile ^ 1;
     bool mask = gGu.alpha_test;
-    if (mask && !alpha_is_tile(gFit.bake_base)) {
+    if (mask && !alpha_is_tile(mask_tile)) {
         return false;
     }
     CombinerFit plain = gFit;
     plain.combine2 = false;
     plain.product = false;
-    int base = gRsp.tex_tile + gFit.tex_tile;
-    int other = gFit.bake_base == 0 ? base + 1 : base - 1;
-    const GuTexture* colour = gfx_bind_texture(other, &plain);
+    int first = gRsp.tex_tile + gFit.tex_tile - gFit.bake_base; /* TEXEL0's tile (the fit's is the bake's grid) */
+    const GuTexture* colour = gfx_bind_texture(first + colour_tile, &plain);
     if (colour == NULL) {
         return false;
     }
@@ -868,7 +908,7 @@ static bool bind_cut(void) {
         return true;
     }
     float su = sTexScaleU, sv = sTexScaleV, ou = sTexOffU, ov = sTexOffV;
-    gBatchTex = gfx_bind_texture(base, &plain);
+    gBatchTex = gfx_bind_texture(first + mask_tile, &plain);
     if (gBatchTex == NULL || sTexScaleU == 0.0f || sTexScaleV == 0.0f) {
         return false;
     }
@@ -948,7 +988,7 @@ static void pass_texture(const GuTexture* to, const GuTexture* from) {
     if (to->swizzled != from->swizzled || to->psm != from->psm) {
         sceGuTexMode(to->psm, 0, 0, to->swizzled);
     }
-    sceGuTexImage(0, to->gu_width, to->gu_height, to->gu_width, to->pixels);
+    sceGuTexImage(0, to->gu_width, to->gu_height, to->buf_width ? to->buf_width : to->gu_width, to->pixels);
     sceGuTexFlush();
 }
 
