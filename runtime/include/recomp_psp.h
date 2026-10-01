@@ -357,6 +357,10 @@ void rt_names_letter_footer(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_mail_tag(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_free_str(uint8_t* rdram, recomp_context* ctx);
 void rt_names_keyboard(uint8_t* rdram, recomp_context* ctx);
+void rt_names_ledit_space(uint8_t* rdram, recomp_context* ctx);
+void rt_names_ledit_cursor(uint8_t* rdram, recomp_context* ctx);
+bool rt_names_resetti_match(uint8_t* rdram, recomp_context* ctx);
+bool rt_names_resetti_rude(uint8_t* rdram, recomp_context* ctx);
 
 recomp_func_t* get_function(int32_t vram);
 

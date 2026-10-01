@@ -267,3 +267,25 @@ text = "rt_names_free_str(rdram, ctx);"
 func = "func_8088587C_jp"
 before_vram = 0x8088595C
 text = "rt_names_keyboard(rdram, ctx);"
+
+# The line being typed: no boxes over spaces, and the cursor after the text as
+# drawn (the game places both at 12 units a character).
+[[patches.hook]]
+func = "func_80884514_jp"
+before_vram = 0x808847AC
+text = "rt_names_ledit_space(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_80884514_jp"
+before_vram = 0x80884A58
+text = "rt_names_ledit_cursor(rdram, ctx);"
+
+# Mr. Resetti's phrases: a letter's case does not count, and the rude words
+# are an English list.
+[[patches.hook]]
+func = "func_809B4BB8_jp"
+text = "if (rt_names_resetti_match(rdram, ctx)) return;"
+
+[[patches.hook]]
+func = "func_809B4C18_jp"
+text = "if (rt_names_resetti_rude(rdram, ctx)) return;"

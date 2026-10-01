@@ -867,6 +867,79 @@ void rt_names_keyboard(uint8_t* rdram, recomp_context* ctx) {
     if (sState > 0) wr_u8((uint32_t)ctx->r3 + 4, 3);
 }
 
+/*
+ * The line being typed (m_ledit_ovl, func_80884514_jp) lays its extras out at
+ * 12 units a character: a box over every space, and the cursor. The English
+ * letters are narrower, so the box of the first space sat on the last letter
+ * typed and the cursor stood at the far end of the field.
+ * rt_names_ledit_space: before the test for a space (t8 the character): no
+ * box, as a space's 5 units have no room for one.
+ * rt_names_ledit_cursor: before x = x0 + 12 * f16, f16 = cursor - 1 + 0.3,
+ * with the editor's state in s4 (cursor +0x16, text +0x24): the cursor goes
+ * after the text drawn before it.
+ */
+void rt_names_ledit_space(uint8_t* rdram, recomp_context* ctx) {
+    if (sState > 0 && rt_text_en_active()) ctx->r24 = 0;
+}
+
+void rt_names_ledit_cursor(uint8_t* rdram, recomp_context* ctx) {
+    if (sState <= 0 || !rt_text_en_active()) return;
+    uint32_t state = (uint32_t)ctx->r20, text = rd_w32(state + 0x24), w = 0;
+    int cursor = (int16_t)rd_u16(state + 0x16);
+    for (int i = 0; i < cursor && i < EXPANDED_MAX; i++) w += (uint32_t)rt_text_en_char_width(rd_u8(text + (uint32_t)i));
+    ctx->f16.fl = ((float)w - 5.5f) / 12.0f;
+}
+
+/*
+ * Mr. Resetti's "say exactly what I tell you" (ovl_Npc_Majin3): the phrase is
+ * string 0x484 + actor[0x956], typed into actor[0x94C] (10 bytes). The game
+ * compares the bytes, but the keyboard's ABC page types capitals only (R
+ * turns the last letter typed into a small one), so with the English phrases
+ * a letter's case does not count.
+ * It then looks for one of 32 rude words (strings 0x4C0..) anywhere in the
+ * text, each at a fixed length of 2 to 7 bytes that the English words do not
+ * have ("Moles suck" matched every answer beginning "Moles "): the English
+ * list is here instead.
+ */
+#define RESETTI_TEXT 0x94C
+#define RESETTI_PHRASE 0x956
+#define RESETTI_LEN 10
+
+static uint8_t lower(uint8_t c) {
+    return c >= 'A' && c <= 'Z' ? (uint8_t)(c + 0x20) : c;
+}
+
+/* s32 func_809B4BB8_jp(Actor*): 1 if the text typed is the phrase asked for */
+bool rt_names_resetti_match(uint8_t* rdram, recomp_context* ctx) {
+    uint32_t actor = (uint32_t)ctx->r4, len;
+    const uint8_t* s = entry(BASE_STRING + 0x484 + rd_u8(actor + RESETTI_PHRASE), &len);
+    if (s == NULL || len > RESETTI_LEN) return false;
+    ctx->r2 = 1;
+    for (uint32_t i = 0; i < RESETTI_LEN; i++) {
+        if (lower(rd_u8(actor + RESETTI_TEXT + i)) != lower(i < len ? s[i] : ' ')) ctx->r2 = 0;
+    }
+    return true;
+}
+
+/* s32 func_809B4C18_jp(Actor*): 1 if the text typed has a rude word in it */
+bool rt_names_resetti_rude(uint8_t* rdram, recomp_context* ctx) {
+    static const char* const kRude[] = {
+        "jerk", "die!", "loser", "freak", "creep", "no way", "leave", "shut up", "go away", "pinhead",
+        "dirtbag", "scumbag", "butthead", "bite me", "ugly", "groundhog", "you stink", "suck", "hate",
+        "who cares", "i + reset",
+    };
+    uint32_t actor = (uint32_t)ctx->r4, len;
+    if (entry(BASE_STRING + 0x4C0, &len) == NULL) return false;
+    char text[RESETTI_LEN + 1];
+    for (uint32_t i = 0; i < RESETTI_LEN; i++) text[i] = (char)lower(rd_u8(actor + RESETTI_TEXT + i));
+    text[RESETTI_LEN] = 0;
+    ctx->r2 = 0;
+    for (size_t i = 0; i < RT_COUNT(kRude); i++) {
+        if (strstr(text, kRude[i]) != NULL) ctx->r2 = 1;
+    }
+    return true;
+}
+
 /* Draws text with func_80090E98_jp(gfx, str, len, x, y, r, g, b, a, 0, 0, sx, sy, 0). */
 static void tag_line(uint8_t* rdram, recomp_context* ctx, uint32_t gfx, uint32_t str, int len,
                      float x, float y, float scale, const uint8_t* rgb) {
