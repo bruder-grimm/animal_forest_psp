@@ -47,10 +47,21 @@
 #define SCALE_X ((float)PSP_SCREEN_W / (N64_SCREEN_W - 2 * CROP_X))
 #define SCALE_Y ((float)PSP_SCREEN_H / (N64_SCREEN_H - 2 * CROP_Y))
 
-/* N64 pixels -> the GE's target: the screen (scaled, cropped) or a render target (1:1). */
+/*
+ * Unstretched (START + SELECT, rt_gfx_toggle_stretch): the picture at the
+ * shape a 4:3 TV gives it, between black bars. N64 pixels are square there,
+ * so the 316 x 236 that are shown come to 364 PSP pixels at full height.
+ */
+#define PILLAR_W 364
+#define PILLAR_X ((PSP_SCREEN_W - PILLAR_W) / 2)
+
+/*
+ * N64 pixels -> the GE's target: the screen (scaled, cropped) or a render
+ * target (1:1). x0..x1 and 0..y1 are the picture's bounds on the target.
+ */
 typedef struct {
     float scale_x, scale_y, crop_x, crop_y;
-    int w, h;
+    int x0, x1, y1;
 } ScreenMap;
 extern ScreenMap gMap;
 

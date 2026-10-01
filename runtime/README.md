@@ -94,6 +94,7 @@ file.
 | `input_script.txt` | scripted controller input (format in si.c) | si.c |
 | `shot_frames.txt` | save these frames as `shot_NNNNN.bmp` | gfx_debug.c |
 | SELECT + R (not a file) | save the next frame's RDRAM and picture as `capture_N*` | gfx_debug.c |
+| `no_stretch.txt` | start with the picture at 4:3 between black bars (START + SELECT switches) | gfx_frame.c |
 | `dump_frames.txt` | save the RDRAM of these graphics tasks | gfx_debug.c |
 | `replay.txt` | `<dump> <task> [step]`: render a dump forever instead of booting | gfx_debug.c |
 | `replay_scroll.txt` | scroll these tiles each replayed frame | gfx_debug.c |

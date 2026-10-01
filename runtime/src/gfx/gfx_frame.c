@@ -22,8 +22,51 @@ static unsigned int sGuList[256 * 1024] __attribute__((aligned(16)));
 static bool sGuReady = false;
 bool gFrameOpen = false;
 int gProjVariant = -1;
-ScreenMap gMap = { SCALE_X, SCALE_Y, CROP_X, CROP_Y, PSP_SCREEN_W, PSP_SCREEN_H };
 GfxStats gStats;
+
+/* ---- the screen map ----------------------------------------------------- */
+
+static const ScreenMap kStretched = { SCALE_X, SCALE_Y, CROP_X, CROP_Y, 0, PSP_SCREEN_W, PSP_SCREEN_H };
+#define PILLAR_SCALE_X ((float)PILLAR_W / (N64_SCREEN_W - 2 * CROP_X))
+static const ScreenMap kPillar = { PILLAR_SCALE_X, SCALE_Y, CROP_X - PILLAR_X / PILLAR_SCALE_X, CROP_Y,
+                                   PILLAR_X, PILLAR_X + PILLAR_W, PSP_SCREEN_H };
+
+/*
+ * The game's thread asks for the other shape (START + SELECT); the worker
+ * takes it up between frames, so no frame is drawn half in each. A colour
+ * buffer last drawn in the other shape has that picture left in the bars and
+ * is cleared when its turn comes (sBufStretched).
+ */
+static volatile int sStretchWanted = -1; /* -1: not yet read from no_stretch.txt */
+static bool sStretched = true;
+static bool sBufStretched[3] = { true, true, true };
+static ScreenMap sScreen = { SCALE_X, SCALE_Y, CROP_X, CROP_Y, 0, PSP_SCREEN_W, PSP_SCREEN_H };
+ScreenMap gMap = { SCALE_X, SCALE_Y, CROP_X, CROP_Y, 0, PSP_SCREEN_W, PSP_SCREEN_H };
+
+void rt_gfx_toggle_stretch(void) {
+    sStretchWanted = sStretchWanted == 0;
+}
+
+static void map_screen(void) {
+    gMap = sScreen;
+}
+
+/* Between frames: take up the shape asked for. */
+static void update_stretch(void) {
+    if (sStretchWanted < 0) {
+        sStretchWanted = !RT_SWITCH("no_stretch.txt");
+    }
+    bool wanted = sStretchWanted != 0;
+    if (wanted == sStretched) {
+        return;
+    }
+    sStretched = wanted;
+    sScreen = wanted ? kStretched : kPillar;
+    if (!gTarget.bound) {
+        map_screen();
+    }
+    rt_log("gfx: picture %s", wanted ? "stretched" : "at 4:3");
+}
 
 /* ---- projection, viewport, scissor -------------------------------------- */
 
@@ -166,11 +209,11 @@ void gfx_set_scissor(void) {
     int y0 = (int)((gRdp.scissor[1] / 4.0f - gMap.crop_y) * gMap.scale_y);
     int x1 = (int)((gRdp.scissor[2] / 4.0f - gMap.crop_x) * gMap.scale_x + 0.5f);
     int y1 = (int)((gRdp.scissor[3] / 4.0f - gMap.crop_y) * gMap.scale_y + 0.5f);
-    if (x1 > gMap.w) x1 = gMap.w;
-    if (y1 > gMap.h) y1 = gMap.h;
-    if (x0 < 0) x0 = 0;
+    if (x1 > gMap.x1) x1 = gMap.x1;
+    if (y1 > gMap.y1) y1 = gMap.y1;
+    if (x0 < gMap.x0) x0 = gMap.x0;
     if (y0 < 0) y0 = 0;
-    sceGuScissor(x0, y0, x1, y1);
+    sceGuScissor(x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0);
 }
 
 /* ---- colour buffers ----------------------------------------------------- */
@@ -238,6 +281,12 @@ void gfx_open_frame(void) {
     sceGuTexOffset(0.0f, 0.0f);
     sceGuDisable(GU_FOG);
     gGu.fog = 0;
+    if (sBufStretched[sDrawBuf] != sStretched) {
+        sBufStretched[sDrawBuf] = sStretched;
+        sceGuScissor(0, 0, PSP_SCREEN_W, PSP_SCREEN_H);
+        sceGuClearColor(0xFF000000);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
+    }
     gfx_upload_projection(PROJ_NORMAL);
     gfx_set_viewport();
     gfx_set_scissor();
@@ -362,11 +411,11 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
     if (height > N64_SCREEN_H) height = N64_SCREEN_H;
     uint8_t* rdram = g_rdram;
     for (uint32_t y = 0; y < height; y++) {
-        int sy = (int)(((float)y + 0.5f - CROP_Y) * SCALE_Y);
-        sy = sy < 0 ? 0 : sy >= PSP_SCREEN_H ? PSP_SCREEN_H - 1 : sy;
+        int sy = (int)(((float)y + 0.5f - sScreen.crop_y) * sScreen.scale_y);
+        sy = sy < 0 ? 0 : sy >= sScreen.y1 ? sScreen.y1 - 1 : sy;
         for (uint32_t x = 0; x < width; x++) {
-            int sx = (int)(((float)x + 0.5f - CROP_X) * SCALE_X);
-            sx = sx < 0 ? 0 : sx >= PSP_SCREEN_W ? PSP_SCREEN_W - 1 : sx;
+            int sx = (int)(((float)x + 0.5f - sScreen.crop_x) * sScreen.scale_x);
+            sx = sx < sScreen.x0 ? sScreen.x0 : sx >= sScreen.x1 ? sScreen.x1 - 1 : sx;
             uint32_t c = sCapturePixels[sy * BUF_WIDTH + sx];
             uint32_t r = (c >> 3) & 31, g = (c >> 11) & 31, b = (c >> 19) & 31;
             uint16_t v = (uint16_t)((r << 11) | (g << 6) | (b << 1) | 1);
@@ -528,15 +577,6 @@ static void rdram_to_pixels(uint32_t* px) {
     }
 }
 
-static void map_screen(void) {
-    gMap.scale_x = SCALE_X;
-    gMap.scale_y = SCALE_Y;
-    gMap.crop_x = CROP_X;
-    gMap.crop_y = CROP_Y;
-    gMap.w = PSP_SCREEN_W;
-    gMap.h = PSP_SCREEN_H;
-}
-
 /* Points the GE at the target's buffers; its stencil is the coverage bit. */
 static void ge_draw_to_target(void) {
     sceGuDrawBufferList(GU_PSM_8888, (void*)RT_VRAM, RT_MAX);
@@ -546,8 +586,9 @@ static void ge_draw_to_target(void) {
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
     gMap.scale_x = gMap.scale_y = 1.0f;
     gMap.crop_x = gMap.crop_y = 0.0f;
-    gMap.w = (int)gTarget.width;
-    gMap.h = (int)gTarget.height;
+    gMap.x0 = 0;
+    gMap.x1 = (int)gTarget.width;
+    gMap.y1 = (int)gTarget.height;
     gfx_set_viewport();
     gfx_set_scissor();
 }
@@ -771,8 +812,9 @@ void gfx_copy_from_screen(uint32_t fb, float dx0, float dy0, float dx1, float dy
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-    gfx_draw_rect(dx0, dy0, dx1, dy1, (sx0 - CROP_X) * SCALE_X, (sy0 - CROP_Y) * SCALE_Y, (sx1 - CROP_X) * SCALE_X,
-                  (sy1 - CROP_Y) * SCALE_Y, 0xFFFFFFFF, NULL, false);
+    gfx_draw_rect(dx0, dy0, dx1, dy1, (sx0 - sScreen.crop_x) * sScreen.scale_x, (sy0 - sScreen.crop_y) * sScreen.scale_y,
+                  (sx1 - sScreen.crop_x) * sScreen.scale_x, (sy1 - sScreen.crop_y) * sScreen.scale_y, 0xFFFFFFFF, NULL,
+                  false);
     gfx_gu_reset_cache();
 }
 
@@ -858,16 +900,21 @@ static void soften_passes(void) {
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexWrap(GU_CLAMP, GU_CLAMP);
 
-    /* the frame at half size */
+    /* the picture (not the bars beside it, if any) at half size */
+    int x0 = sScreen.x0, x1 = sScreen.x1, hx0 = x0 / 2, hx1 = x1 / 2;
     sceGuDisable(GU_BLEND);
     sceGuDrawBufferList(GU_PSM_8888, (void*)SOFT_VRAM, 256);
     sceGuTexImage(0, 512, 512, BUF_WIDTH, VRAM_ADDR(screen));
     sceGuTexFlush();
-    soften_sprite(0, 0, SOFT_W, SOFT_H, 0, 0, PSP_SCREEN_W, PSP_SCREEN_H);
+    soften_sprite(hx0, 0, hx1, SOFT_H, x0, 0, x1, PSP_SCREEN_H);
     /* its last column and row repeated: the enlarged sprite's right and bottom
-     * pixels sample a quarter texel past them */
+     * pixels sample a quarter texel past them (and its left ones, where the
+     * picture does not start at the texture's edge) */
     void* half = VRAM_ADDR(SOFT_VRAM);
-    sceGuCopyImage(GU_PSM_8888, SOFT_W - 1, 0, 1, SOFT_H, 256, half, SOFT_W, 0, 256, half);
+    sceGuCopyImage(GU_PSM_8888, hx1 - 1, 0, 1, SOFT_H, 256, half, hx1, 0, 256, half);
+    if (hx0 > 0) {
+        sceGuCopyImage(GU_PSM_8888, hx0, 0, 1, SOFT_H, 256, half, hx0 - 1, 0, 256, half);
+    }
     sceGuCopyImage(GU_PSM_8888, 0, SOFT_H - 1, SOFT_W + 1, 1, 256, half, 0, SOFT_H, 256, half);
 
     /* and back over it, enlarged */
@@ -878,7 +925,7 @@ static void soften_passes(void) {
     uint32_t k = (uint32_t)sSoften, ik = 255 - k;
     sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, k | (k << 8) | (k << 16), ik | (ik << 8) | (ik << 16));
-    soften_sprite(0, 0, PSP_SCREEN_W, PSP_SCREEN_H, 0, 0, SOFT_W, SOFT_H);
+    soften_sprite(x0, 0, x1, PSP_SCREEN_H, hx0, 0, hx1, SOFT_H);
     gfx_gu_reset_cache();
 }
 
@@ -1026,6 +1073,7 @@ void gfx_present_frame(uint32_t framebuffer) {
         sShownVcount = sceDisplayGetVcount();
         sFrameDrawn = false;
     }
+    update_stretch();
     gfx_tex_new_frame();
     if ((gStats.frames % 120) == 1) {
         log_stats();

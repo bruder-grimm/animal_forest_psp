@@ -264,6 +264,7 @@ bool rt_gfx_yielded(void);
 uint32_t rt_gfx_frame_count(void);
 /* Debug tools */
 void rt_gfx_request_capture(void); /* SELECT + R: dump the next frame (gfx_debug.c) */
+void rt_gfx_toggle_stretch(void);  /* START + SELECT: the picture stretched, or at 4:3 (gfx_frame.c) */
 void rt_gfx_bench(void);           /* bench_vtx.txt: times the vertex stage (gfx_vertex.c) */
 bool rt_gfx_replay(void);          /* replay.txt: renders a dumped frame forever (gfx_debug.c) */
 

@@ -165,7 +165,9 @@ it: copy them there from `work/text/`.
 The save (`flash.bin`) and clock offset (`rtc.bin`) are written next to them.
 Controls: cross A, square B, L Z, R R, START start, triangle and circle C-up
 and C-right, d-pad and stick as themselves; SELECT + d-pad gives the four C
-buttons and SELECT + L the N64's L.
+buttons and SELECT + L the N64's L. START + SELECT switches between the
+picture stretched over the whole screen and at its own 4:3 shape between black
+bars (a file `no_stretch.txt` next to the EBOOT starts the game at 4:3).
 
 ## Debugging
 

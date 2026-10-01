@@ -199,7 +199,8 @@ static int8_t scale_axis(int raw, bool invert) {
  *   cross A, square B, L Z, R R, START start, triangle C-up, circle C-right,
  *   d-pad the four C buttons, analog stick stick;
  *   SELECT + d-pad the N64 d-pad (only debug screens read it), SELECT + L the
- *   N64's L, SELECT + R a debug capture of the next frame (not passed to the game).
+ *   N64's L, SELECT + R a debug capture of the next frame, START + SELECT the
+ *   picture stretched or at 4:3 (neither passed to the game).
  */
 static void poll_pad(void) {
     SceCtrlData pad;
@@ -230,6 +231,18 @@ static void poll_pad(void) {
         }
     }
     sCaptureHeld = capture;
+
+    /* START + SELECT: the picture stretched over the screen, or at 4:3
+     * between black bars. Kept from the game as well. */
+    static bool sStretchHeld = false;
+    bool stretch = shift && (pad.Buttons & PSP_CTRL_START);
+    if (stretch) {
+        b &= (uint16_t)~N64_START;
+        if (!sStretchHeld) {
+            rt_gfx_toggle_stretch();
+        }
+    }
+    sStretchHeld = stretch;
 
     if (shift) {
         /* SELECT + d-pad: N64 d-pad / L */
