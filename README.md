@@ -52,10 +52,10 @@ This project was *heavily* supported by claude as copilot, so much so that I hon
 ## Credit that is actually due
 
 The decompilation is [zeldaret/af](https://github.com/zeldaret/af)'s.
-[N64Recomp](https://github.com/N64Recomp/N64Recomp) is Mr-Wiseguy's; the
-runtime's thread model follows his N64ModernRuntime. The Media Engine support
-uses mcidclan's
-[psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core).
+[N64Recomp](https://github.com/N64Recomp/N64Recomp) is Mr-Wiseguy's
+Theruntime's thread model follows his N64ModernRuntime. 
+Heavily inspired by how z2442's [oot](https://github.com/z2442/oot-PSP) and [sm64](https://github.com/z2442/sm64-port) ports.
+The Media Engine support uses mcidclan's [psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core).
 The English text comes from your own copy of the GameCube *Animal Crossing*
 and the fan translation ROM; `tools/text_en_manual.txt`
 holds translations made for this port of the messages the GameCube release
