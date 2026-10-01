@@ -264,8 +264,3 @@ text = "rt_names_free_str(rdram, ctx);"
 func = "func_8088587C_jp"
 before_vram = 0x8088595C
 text = "rt_names_keyboard(rdram, ctx);"
-
-# Debug (letter_test.txt only): Z + START opens the pockets on any save.
-[[patches.hook]]
-func = "mSM_submenu_ctrl"
-text = "rt_names_test_submenu(rdram, ctx);"

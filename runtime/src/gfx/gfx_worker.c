@@ -166,10 +166,6 @@ bool rt_gfx_yielded(void) {
     return rendering;
 }
 
-uint32_t rt_gfx_frame_count(void) {
-    return gStats.frames;
-}
-
 static void start_worker(void) {
     if (sGfxIdle >= 0) {
         return;

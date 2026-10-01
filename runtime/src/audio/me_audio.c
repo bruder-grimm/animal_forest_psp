@@ -29,7 +29,6 @@
 
 #include <pspkernel.h>
 #include <pspthreadman.h>
-#include <psppower.h>
 
 #include <me-core-mapper/me-core.h>
 
@@ -38,10 +37,9 @@
 
 #define ME_TIMEOUT_US 200000
 
+/* Both CPUs use this through the uncached alias; it has cache lines to itself,
+ * so neither's cache writes a stale copy of a neighbour over it. */
 typedef struct {
-    u32 bench;      /* rounds of the speed test, then 0 when done */
-    u32 bench_sum;
-    u32 pad[14];    /* the ME writes these: keep them off the CPU's lines */
     u32 seq;        /* bumped by the main CPU to submit a task */
     u32 ack;        /* set to seq by the ME when the task is done */
     u32 alive;      /* incremented by the ME while idle */
@@ -50,12 +48,10 @@ typedef struct {
     u32 quit;       /* 1 = main CPU asks the ME to stop, 2 = ME halted */
     u32 starts;     /* times the ME has started our code */
     u32 fcr31;      /* its FPU control word at the first start, set again at every later one */
-    u32 fcr31_found; /* what the last start found there */
-    u32 boot_tags;  /* cache tags the last start found set (me_boot.S): instruction << 16 | data */
     AspTask task;
-} MeShared;
+} __attribute__((aligned(64))) MeShared;
 
-static MeShared sShared __attribute__((aligned(64)));
+static MeShared sShared;
 #define SHARED ((volatile MeShared*)(UNCACHED_USER_MASK | (u32)&sShared))
 
 /* Called through kcall: checks that kernel calls really work. */
@@ -99,32 +95,16 @@ static u32 sTasks = 0;
 static float sIdleRate = 0;   /* idle-loop counts per us with the ME at rest */
 static u32 sAliveMark = 0, sAliveTime = 0;
 
-/* A fixed amount of integer work, to compare the two cores. */
-static u32 bench_work(u32 rounds) {
-    volatile u32* buf = (volatile u32*)g_asp.dm;
-    u32 sum = 0;
-    for (u32 r = 0; r < rounds; r++) {
-        for (u32 i = 0; i < 1024; i++) {
-            sum = sum * 1103515245u + buf[i & 0x3FF] + r;
-        }
-    }
-    return sum;
-}
-
 void meLibOnProcess(void) {
     volatile MeShared* sh = SHARED;
-    u32 tags;
-    asm volatile("mfc0 %0, $14" : "=r"(tags)); /* left there by me_boot.S */
-    sh->boot_tags = tags;
     /*
      * The FPU's control word (rounding, traps) is the one the firmware's ME
      * code left the first time, and whatever the hardware came up with after
      * a standby: the audio code has to find the same one every time.
      */
     u32 fcr31;
-    asm volatile("cfc1 %0, $31" : "=r"(fcr31));
-    sh->fcr31_found = fcr31;
     if (sh->starts == 0) {
+        asm volatile("cfc1 %0, $31" : "=r"(fcr31));
         sh->fcr31 = fcr31;
     } else {
         fcr31 = sh->fcr31;
@@ -133,14 +113,6 @@ void meLibOnProcess(void) {
     sh->starts = sh->starts + 1;
     u32 done = sh->ack;
     for (;;) {
-        if (sh->bench != 0) {
-            u32 rounds = sh->bench;
-            meLibDcacheWritebackInvalidateAll();
-            sh->bench_sum = bench_work(rounds);
-            meLibDcacheWritebackInvalidateAll();
-            sh->bench = 0;
-            meLibSync();
-        }
         u32 seq = sh->seq;
         if (seq != done) {
             AspTask task = sh->task;
@@ -167,33 +139,6 @@ void meLibOnProcess(void) {
     }
 }
 
-/* The state the ME came out of its reset in: after a standby it is the hardware's, not the firmware's. */
-static void log_start(void) {
-    volatile MeShared* sh = SHARED;
-    u32 tags = sh->boot_tags;
-    rt_log("me: start %u found %u instruction and %u data cache tags set, FPU control %08X (using %08X)",
-           (unsigned)sh->starts, (unsigned)(tags >> 16), (unsigned)(tags & 0xFFFF), (unsigned)sh->fcr31_found,
-           (unsigned)sh->fcr31);
-}
-
-/* How fast is the ME, compared with the main CPU? */
-static void speed_test(const char* when) {
-    volatile MeShared* sh = SHARED;
-    const u32 rounds = 400;
-    uint32_t t0 = sceKernelGetSystemTimeLow();
-    sh->bench = rounds;
-    while (sh->bench != 0 && sceKernelGetSystemTimeLow() - t0 < 3000000) {
-        sceKernelDelayThread(200);
-    }
-    uint32_t me_us = sceKernelGetSystemTimeLow() - t0;
-    t0 = sceKernelGetSystemTimeLow();
-    u32 cpu_sum = bench_work(rounds);
-    uint32_t cpu_us = sceKernelGetSystemTimeLow() - t0;
-    rt_log("me: speed test%s %u us on the ME, %u us on the main CPU (sums %08X/%08X), clocks %d/%d MHz", when,
-           (unsigned)me_us, (unsigned)cpu_us, (unsigned)sh->bench_sum, (unsigned)cpu_sum,
-           scePowerGetCpuClockFrequency(), scePowerGetBusClockFrequency());
-}
-
 /* Kernel mode: stops the ME dead, cache and all. */
 static int hold_reset(void) {
     HW_SYS_RESET_ENABLE = SC_HW_RESET;
@@ -216,7 +161,6 @@ static int hold_reset(void) {
 #define SYSEVENT_SUSPEND 0x00000402
 
 static bool sMeAsleep = false;
-static u32 sSleepAck = 0;   /* quit state the ME reached at the last suspend */
 
 static int me_sysevent(int ev_id, char* ev_name, void* param, int* result) {
     volatile MeShared* sh = SHARED;
@@ -225,7 +169,6 @@ static int me_sysevent(int ev_id, char* ev_name, void* param, int* result) {
         sh->quit = 1;
         for (u32 i = 0; i < 2000000 && sh->quit != 2; i++) {
         }
-        sSleepAck = sh->quit;
         HW_SYS_RESET_ENABLE = SC_HW_RESET;
         meLibSync();
         sMeAsleep = true;
@@ -242,7 +185,6 @@ void rt_me_audio_resume(void) {
     if (!sMeAsleep) {
         return;
     }
-    rt_log("me: %s before the suspend", sSleepAck == 2 ? "halted" : "did not halt");
     sh->quit = 0;
     u32 alive = sh->alive;
     int table = kcall(start_me_core, 0);
@@ -254,8 +196,6 @@ void rt_me_audio_resume(void) {
         rt_log("me: did not restart after the resume (%d), audio stays on the main CPU", table);
         return;
     }
-    log_start();
-    speed_test(" after the resume:");
     sSubmitTime = sceKernelGetSystemTimeLow();
     sAliveMark = sh->alive;
     sAliveTime = sceKernelGetSystemTimeLow();
@@ -381,9 +321,6 @@ void rt_me_audio_init(void) {
     }
     sMeReady = true;
     rt_log("me: audio tasks run on the Media Engine (core image %d)", table);
-    log_start();
-
-    speed_test("");
 
     /* How fast the idle loop counts when the ME has nothing to do: the
      * baseline for how busy it is later (rt_me_audio_report). */

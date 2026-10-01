@@ -153,50 +153,6 @@ static void output_wav_write(const int16_t* chunk, uint32_t frames, uint32_t rat
     }
 }
 
-/*
- * audio_raw.txt holds "first count": the sample buffers the game hands over,
- * from buffer number `first` on, go to afpsp_raw.wav. Unlike the output this
- * does not depend on timing, so recordings of the same scene can be compared
- * bit for bit (e.g. Media Engine against main CPU).
- */
-static SceUID sRawFd = -1;
-static bool sRawLoaded = false;
-static uint32_t sRawFirst = 0;
-static uint32_t sRawCount = 0;
-static uint32_t sRawWritten = 0;
-
-/* count: frames to write; total: frames in this buffer (0 for the rest of one that wrapped). */
-static void raw_record(const int16_t* samples, uint32_t count, uint32_t total, uint32_t rate) {
-    if (!sRawLoaded) {
-        uint32_t v[2];
-        sRawLoaded = true;
-        if (rt_load_number_list("audio_raw.txt", v, 2) < 2) {
-            return;
-        }
-        char path[256];
-        sRawFd = sceIoOpen(rt_data_path("afpsp_raw.wav", path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
-                           0777);
-        sRawFirst = v[0];
-        sRawCount = v[1];
-        if (sRawFd >= 0) {
-            write_wav_header(sRawFd, rate, 0);
-            rt_log("audio: recording %u buffers from buffer %u to %s", (unsigned)sRawCount, (unsigned)sRawFirst, path);
-        }
-    }
-    if (sRawFd < 0 || sSubmitted < sRawFirst) {
-        return;
-    }
-    if (sSubmitted >= sRawFirst + sRawCount && total != 0) {
-        write_wav_header(sRawFd, rate, sRawWritten);
-        sceIoClose(sRawFd);
-        sRawFd = -1;
-        rt_log("audio: buffer recording done (%u frames)", (unsigned)sRawWritten);
-        return;
-    }
-    sceIoWrite(sRawFd, samples, count * 4);
-    sRawWritten += count;
-}
-
 /* dump_audio.txt lists task numbers: those tasks' RDRAM goes to aspt_<n>.bin, for testing the microcode off the PSP. */
 static void maybe_dump_task(uint32_t task_number, uint32_t task) {
     static uint32_t sDumpTasks[32];
@@ -255,7 +211,7 @@ static uint32_t sHwChunks = 0;
 static uint32_t sPrevOutEnd = 0;    /* when the last output call returned */
 static uint32_t sChunkUs = 0;       /* how long one chunk plays for */
 
-/* The end of the last chunk played, looped to cover an underrun (resampled output). */
+/* The end of the last chunk played, looped to cover an underrun . */
 static int16_t sHist[CONCEAL_FRAMES * 2];
 static uint32_t sHistFill = 0;
 
@@ -362,70 +318,20 @@ static void fill_resampled(int16_t* chunk, uint32_t step, uint32_t* phase) {
     sHistFill = CONCEAL_FRAMES;
 }
 
-/* A chunk straight from the ring, for the firmware's rate converter (src32.txt). */
-static void fill_direct(int16_t* chunk) {
-    uint32_t avail = ring_fill();
-    uint32_t take = avail < OUT_CHUNK ? avail : OUT_CHUNK;
-    uint32_t rd = sRingRead;
-    for (uint32_t i = 0; i < take; i++) {
-        uint32_t k = (rd + i) & RING_MASK;
-        chunk[i * 2] = sRing[k * 2];
-        chunk[i * 2 + 1] = sRing[k * 2 + 1];
-    }
-    sRingRead = rd + take;
-    if (take < OUT_CHUNK) {
-        /* Underrun: loop what was just played (the ring still holds it), fading out. */
-        note_underrun();
-        uint32_t played = rd + take;
-        uint32_t loop = played < CONCEAL_FRAMES ? played : CONCEAL_FRAMES;
-        for (uint32_t i = take; i < OUT_CHUNK; i++) {
-            if (loop == 0) {
-                chunk[i * 2] = chunk[i * 2 + 1] = 0;
-                continue;
-            }
-            uint32_t k = (played - loop + ((i - take) % loop)) & RING_MASK;
-            int32_t fade = 256 - (int32_t)((i - take) >> 1);
-            if (fade < 0) {
-                fade = 0;
-            }
-            chunk[i * 2] = (int16_t)(sRing[k * 2] * fade >> 8);
-            chunk[i * 2 + 1] = (int16_t)(sRing[k * 2 + 1] * fade >> 8);
-        }
-    }
-    sConsumed += OUT_CHUNK;
-}
-
-/* The firmware's SRC channel takes these rates only; the closest to the game's. */
-static uint32_t nearest_src_rate(uint32_t freq) {
-    static const uint32_t kRates[] = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000 };
-    uint32_t rate = kRates[0];
-    for (size_t i = 0; i < RT_COUNT(kRates); i++) {
-        uint32_t d_best = rate > freq ? rate - freq : freq - rate;
-        uint32_t d = kRates[i] > freq ? kRates[i] - freq : freq - kRates[i];
-        if (d < d_best) {
-            rate = kRates[i];
-        }
-    }
-    return rate;
-}
-
 /*
- * Plays the ring. By default the output runs at the DAC's own 44.1 kHz,
- * resampled here, which keeps the firmware's rate converter out of the path;
- * src32.txt hands the firmware the game's rate instead, for comparisons.
+ * Plays the ring. The output runs at the DAC's own 44.1 kHz, resampled here,
+ * which keeps the firmware's rate converter out of the path.
  */
 static int output_thread(SceSize args, void* argp) {
     sceKernelWaitSema(sFreqSignal, 1, NULL);
     uint32_t freq = sFrequency;
-    bool resample = !rt_data_file_exists("src32.txt");
-    uint32_t rate = resample ? OUT_RATE_44K : nearest_src_rate(freq);
+    const uint32_t rate = OUT_RATE_44K;
     int ret = sceAudioSRCChReserve(OUT_CHUNK, (int)rate, 2);
-    rt_log("audio: output %u Hz (game %u Hz), reserve %08X%s", rate, freq, (unsigned)ret,
-           resample ? " [resampled here]" : " [firmware SRC, src32.txt]");
+    rt_log("audio: output %u Hz (game %u Hz), reserve %08X", rate, freq, (unsigned)ret);
     if (ret < 0) {
         return 0;
     }
-    uint32_t step = (uint32_t)(((uint64_t)freq << 16) / OUT_RATE_44K);
+    uint32_t step = (uint32_t)(((uint64_t)freq << 16) / rate);
     uint32_t phase = 0;
     sChunkUs = (uint32_t)((uint64_t)OUT_CHUNK * 1000000 / rate);
     output_wav_open(rate);
@@ -449,11 +355,7 @@ static int output_thread(SceSize args, void* argp) {
                 continue;
             }
         }
-        if (resample) {
-            fill_resampled(chunk, step, &phase);
-        } else {
-            fill_direct(chunk);
-        }
+        fill_resampled(chunk, step, &phase);
         output_wav_write(chunk, OUT_CHUNK, rate);
         output_chunk(chunk);
     }
@@ -643,15 +545,6 @@ void func_800EFD40_jp(uint8_t* rdram, recomp_context* ctx) {
     }
     sRingWrite = wr + frames;
     sProduced += frames;
-    /* The samples as produced, for comparing runs (see raw_record). */
-    uint32_t head = RING_FRAMES - (wr & RING_MASK);
-    if (head > frames) {
-        head = frames;
-    }
-    raw_record(&sRing[(wr & RING_MASK) * 2], head, frames, sFrequency);
-    if (head < frames) {
-        raw_record(&sRing[0], frames - head, 0, sFrequency);
-    }
     sSubmitted++;
     ctx->r2 = 0;
 }

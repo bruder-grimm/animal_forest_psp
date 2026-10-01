@@ -108,55 +108,21 @@ const char* rt_data_path(const char* name, char* out, size_t out_size) {
     return out;
 }
 
-static void exit_game(bool stop_me) {
+static int exit_callback(int arg1, int arg2, void* common) {
     rt_log("exit requested");
     /* The ME first: it runs code from, and writes into, memory the exit frees. */
-    if (stop_me) {
-        rt_me_audio_shutdown();
-    }
+    rt_me_audio_shutdown();
     rt_save_flush();
     rt_rtc_tick();
     rt_log_flush();
     sceKernelExitGame();
-}
-
-static int exit_callback(int arg1, int arg2, void* common) {
-    exit_game(true);
     return 0;
 }
 
-/*
- * After a resume, on a thread of its own: starts the ME again, then (debug)
- * logs twice a second for 20 s whether the game runs and what every thread of
- * ours is waiting for. The log is written out before and after the ME's
- * start, so that it shows how far things got if the PSP stops there.
- */
+/* After a resume, on a thread of its own: starts the ME again. */
 static int resume_thread(SceSize args, void* argp) {
-    rt_log_flush();
     rt_me_audio_resume();
-    rt_log("power: resume handled");
-    rt_log_flush();
-    for (int i = 0; i < 40; i++) {
-        rt_log("resume +%d.%ds: frame %u, polls %u, indirect calls %u (last %08X)", i / 2, (i % 2) * 5,
-               (unsigned)rt_gfx_frame_count(), (unsigned)rt_input_polls(), (unsigned)g_indirect_calls,
-               (unsigned)g_last_indirect_vram);
-        if (i == 4 || i == 20) {
-            SceUID ids[64];
-            int n = 0;
-            sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, ids, 64, &n);
-            for (int k = 0; k < n && k < 64; k++) {
-                SceKernelThreadInfo info;
-                memset(&info, 0, sizeof(info));
-                info.size = sizeof(info);
-                if (sceKernelReferThreadStatus(ids[k], &info) == 0) {
-                    rt_log("  thread %-16s pri %02X status %X wait type %d on %08X", info.name,
-                           (unsigned)info.currentPriority, (unsigned)info.status, info.waitType,
-                           (unsigned)info.waitId);
-                }
-            }
-        }
-        sceKernelDelayThread(500000);
-    }
+    rt_log("power: resumed");
     sceKernelExitDeleteThread(0);
     return 0;
 }
@@ -169,7 +135,6 @@ static int resume_thread(SceSize args, void* argp) {
  * resume_thread.
  */
 static int power_callback(int unknown, int flags, void* common) {
-    rt_log("power: callback flags %08X", (unsigned)flags);
     if (flags & PSP_POWER_CB_RESUME_COMPLETE) {
         SceUID thid = sceKernelCreateThread("rt_resume", resume_thread, 0x10, 32 * 1024, PSP_THREAD_ATTR_USER, NULL);
         if (thid < 0 || sceKernelStartThread(thid, 0, NULL) < 0) {
@@ -179,35 +144,11 @@ static int power_callback(int unknown, int flags, void* common) {
     return 0;
 }
 
-/* In libpsppower, but not in its header: a standby the firmware ends by itself. */
-int scePowerRequestSuspendTouchAndGo(void);
-
 static int callback_thread(SceSize args, void* argp) {
     int cbid = sceKernelCreateCallback("exit_callback", exit_callback, NULL);
     sceKernelRegisterExitCallback(cbid);
     int pcbid = sceKernelCreateCallback("power_callback", (SceKernelCallbackFunction)power_callback, NULL);
     scePowerRegisterCallback(-1, pcbid);
-    /* Debug: standby_test.txt "<seconds> [times]" puts the PSP into standby
-     * that long after the start (and that long after each resume); the
-     * firmware wakes it again by itself at once, so nobody has to work the
-     * power switch. The ME's power stays on, unlike in a real standby. */
-    uint32_t standby[2] = {0, 1};
-    if (rt_load_number_list("standby_test.txt", standby, 2) > 0) {
-        for (uint32_t i = 0; i < standby[1]; i++) {
-            sceKernelDelayThreadCB(standby[0] * 1000000u);
-            rt_log("power: standby test %u of %u", (unsigned)(i + 1), (unsigned)standby[1]);
-            scePowerRequestSuspendTouchAndGo();
-        }
-    }
-    /* Debug: exit_test.txt "<seconds> [1]" takes the HOME exit path by itself
-     * after that long (1 = leave the ME running, as before the fix), for
-     * testing it over PSPLink, where nobody presses HOME. It is also how a
-     * test run there has to end: PSPLink's own reset leaves the ME running. */
-    uint32_t test[2] = {0, 0};
-    if (rt_load_number_list("exit_test.txt", test, 2) > 0) {
-        sceKernelDelayThreadCB(test[0] * 1000000u);
-        exit_game(test[1] != 1);
-    }
     sceKernelSleepThreadCB();
     return 0;
 }
@@ -270,10 +211,7 @@ int main(int argc, char* argv[]) {
     setup_callbacks();
     rt_log_init();
     rt_log("Animal Forest PSP runtime starting (base %s)", sBaseDir);
-    /* cpu_mhz.txt: run at another CPU clock (222, 266, ...), to see how much headroom there is. */
-    uint32_t mhz[1] = { 333 };
-    rt_load_number_list("cpu_mhz.txt", mhz, 1);
-    scePowerSetClockFrequency((int)mhz[0], (int)mhz[0], (int)mhz[0] / 2);
+    scePowerSetClockFrequency(333, 333, 166);
 
     /* RDRAM with zeros on both sides for generated code that steps just outside it (MEM_PTR). */
     uint8_t* rdram_block = memalign(64, RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD);
@@ -300,12 +238,10 @@ int main(int argc, char* argv[]) {
     rt_rtc_init();
     rt_input_init();
     rt_gfx_init();
-    rt_gfx_bench();   /* debug: bench_vtx.txt */
     rt_gfx_replay();  /* debug: replay.txt, never returns if present */
     rt_audio_init();
     rt_me_audio_init();
     rt_vi_init();
-    rt_preempt_init();
 
     rt_sched_run_boot(BOOTPROC_VRAM, BOOT_STACK_TOP);
     return 0;

@@ -43,17 +43,6 @@ ifeq ($(MEMCHECK),1)
 GEN_CFLAGS += -DRECOMP_MEM_CHECK
 endif
 RT_CFLAGS := $(COMMON_FLAGS) -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-format $(INCLUDES) $(DEFINES)
-# The renderer's PROF_BEGIN/PROF_END timing slots (runtime/src/prof.h) are two
-# syscalls each, ~1700 a village frame: 1.1 ms of a 13 ms render. They are
-# compiled in only with `gmake PROF=1`; the stats line then shows them.
-ifneq ($(PROF),1)
-RT_CFLAGS += -DRT_NO_PROF
-endif
-# gmake GFXPROF=1: sampling profiler for the renderer (runtime/src/gfx/gfx_prof.c)
-ifeq ($(GFXPROF),1)
-RT_CFLAGS += -DRT_GFXPROF
-$(filter-out $(BUILD)/rt/gfx/gfx_prof.o,$(filter $(BUILD)/rt/gfx/%,$(RT_OBJS))): RT_CFLAGS += -finstrument-functions
-endif
 
 LIBS := -lme-core -lpspsdk -lpspgum -lpspgu -lpsppower -lpsprtc -lpspaudio -lpspdisplay -lpspge -lpspctrl -lpspdebug -lm
 LDFLAGS := -L$(PSPDEV)/psp/lib -L$(PSPSDK)/lib -specs=$(PSPSDK)/lib/prxspecs \

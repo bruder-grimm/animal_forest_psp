@@ -21,7 +21,6 @@
 #include <string.h>
 
 #include "gfx_internal.h"
-#include "prof.h"
 
 #define BATCH_MAX_VERTS 3 * 512
 #define BATCH_MAX_INDICES 3 * 1024
@@ -226,21 +225,30 @@ void gfx_forget_packed(int first, int count) {
  * a sliver of a pixel between two edges can hold a PSP pixel centre: a line of
  * background across the screen, coming and going as the camera moves.
  *
- * So vertices are snapped to the N64's quarter-pixel grid, and vertices that
- * nearly coincide are welded: rounded on their own, two vertices 0.08 pixel
- * apart land on different grid points about a third of the time, and the
- * snap then *widens* the sliver to a quarter pixel (the ground blocks at
- * y = 25.85 and 25.93 went to 25.75 and 26.0 -- a line of blue across the
- * grass on the PSP-1000). Every vertex sent in a task is remembered with its
- * grid point, and one within WELD_RADIUS of an earlier one takes that one's
- * grid point instead of its own, if it is at the same depth: two meshes
- * meeting at a point agree on its depth, something in front of them does not.
- * The radius is a quarter of a pixel: along the beach, blocks meet 0.15-0.18
- * pixel apart (x = 307.03 and 306.86 became 307.0 and 306.75 -- a dotted
- * line down the grass and sand). A weld moves a vertex at most three eighths
- * of a pixel; the one edge in the reference frames it moves a row (the
- * station platform, whose corner meets the wall 0.09 pixel away) is such a
- * join.
+ * So vertices are snapped to a grid, and vertices that nearly coincide are
+ * welded: rounded on their own, two vertices 0.08 pixel apart land on
+ * different grid points some of the time, and the snap then *widens* the
+ * sliver to a grid step (a line of blue across the grass on the PSP-1000).
+ * Every vertex sent in a task is remembered with its grid point, and one
+ * within WELD_RADIUS of an earlier one takes that one's grid point instead of
+ * its own, if it is at the same depth: two meshes meeting at a point agree on
+ * its depth, something in front of them does not. The radius has to cover the
+ * beach, where blocks meet 0.15-0.18 N64 pixel apart (a dotted line down the
+ * grass and sand).
+ *
+ * The grid is the PSP's, not the N64's: half a PSP pixel apart, at 5/16 and
+ * 13/16 of each pixel (SNAP_PHASE). Welded vertices are not equal on the
+ * hardware. The GE rounds screen positions to 1/16 pixel, and its own
+ * transform put the two sides of an acre join 0.03-0.09 pixel apart although
+ * they were sent to the same point (the village's coordinates are in the
+ * thousands; PPSSPP, which rasterises on the host's GPU, shows none of this).
+ * So a shared edge can come out one 1/16 step apart, and when the GE's sample
+ * point -- between 9/16 and 10/16 down the pixel, as measured by shifting the
+ * picture a sixteenth at a time -- is in that step, the row belongs to
+ * neither side: on the N64's quarter-pixel grid, which falls anywhere on the
+ * PSP's, the join at y = 269.595 went to 269.5625 above and 269.625 below
+ * and left row 269 blue. The grid points here are a quarter pixel from the
+ * sample points on both sides.
  *
  * The GE projects the eye-space position itself (GU_TRANSFORM_3D), so the snap
  * is applied as a nudge in eye space: the 2x2 Jacobian of the screen position
@@ -250,9 +258,10 @@ void gfx_forget_packed(int first, int count) {
  * so eye y feeds clip w too (P[1][3] != 0), and a nudge that assumed a plain
  * perspective left the village unsnapped -- a line of blue across the ground.
  */
+#define SNAP_PHASE 0.3125f /* grid points are at SNAP_PHASE + n / 2 PSP pixels */
 static struct {
     bool ok;
-    float hw, tx, hh, ty;   /* N64 viewport: screen = ndc * hw + tx, ty - ndc * hh */
+    float hw, tx, hh, ty;   /* grid steps / 4 = ndc * hw + tx, ty - ndc * hh */
     float p00, p10, p01, p11, p03, p13; /* how eye x and y feed clip x, y and w */
 } sSnap;
 
@@ -271,12 +280,12 @@ static struct {
  */
 #define WELD_SLOTS 1024        /* a power of two; the village draws ~550 vertices a task */
 #define WELD_MAX_FILL 768
-#define WELD_OFS_BITS 6        /* positions in 1/64 quarter pixel */
-#define WELD_RADIUS 64         /* in 1/64 quarter pixel: a quarter of a pixel */
+#define WELD_OFS_BITS 6        /* positions in 1/64 grid step */
+#define WELD_RADIUS 44         /* in 1/64 grid step: about a third of a PSP pixel */
 #define WELD_EMPTY INT16_MIN
 #define WELD_MIN_EXTENT 0.6f  /* sum of a triangle's x and y edge extents, in NDC (~50 px) */
 typedef struct {
-    int16_t gx, gy;            /* grid point, in quarter pixels (WELD_EMPTY: free) */
+    int16_t gx, gy;            /* grid point, in grid steps (WELD_EMPTY: free) */
     int8_t ox, oy;             /* the vertex, unsnapped: its offset from the grid point */
     uint16_t w;                /* clip w in 1/4 */
 } WeldSlot;
@@ -376,7 +385,7 @@ static __attribute__((noinline)) int weld_search(int gx, int gy, int fx, int fy,
 }
 
 /*
- * The grid point for a vertex at (qx, qy) quarter pixels (|q| < 32000) and
+ * The grid point for a vertex at (qx, qy) grid steps (|q| < 32000) and
  * clip w: its own, or that of the nearest earlier vertex within WELD_RADIUS at
  * the same depth (within 1/128).
  */
@@ -392,7 +401,7 @@ static inline void weld_grid_point(float qx, float qy, float w, int* out_x, int*
     if (!sWeldTri || sWeldOff || sWeldFill >= WELD_MAX_FILL || !(w > 0.0f && w < 16000.0f)) {
         return;
     }
-    /* the offset from the grid point, in 1/64 quarter pixel: -32 .. 32 */
+    /* the offset from the grid point, in 1/64 grid step: -32 .. 32 */
     int fx = (int)((qx - (float)gx) * (1 << WELD_OFS_BITS)), fy = (int)((qy - (float)gy) * (1 << WELD_OFS_BITS));
     int wq = (int)(w * 4.0f);
     int bx = gx, by = gy;
@@ -414,7 +423,8 @@ static inline void weld_grid_point(float qx, float qy, float w, int* out_x, int*
             return;
         }
         if (gTracing && r) {
-            rt_log("      weld (%.3f,%.3f w%.1f) to (%.2f,%.2f)", qx * 0.25f, qy * 0.25f, w, bx * 0.25f, by * 0.25f);
+            rt_log("      weld psp (%.3f,%.3f w%.1f) to (%.4f,%.4f)", qx * 0.5f + SNAP_PHASE, qy * 0.5f + SNAP_PHASE, w,
+                   bx * 0.5f + SNAP_PHASE, by * 0.5f + SNAP_PHASE);
         }
     }
     uint32_t i = weld_slot(bx, by);
@@ -432,8 +442,11 @@ static inline void weld_grid_point(float qx, float qy, float w, int* out_x, int*
 /* no_snap.txt turns the snap off, no_weld.txt just the welding. */
 void gfx_update_snap(void) {
     const float (*p)[4] = (const float (*)[4])gRsp.proj;
-    float hw = gRsp.vscale[0] / 4.0f, hh = gRsp.vscale[1] / 4.0f;
-    float tx = gRsp.vtrans[0] / 4.0f, ty = gRsp.vtrans[1] / 4.0f;
+    /* PSP pixel p is grid step (p - SNAP_PHASE) * 2; sSnap counts in quarter steps. */
+    int cx, cy, w, h;
+    gfx_ge_viewport(&cx, &cy, &w, &h);
+    float hw = (float)w * 0.25f, hh = (float)h * 0.25f;
+    float tx = ((float)cx - SNAP_PHASE) * 0.5f, ty = ((float)cy - SNAP_PHASE) * 0.5f;
     if (hw != sSnap.hw || hh != sSnap.hh || tx != sSnap.tx || ty != sSnap.ty || p[0][0] != sSnap.p00 ||
         p[1][0] != sSnap.p10 || p[0][1] != sSnap.p01 || p[1][1] != sSnap.p11 || p[0][3] != sSnap.p03 ||
         p[1][3] != sSnap.p13) {
@@ -557,9 +570,7 @@ static bool sSplitSecond = false; /* bind_texture_impl: only look up the split's
 static const GuTexture* sBatchTex2 = NULL; /* that texture, for the batch's second pass */
 
 const GuTexture* gfx_bind_texture(int tile_index, const CombinerFit* fit) {
-    PROF_BEGIN(PROF_GFX_TEX);
     const GuTexture* tex = bind_texture_impl(tile_index, fit);
-    PROF_END(PROF_GFX_TEX);
     return tex;
 }
 
@@ -1138,7 +1149,6 @@ void gfx_flush_batch(void) {
                sBatchState.omh, gGu.depth_test, gGu.depth_mask, gGu.blend, gGu.alpha_test ? gGu.alpha_ref : -1,
                sFogPass ? 2 : gGu.fog, normal->fog_max);
     }
-    PROF_BEGIN(PROF_GFX_DRAW);
     if (gfx_draw_enabled()) {
         if (normal->nidx > 0) {
             draw_batch(normal);
@@ -1156,7 +1166,6 @@ void gfx_flush_batch(void) {
             gfx_upload_projection(variant);
         }
     }
-    PROF_END(PROF_GFX_DRAW);
     gStats.draw_calls++;
     gStats.triangles += total / 3;
     gStats.ge_verts += normal->nverts + near->nverts + far->nverts;
@@ -1399,7 +1408,7 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
     const RspVertex* v2 = &gRsp.verts[i2 & 0x3F];
 
     gStats.tri_in++;
-    if (!gfx_select_target() || gfx_ablated(2) || gfx_blender_keeps_memory()) {
+    if (!gfx_select_target() || gfx_blender_keeps_memory()) {
         return;
     }
     /* Trivial reject: all vertices outside the same frustum side. */
@@ -1452,9 +1461,6 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
         Batch* b = BATCH;
         if (b->nverts + 3 > BATCH_MAX_VERTS || b->nidx + 3 > BATCH_MAX_INDICES) {
             gfx_flush_batch();
-        }
-        if (gfx_ablated(1)) {
-            return;
         }
         if (gTracing) {
             ClipVertex tri[3];

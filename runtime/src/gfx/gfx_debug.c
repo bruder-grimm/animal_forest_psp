@@ -7,7 +7,6 @@
  *   dump_frames.txt   save the RDRAM of these graphics tasks (dump_task<N>_<task>.bin)
  *   trace_tasks.txt   log every draw of these graphics tasks
  *   skip_draws.txt    leave these draws (1-based, per frame) out
- *   gfx_ablate.txt    leave part of the renderer out, to see what it costs
  *   replay.txt        render a dumped task forever instead of running the game
  */
 #include <pspdisplay.h>
@@ -21,37 +20,17 @@
 #include "gfx_internal.h"
 
 bool gTracing = false;
-int gDrawLimit = -1;
+static int sDrawLimit = -1; /* replay step mode: draws per frame that reach the GE (-1: all) */
 
 static uint32_t sTraceTasks[32];
 static int sNumTraceTasks = -1;
-
-/*
- * gfx_ablate.txt leaves out part of the renderer, so the frame profile says
- * what each part really costs (1 = no triangle output, 2 = no triangles at
- * all, 3 = no vertex stage either, 4 = batches built but not handed to the
- * GE, 5 = no shade colour). The picture is wrong on purpose; only the timings
- * mean anything.
- */
-int gAblate = 0;
-
-void gfx_debug_init(void) {
-    uint32_t v[1];
-    gAblate = rt_load_number_list("gfx_ablate.txt", v, 1) > 0 ? (int)v[0] : 0;
-    if (gAblate > 0) {
-        rt_log("gfx: ablation level %d -- the picture will be wrong", gAblate);
-    }
-}
 
 /* Draw numbers listed in skip_draws.txt never reach the GE. */
 static uint32_t sSkipDraws[32];
 static int sNumSkipDraws = -1;
 
 bool gfx_draw_enabled(void) {
-    if (gAblate == 4) {
-        return false;   /* batches are built but never reach the GE */
-    }
-    if (gDrawLimit >= 0 && (int)gStats.draw_calls >= gDrawLimit) {
+    if (sDrawLimit >= 0 && (int)gStats.draw_calls >= sDrawLimit) {
         return false;
     }
     if (sNumSkipDraws < 0) {
@@ -254,47 +233,9 @@ bool rt_gfx_replay(void) {
     uint32_t fb = gRdp.cimg | 0x80000000u;
     rt_log("replay: task %08X from %s, framebuffer %08X", task, path, fb);
     rt_gfx_present(fb);
-    /*
-     * replay_scroll.txt: lines "<address of a G_SETTILESIZE, hex> <ds> <dt>" --
-     * each frame the tile moves by ds, dt quarter texels, wrapping like the
-     * game's two_tex_scroll. A replayed frame is otherwise identical every time,
-     * which hides what scrolling textures cost live (bakes rebuilt, cache churn).
-     */
-    uint32_t scroll_addr[16];
-    int32_t scroll_ds[16], scroll_dt[16];
-    int nscroll = 0;
-    fd = sceIoOpen(rt_data_path("replay_scroll.txt", path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd >= 0) {
-        char lines[512];
-        int n = sceIoRead(fd, lines, sizeof(lines) - 1);
-        sceIoClose(fd);
-        lines[n > 0 ? n : 0] = 0;
-        char* q = lines;
-        while (nscroll < 16) {
-            unsigned a;
-            int ds, dt, used = 0;
-            if (sscanf(q, "%x %d %d%n", &a, &ds, &dt, &used) != 3) {
-                break;
-            }
-            scroll_addr[nscroll] = a;
-            scroll_ds[nscroll] = ds;
-            scroll_dt[nscroll] = dt;
-            nscroll++;
-            q += used;
-        }
-        rt_log("replay: scrolling %d tiles", nscroll);
-    }
     for (;;) {
         if (step) {
-            gDrawLimit = (int)gStats.frames;
-        }
-        for (int i = 0; i < nscroll; i++) {
-            uint32_t w0 = rd_w32(scroll_addr[i]), w1 = rd_w32(scroll_addr[i] + 4);
-            uint32_t uls = (((w0 >> 12) & 0xFFF) + (uint32_t)scroll_ds[i]) % 2048;
-            uint32_t ult = ((w0 & 0xFFF) + (uint32_t)scroll_dt[i]) % 2048;
-            uint32_t w = ((w1 >> 12) & 0xFFF) - ((w0 >> 12) & 0xFFF), h = (w1 & 0xFFF) - (w0 & 0xFFF);
-            wr_w32(scroll_addr[i], (w0 & 0xFF000000u) | uls << 12 | ult);
-            wr_w32(scroll_addr[i] + 4, (w1 & 0xFF000000u) | ((uls + w) & 0xFFF) << 12 | ((ult + h) & 0xFFF));
+            sDrawLimit = (int)gStats.frames;
         }
         gfx_run_task(task);
         rt_gfx_present(fb);

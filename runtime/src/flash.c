@@ -177,29 +177,3 @@ void osFlashReadArray_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
 
-void __osFlashGetAddr(uint8_t* rdram, recomp_context* ctx) {
-    ctx->r2 = ctx->r4 * FLASH_PAGE_BYTES;
-}
-
-/*
- * flash_test.txt next to the EBOOT: once the game has started its threads, run
- * its own sFRm_Init and sFRm_WriteSync three times, as a save does. Every write
- * re-creates the flash thread on the same OSThread after osDestroyThread on the
- * finished one (see osCreateThread in sched.c). Pages 768-1023 are written with
- * whatever RDRAM holds; don't keep the flash.bin from such a run.
- */
-void rt_debug_flash_test(recomp_context* ctx) {
-    static const uint32_t pages[] = { 768, 896, 768 };
-    recomp_context saved = *ctx;
-    rt_log("flash test: initialising");
-    get_function((int32_t)0x800CDB10)(g_rdram, ctx); /* sFRm_Init */
-    for (unsigned i = 0; i < RT_COUNT(pages); i++) {
-        ctx->r4 = 0x80100000;
-        ctx->r5 = pages[i];
-        ctx->r6 = 128;
-        get_function((int32_t)0x800CE0E8)(g_rdram, ctx); /* sFRm_WriteSync */
-        rt_log("flash test: write %u (page %u) done", i + 1, pages[i]);
-    }
-    *ctx = saved;
-    rt_log("flash test: passed");
-}

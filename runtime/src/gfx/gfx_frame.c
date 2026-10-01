@@ -16,7 +16,6 @@
 #include <string.h>
 
 #include "gfx_internal.h"
-#include "prof.h"
 
 static unsigned int sGuList[256 * 1024] __attribute__((aligned(16)));
 static bool sGuReady = false;
@@ -195,13 +194,22 @@ bool gfx_compute_fog_range(float* near_out, float* far_out) {
     return true;
 }
 
-void gfx_set_viewport(void) {
-    gfx_update_snap();
+/* The N64 viewport on the GE's target, in whole pixels: a vertex lands at
+ * (*cx + ndc x * *w / 2, *cy - ndc y * *h / 2). */
+void gfx_ge_viewport(int* cx, int* cy, int* w, int* h) {
     float hw = gRsp.vscale[0] / 4.0f * gMap.scale_x;
     float hh = gRsp.vscale[1] / 4.0f * gMap.scale_y;
-    float cx = (gRsp.vtrans[0] / 4.0f - gMap.crop_x) * gMap.scale_x;
-    float cy = (gRsp.vtrans[1] / 4.0f - gMap.crop_y) * gMap.scale_y;
-    sceGuViewport(GU_OFFSET_X + (int)(cx + 0.5f), GU_OFFSET_Y + (int)(cy + 0.5f), (int)(hw * 2 + 0.5f), (int)(hh * 2 + 0.5f));
+    *cx = (int)((gRsp.vtrans[0] / 4.0f - gMap.crop_x) * gMap.scale_x + 0.5f);
+    *cy = (int)((gRsp.vtrans[1] / 4.0f - gMap.crop_y) * gMap.scale_y + 0.5f);
+    *w = (int)(hw * 2 + 0.5f);
+    *h = (int)(hh * 2 + 0.5f);
+}
+
+void gfx_set_viewport(void) {
+    int cx, cy, w, h;
+    gfx_update_snap();
+    gfx_ge_viewport(&cx, &cy, &w, &h);
+    sceGuViewport(GU_OFFSET_X + cx, GU_OFFSET_Y + cy, w, h);
 }
 
 void gfx_set_scissor(void) {
@@ -296,11 +304,7 @@ void rt_gfx_init(void) {
     if (sGuReady) {
         return;
     }
-#ifdef RT_GFXPROF
-    gfx_prof_init();
-#endif
     sGuReady = true;
-    gfx_debug_init();
     gfx_vertex_init();
     gfx_tmem_reset();
     gfx_tex_init();
@@ -941,36 +945,7 @@ static void soften_frame(void) {
     if (sSoften == 0) {
         return;
     }
-    /*
-     * soften_bench.txt: time the pass on the GE alone -- the list so far is
-     * finished and waited for, the pass runs in a list of its own, and the
-     * frame goes on in a new one. Costs the overlap of GE and CPU, so only
-     * for measuring.
-     */
-    bool bench = RT_SWITCH("soften_bench.txt");
-    static uint32_t bench_us = 0, bench_max = 0, bench_n = 0;
-    uint32_t t0 = 0;
-    if (bench) {
-        sceGuFinish();
-        sceGuSync(0, 0);
-        sceGuStart(GU_DIRECT, sGuList);
-        t0 = sceKernelGetSystemTimeLow();
-    }
     soften_passes();
-    if (bench) {
-        sceGuFinish();
-        sceGuSync(0, 0);
-        uint32_t dt = sceKernelGetSystemTimeLow() - t0;
-        sceGuStart(GU_DIRECT, sGuList);
-        sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
-        bench_us += dt;
-        bench_max = dt > bench_max ? dt : bench_max;
-        if (++bench_n == 120) {
-            rt_log("soften bench: %u us per frame on the GE (max %u)", (unsigned)(bench_us / bench_n),
-                   (unsigned)bench_max);
-            bench_us = bench_max = bench_n = 0;
-        }
-    }
 }
 
 /* ---- presenting --------------------------------------------------------- */
@@ -987,8 +962,6 @@ static void log_stats(void) {
     uint64_t now = sceKernelGetSystemTimeWide();
     uint64_t span = now - sStatStart;
     uint64_t idle = g_idle_us - sStatIdleStart;
-    char prof[160];
-    rt_prof_report(prof, sizeof(prof), (uint32_t)span, 120);
     char threads[160];
     rt_sched_report(threads, sizeof(threads), (uint32_t)span);
     rt_log("idle %u%% of the CPU", (unsigned)rt_idle_percent((uint32_t)span));
@@ -1010,13 +983,13 @@ static void log_stats(void) {
            (unsigned)gfx_tex_take_deferred(),
            (unsigned)(gStats.submit_wait_n ? gStats.submit_wait_sum / gStats.submit_wait_n : 0),
            (unsigned)gStats.submit_wait_max);
-    rt_log("frame %u (poll %u): %u gfx tasks, %u yields, %u verts, %u draws, %u tris (in %u, trivial %u, culled %u, clipped %u, %u GE verts) | busy %u%% = %u us a frame (gfx %u%%, blocked %u%%, audio %u%%) |%s |%s",
+    rt_log("frame %u (poll %u): %u gfx tasks, %u yields, %u verts, %u draws, %u tris (in %u, trivial %u, culled %u, clipped %u, %u GE verts) | busy %u%% = %u us a frame (gfx %u%%, blocked %u%%, audio %u%%) |%s",
            gStats.frames, (unsigned)rt_input_polls(), gStats.tasks, (unsigned)gStats.yields, gStats.vertices,
            gStats.draw_calls, gStats.triangles, gStats.tri_in, gStats.tri_trivial, gStats.tri_culled,
            gStats.tri_clipped, gStats.ge_verts, span ? (unsigned)(100 - idle * 100 / span) : 0,
            (unsigned)((span - idle) / 120), span ? (unsigned)(gStats.render_us * 100 / span) : 0,
            span ? (unsigned)((uint64_t)gStats.blocked_us * 100 / span) : 0,
-           span ? (unsigned)(g_audio_us * 100 / span) : 0, prof, threads);
+           span ? (unsigned)(g_audio_us * 100 / span) : 0, threads);
     gStats.render_us = gStats.render_cpu_us = 0;
     gStats.blocked_us = 0;
     gStats.submit_wait_max = gStats.submit_wait_sum = gStats.submit_wait_n = 0;
@@ -1047,9 +1020,7 @@ void gfx_present_frame(uint32_t framebuffer) {
                            0, 0, BUF_WIDTH, shot);
         }
         sceGuFinish();
-        PROF_BEGIN(PROF_GFX_SYNC);
         rt_sched_native_wait(ge_sync, NULL);
-        PROF_END(PROF_GFX_SYNC);
         gFrameOpen = false;
         /* The GE is done with this frame: buffers it might have read are free. */
         gfx_tex_flush_retired();

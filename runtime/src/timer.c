@@ -44,7 +44,8 @@ static uint64_t now_us(void) {
     return sceKernelGetSystemTimeWide();
 }
 
-uint64_t rt_os_time(void) {
+/* N64 counter ticks since boot */
+static uint64_t os_time(void) {
     uint64_t elapsed = now_us() - sStartUs;
     return (elapsed * (COUNTS_PER_SECOND / 1000)) / 1000;
 }
@@ -215,11 +216,11 @@ void csleep(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void osGetTime_recomp(uint8_t* rdram, recomp_context* ctx) {
-    uint64_t t = rt_os_time();
+    uint64_t t = os_time();
     ctx->r2 = (gpr)(t >> 32);
     ctx->r3 = (gpr)t;
 }
 
 void osGetCount_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ctx->r2 = (gpr)rt_os_time();
+    ctx->r2 = (gpr)os_time();
 }

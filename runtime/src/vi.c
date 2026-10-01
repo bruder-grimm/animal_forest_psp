@@ -55,10 +55,6 @@ void osViSetEvent_recomp(uint8_t* rdram, recomp_context* ctx) {
     sViRetraceCount = ctx->r6;
     sViStarted = true;
     rt_log("osViSetEvent mq=%08X msg=%08X retrace=%u", sViMq, sViMsg, sViRetraceCount);
-    /* The game's threads are all up by now. */
-    if (RT_SWITCH("flash_test.txt")) {
-        rt_debug_flash_test(ctx);
-    }
 }
 
 void osViSwapBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -76,11 +72,8 @@ void osViGetNextFramebuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 /* The PSP's display is set up by the renderer; the N64's video modes don't apply. */
-RT_STUB(__osViInit_recomp)
 RT_STUB(osViSetMode_recomp)
 RT_STUB(osViBlack_recomp)
 RT_STUB(osViSetSpecialFeatures_recomp)
 RT_STUB(osViSetXScale_recomp)
 RT_STUB(osViSetYScale_recomp)
-RT_STUB_RETURN(__osViGetCurrentContext_recomp, 0)
-RT_STUB(__osViSwapContext_recomp)

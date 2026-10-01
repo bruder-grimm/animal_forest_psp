@@ -20,7 +20,6 @@
 #include <string.h>
 
 #include "gfx_internal.h"
-#include "prof.h"
 
 /* ---- evaluating the combiner -------------------------------------------- */
 
@@ -209,7 +208,7 @@ int gBakeRgbTile;
  * caller has already established that the alpha combine ignores the shade,
  * so the shade values here cannot affect the result.
  */
-uint32_t gfx_bake_texel(uint32_t t0, uint32_t t1) {
+static uint32_t bake_texel(uint32_t t0, uint32_t t1) {
     CombInputs in;
     in.bound = 0;
     for (int ch = 0; ch < 4; ch++) {
@@ -255,7 +254,7 @@ void gfx_bake_alpha_prepare(void) {
 }
 
 uint8_t gfx_bake_alpha_fill(uint32_t k) {
-    gBakeAlpha[k] = (uint8_t)(gfx_bake_texel((k >> 8) << 24, (k & 0xFF) << 24) >> 24);
+    gBakeAlpha[k] = (uint8_t)(bake_texel((k >> 8) << 24, (k & 0xFF) << 24) >> 24);
     gBakeAlphaValid[k >> 5] |= 1u << (k & 31);
     return gBakeAlpha[k];
 }
@@ -841,9 +840,7 @@ int gfx_pin_signature(void) {
 static void classify_combiner_impl(CombinerFit* fit);
 
 void gfx_classify_combiner(CombinerFit* fit) {
-    PROF_BEGIN(PROF_GFX_CLASSIFY);
     classify_combiner_impl(fit);
-    PROF_END(PROF_GFX_CLASSIFY);
 }
 
 static void fit_from_probes(CombinerFit* fit);

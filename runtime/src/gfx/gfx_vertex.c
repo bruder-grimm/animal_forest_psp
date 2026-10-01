@@ -3,9 +3,7 @@
  *
  * G_VTX transforms vertices by the modelview and the modelview-projection
  * matrices, works out their clip flags, lights them and computes texture
- * coordinates and fog, as the RSP does. The heavy lifting is VFPU code; each
- * piece of it has a plain C reference next to it, which the self-test
- * (bench_vtx.txt, at the end of this file) compares it against.
+ * coordinates and fog, as the RSP does. The heavy lifting is VFPU code.
  */
 #include <pspkernel.h>
 #include <math.h>
@@ -20,23 +18,11 @@ void mat_identity(Mat4 m) {
     m[0][0] = m[1][1] = m[2][2] = m[3][3] = 1.0f;
 }
 
-/* out = a * b (row-vector convention: v * a * b). The reference the VFPU
- * version below is checked against. */
-static void mat_mul_ref(Mat4 out, const Mat4 a, const Mat4 b) {
-    Mat4 r;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j];
-        }
-    }
-    memcpy(out, r, sizeof(Mat4));
-}
-
 /*
- * The same on the VFPU. vtfm4 gives result[i] = sum(r) M[r][i] * v[r] when the
- * matrix' memory rows were loaded into the VFPU's rows (which is what the
- * selftest's 13951 pins down), so feeding it b that way and then a's rows one
- * at a time produces out's rows. Every load happens before every store, so out
+ * out = a * b (row-vector convention: v * a * b), on the VFPU. vtfm4 gives
+ * result[i] = sum(r) M[r][i] * v[r] when the matrix' memory rows were loaded
+ * into the VFPU's rows, so feeding it b that way and then a's rows one at a
+ * time produces out's rows. Every load happens before every store, so out
  * may be a or b -- G_MTX multiplies a matrix into itself.
  *
  * The game dirties the modelview on nearly every vertex load, so this runs
@@ -101,23 +87,16 @@ void normalize3(float* v) {
     }
 }
 
-/* Transform a world-space direction into model space (transpose of the
- * modelview's 3x3). The reference the VFPU version is checked against. */
-static void dir_to_model_ref(const Mat4 mv, const float* in, float* out) {
-    out[0] = mv[0][0] * in[0] + mv[0][1] * in[1] + mv[0][2] * in[2];
-    out[1] = mv[1][0] * in[0] + mv[1][1] * in[1] + mv[1][2] * in[2];
-    out[2] = mv[2][0] * in[0] + mv[2][1] * in[1] + mv[2][2] * in[2];
-    normalize3(out);
-}
-
 /* Smallest squared length that still gets normalised; below it the direction
  * keeps whatever the transform gave it, as dividing by its length would. */
 static const float kMinLenSq __attribute__((aligned(16))) = 1.0e-12f;
 
 /*
- * The same on the VFPU. vtfm3 dots the matrix' memory rows against the vector
- * (see mat_mul), so loading the modelview's rows down the VFPU's columns --
- * which transposes it -- gives the model-space direction in one instruction.
+ * Transforms a world-space direction into model space (the transpose of the
+ * modelview's 3x3) and normalises it. vtfm3 dots the matrix' memory rows
+ * against the vector (see mat_mul), so loading the modelview's rows down the
+ * VFPU's columns -- which transposes it -- gives the model-space direction in
+ * one instruction.
  * The direction itself is three floats in the middle of a Light, so it is
  * loaded and stored a word at a time; only the matrix is quad-aligned.
  */
@@ -156,30 +135,12 @@ static void update_light_dirs(void) {
     gRsp.lights_dirty = false;
 }
 
-/* The vertex stage computes these on the VFPU; this is the reference the
- * benchmark checks it against, and documents what the flags mean. */
-static void compute_clip_flags(RspVertex* v) {
-    uint16_t f = 0;
-    if (v->cw < W_EPSILON) f |= CLIP_NEAR;
-    if (v->cx > GUARD_BAND * v->cw) f |= 0x02;
-    if (v->cx < -GUARD_BAND * v->cw) f |= 0x04;
-    if (v->cy > GUARD_BAND * v->cw) f |= 0x08;
-    if (v->cy < -GUARD_BAND * v->cw) f |= 0x10;
-    if (v->cx > v->cw) f |= CLIP_X_POS;
-    if (v->cx < -v->cw) f |= CLIP_X_NEG;
-    if (v->cy > v->cw) f |= CLIP_Y_POS;
-    if (v->cy < -v->cw) f |= CLIP_Y_NEG;
-    if (v->cz < -DEPTH_PIN * v->cw) f |= CLIP_Z_NEAR;
-    if (v->cz > DEPTH_PIN * v->cw) f |= CLIP_Z_FAR;
-    v->clip = f;
-}
-
 /*
  * Transforms a vertex and works out its clipping flags while the clip
- * coordinates are still in registers. The flags are eleven comparisons of the
- * form "value > cw" (see compute_clip_flags, which is the same thing in C and
- * what the benchmark checks this against): three vectors of comparisons give
- * 1.0 or 0.0 per lane, and a dot product with the flag values adds them up.
+ * coordinates are still in registers. The flags (CLIP_* in gfx_internal.h)
+ * are eleven comparisons of the form "value > cw": three vectors of
+ * comparisons give 1.0 or 0.0 per lane, and a dot product with the flag
+ * values adds them up.
  *
  * The position words hold x,y,z as big-endian shorts, so a pair expands to
  * (y, x, flag, z); [y,x,w,w] puts x,y,z back in order for the homogeneous
@@ -310,8 +271,6 @@ static inline void finish_vertex(RspVertex* v, const uint32_t* w, bool lighting,
  * vtfm4 sums the colours, then ambient is added and the result clamped to 1.
  * Same maths as finish_vertex's C loop, summed in a different order.
  */
-static bool sVfpuLighting = true; /* false: finish_vertex's C loop (the self-test's reference) */
-
 static void light_vertices_vfpu(RspVertex* verts, const uint32_t* src, int count) {
     static float dirs[4][4] __attribute__((aligned(16)));
     static float cols[4][4] __attribute__((aligned(16)));
@@ -370,9 +329,6 @@ void gfx_process_vertices(uint32_t addr, int start, int count) {
         RT_LOG_ONCE("G_VTX out of range: start %d count %d", start, count);
         return;
     }
-    if (gfx_ablated(3)) {
-        return;
-    }
     update_mvp();
     const float (*mv)[4] = (const float (*)[4])gRsp.mv_stack[gRsp.mv_depth];
     const float (*mvp)[4] = (const float (*)[4])gRsp.mvp;
@@ -420,7 +376,7 @@ void gfx_process_vertices(uint32_t addr, int start, int count) {
         :
         : "r"(mvp), "r"(mv), "r"(kClipConstants));
 
-    bool light_later = lighting && !texgen && gRsp.num_lights <= 4 && sVfpuLighting;
+    bool light_later = lighting && !texgen && gRsp.num_lights <= 4;
     const uint32_t* first = src;
     gfx_forget_packed(start, count); /* these slots hold different vertices now */
     for (int i = 0; i < count; i++, src += 4) {
@@ -431,300 +387,4 @@ void gfx_process_vertices(uint32_t addr, int start, int count) {
     if (light_later) {
         light_vertices_vfpu(&gRsp.verts[start], first, count);
     }
-}
-
-/* ---- benchmark and self-test (bench_vtx.txt) ---------------------------- */
-
-/*
- * Times the vertex stage on whatever machine this is, so optimisations are
- * measured rather than guessed. Runs at startup when bench_vtx.txt is next to
- * the EBOOT (the file's first number is the number of vertices per round, the
- * second the rounds). Results go to the log as ns per vertex.
- */
-static void bench_setup(uint32_t addr, int count) {
-    uint32_t* p = (uint32_t*)(void*)(g_rdram + (addr & RDRAM_MASK & ~3u));
-    uint32_t seed = 12345;
-    for (int i = 0; i < count; i++) {
-        /* Model coordinates, texture coordinates, normal/colour, like the game's. */
-        seed = seed * 1103515245u + 12345u;
-        int16_t x = (int16_t)((seed >> 16) % 2000 - 1000);
-        seed = seed * 1103515245u + 12345u;
-        int16_t y = (int16_t)((seed >> 16) % 2000 - 1000);
-        seed = seed * 1103515245u + 12345u;
-        int16_t z = (int16_t)((seed >> 16) % 2000 - 1000);
-        seed = seed * 1103515245u + 12345u;
-        p[i * 4 + 0] = (uint32_t)((uint16_t)x << 16 | (uint16_t)y);
-        p[i * 4 + 1] = (uint32_t)((uint16_t)z << 16);
-        p[i * 4 + 2] = seed & 0x0FFF0FFF;
-        p[i * 4 + 3] = seed ^ 0x40302010;
-    }
-}
-
-static void bench_state(bool lighting, bool fog) {
-    memset(&gRsp, 0, sizeof(gRsp));
-    /* A perspective projection over a modelview with a translation and a spin. */
-    static const Mat4 proj = { { 1.6f, 0, 0, 0 }, { 0, 1.2f, 0, 0 }, { 0, 0, -1.002f, -1.0f }, { 0, 0, -20.02f, 0 } };
-    static const Mat4 mv = { { 0.87f, 0.1f, -0.48f, 0 }, { 0, 0.98f, 0.2f, 0 }, { 0.48f, -0.17f, 0.86f, 0 },
-                             { 12.0f, -30.0f, -180.0f, 1.0f } };
-    memcpy(gRsp.proj, proj, sizeof(Mat4));
-    memcpy(gRsp.mv_stack[0], mv, sizeof(Mat4));
-    gRsp.mv_depth = 0;
-    gRsp.mvp_dirty = true;
-    gRsp.tex_scale_s = gRsp.tex_scale_t = 0x8000;
-    gRsp.vscale[0] = 160; gRsp.vscale[1] = 120; gRsp.vscale[2] = 511;
-    gRsp.vtrans[0] = 160; gRsp.vtrans[1] = 120; gRsp.vtrans[2] = 511;
-    gRsp.fog_mul = 200; gRsp.fog_ofs = -100;
-    gRsp.geometry_mode = (lighting ? G_LIGHTING : 0) | (fog ? G_FOG : 0);
-    gRsp.num_lights = 2;
-    gRsp.lights_dirty = true;
-    for (int i = 0; i < 3; i++) {
-        gRsp.lights[0].col[i] = 0.7f;
-        gRsp.lights[1].col[i] = 0.3f;
-        gRsp.lights[2].col[i] = 0.2f;   /* ambient (index num_lights) */
-        gRsp.lights[0].dir[i] = i == 1 ? 0.9f : 0.3f;
-        gRsp.lights[1].dir[i] = i == 2 ? 0.8f : -0.4f;
-        gRsp.lookat[0][i] = i == 0 ? 1.0f : 0.0f;
-        gRsp.lookat[1][i] = i == 1 ? 1.0f : 0.0f;
-    }
-}
-
-/* Isolates the VFPU int/float conversion so its semantics can be seen. */
-static void bench_vfpu_selftest(void) {
-    static uint32_t in[2] __attribute__((aligned(16))) = { 0x00020003u, 0x00040005u }; /* shorts 2,3 and 4,5 */
-    static uint32_t raw[4] __attribute__((aligned(16)));
-    static float conv[4] __attribute__((aligned(16)));
-    static float shuf[4] __attribute__((aligned(16)));
-    __asm__ volatile(
-        "lv.s S200, 0(%0)\n"
-        "lv.s S201, 4(%0)\n"
-        "vs2i.p C300, C200\n"
-        "sv.q C300, 0(%1)\n"
-        "vi2f.q C400, C300, 16\n"
-        "sv.q C400, 0(%2)\n"
-        "vmov.q C500, C400[y,x,w,w]\n"
-        "sv.q C500, 0(%3)\n"
-        :
-        : "r"(in), "r"(raw), "r"(conv), "r"(shuf)
-        : "memory");
-    static float mat[16] __attribute__((aligned(16))) = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-    static float vec[4] __attribute__((aligned(16))) = { 1, 10, 100, 1000 };
-    static float res[4] __attribute__((aligned(16)));
-    __asm__ volatile(
-        "lv.q R000,  0(%0)\n"
-        "lv.q R001, 16(%0)\n"
-        "lv.q R002, 32(%0)\n"
-        "lv.q R003, 48(%0)\n"
-        "lv.q C400, 0(%1)\n"
-        "vtfm4.q C500, M000, C400\n"
-        "sv.q C500, 0(%2)\n"
-        :
-        : "r"(mat), "r"(vec), "r"(res)
-        : "memory");
-    rt_log("vfpu selftest: tfm %d %d %d %d (13951,... = memory rows are inputs; 4321,... = transposed)",
-           (int)res[0], (int)res[1], (int)res[2], (int)res[3]);
-    uint32_t cb[4], sb[4];
-    memcpy(cb, conv, sizeof(cb));
-    memcpy(sb, shuf, sizeof(sb));
-    rt_log("vfpu selftest: ints %08X %08X %08X %08X", (unsigned)raw[0], (unsigned)raw[1], (unsigned)raw[2], (unsigned)raw[3]);
-    rt_log("vfpu selftest: conv %08X %08X %08X %08X", (unsigned)cb[0], (unsigned)cb[1], (unsigned)cb[2], (unsigned)cb[3]);
-    rt_log("vfpu selftest: shuf %08X %08X %08X %08X", (unsigned)sb[0], (unsigned)sb[1], (unsigned)sb[2], (unsigned)sb[3]);
-
-    /* The matrix multiply and the light directions, against the same maths in C. */
-    Mat4 ma, mb, got, want;
-    uint32_t seed = 12345;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            seed = seed * 1103515245u + 12345u;
-            ma[i][j] = (float)(int32_t)(seed >> 8) / 8.0e6f;
-            seed = seed * 1103515245u + 12345u;
-            mb[i][j] = (float)(int32_t)(seed >> 8) / 8.0e6f;
-        }
-    }
-    mat_mul_ref(want, ma, mb);
-    mat_mul(got, ma, mb);
-    int worst = 0;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            int32_t g, w;
-            memcpy(&g, &got[i][j], 4);
-            memcpy(&w, &want[i][j], 4);
-            int ulp = g > w ? g - w : w - g;
-            if (ulp > worst) worst = ulp;
-        }
-    }
-    rt_log("vfpu selftest: mat_mul worst %d ulp", worst);
-
-    /* out == a and out == b as well: G_MTX multiplies a matrix into itself. */
-    Mat4 alias;
-    memcpy(alias, ma, sizeof(Mat4));
-    mat_mul_ref(want, ma, mb);
-    mat_mul(alias, alias, mb);
-    worst = 0;
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            int32_t g, w;
-            memcpy(&g, &alias[i][j], 4);
-            memcpy(&w, &want[i][j], 4);
-            int ulp = g > w ? g - w : w - g;
-            if (ulp > worst) worst = ulp;
-        }
-    }
-    rt_log("vfpu selftest: mat_mul into itself worst %d ulp", worst);
-
-    worst = 0;
-    float biggest = 0;
-    bool zero_ok = true;
-    for (int t = 0; t < 8; t++) {
-        float in[3], vg[3], vw[3];
-        for (int k = 0; k < 3; k++) {
-            seed = seed * 1103515245u + 12345u;
-            in[k] = t == 7 ? 0.0f : (float)(int32_t)(seed >> 8) / 8.0e6f;
-        }
-        dir_to_model_ref((const float (*)[4])ma, in, vw);
-        dir_to_model((const float (*)[4])ma, in, vg);
-        for (int k = 0; k < 3; k++) {
-            int32_t g, w;
-            memcpy(&g, &vg[k], 4);
-            memcpy(&w, &vw[k], 4);
-            int ulp = g > w ? g - w : w - g;
-            if (ulp > worst) worst = ulp;
-            float d = vg[k] - vw[k];
-            if (d < 0) d = -d;
-            if (d > biggest) biggest = d;
-            if (t == 7 && vg[k] != 0.0f) zero_ok = false; /* also false for a NaN */
-        }
-    }
-    rt_log("vfpu selftest: dir_to_model worst %d ulp (%.9f), zero direction -> %s", worst, biggest,
-           zero_ok ? "zero" : "NOT ZERO");
-}
-
-/* Checks the VFPU vertex code against the same maths in plain C (in ULPs,
- * without float arithmetic: subtracting near-equal values traps on denormals). */
-static void bench_verify(uint32_t addr, int count) {
-    bench_state(false, false);
-    gfx_process_vertices(addr, 0, count);
-    const float (*mv)[4] = (const float (*)[4])gRsp.mv_stack[gRsp.mv_depth];
-    const float (*mvp)[4] = (const float (*)[4])gRsp.mvp;
-    const uint32_t* src = (const uint32_t*)(void*)(g_rdram + (addr & RDRAM_MASK & ~3u));
-    int worst = 0;
-    for (int i = 0; i < count; i++, src += 4) {
-        float x = (int16_t)(src[0] >> 16), y = (int16_t)src[0], z = (int16_t)(src[1] >> 16);
-        float want[7] = {
-            x * mvp[0][0] + y * mvp[1][0] + z * mvp[2][0] + mvp[3][0],
-            x * mvp[0][1] + y * mvp[1][1] + z * mvp[2][1] + mvp[3][1],
-            x * mvp[0][2] + y * mvp[1][2] + z * mvp[2][2] + mvp[3][2],
-            x * mvp[0][3] + y * mvp[1][3] + z * mvp[2][3] + mvp[3][3],
-            x * mv[0][0] + y * mv[1][0] + z * mv[2][0] + mv[3][0],
-            x * mv[0][1] + y * mv[1][1] + z * mv[2][1] + mv[3][1],
-            x * mv[0][2] + y * mv[1][2] + z * mv[2][2] + mv[3][2],
-        };
-        const RspVertex* v = &gRsp.verts[i];
-        const float got[7] = { v->cx, v->cy, v->cz, v->cw, v->wx, v->wy, v->wz };
-        for (int k = 0; k < 7; k++) {
-            int32_t a, b;
-            memcpy(&a, &want[k], 4);
-            memcpy(&b, &got[k], 4);
-            int d = a > b ? a - b : b - a;
-            if ((a ^ b) < 0) {
-                d = 1 << 30; /* different signs: not a near miss */
-            }
-            if (d > worst) {
-                worst = d;
-            }
-        }
-    }
-    int clip_bad = 0;
-    for (int i = 0; i < count; i++) {
-        RspVertex copy = gRsp.verts[i];
-        uint16_t got = copy.clip;
-        compute_clip_flags(&copy);
-        if (copy.clip != got) {
-            if (clip_bad == 0) {
-                rt_log("bench vtx verify: clip flags differ at %d: %03X vs %03X (cx %d cy %d cz %d cw %d)", i,
-                       (unsigned)got, (unsigned)copy.clip, (int)copy.cx, (int)copy.cy, (int)copy.cz, (int)copy.cw);
-            }
-            clip_bad++;
-        }
-    }
-    rt_log("bench vtx verify: worst %d ulp, %d/%d clip flags differ", worst, clip_bad, count);
-
-    /* Lighting: the VFPU pass against finish_vertex's C loop, same vertices
-     * (the bench's normals are random bytes, so some point away from both
-     * lights and exercise the clamp at zero). */
-    static float ref[MAX_VERTICES][3];
-    int n = count > MAX_VERTICES ? MAX_VERTICES : count;
-    bench_state(true, false);
-    sVfpuLighting = false;
-    gfx_process_vertices(addr, 0, n);
-    for (int i = 0; i < n; i++) {
-        ref[i][0] = gRsp.verts[i].r;
-        ref[i][1] = gRsp.verts[i].g;
-        ref[i][2] = gRsp.verts[i].b;
-    }
-    bench_state(true, false);
-    sVfpuLighting = true;
-    gfx_process_vertices(addr, 0, n);
-    int lworst = 0;
-    int lbad = 0;
-    for (int i = 0; i < n; i++) {
-        const float got[3] = { gRsp.verts[i].r, gRsp.verts[i].g, gRsp.verts[i].b };
-        for (int k = 0; k < 3; k++) {
-            int32_t a, b;
-            memcpy(&a, &ref[i][k], 4);
-            memcpy(&b, &got[k], 4);
-            int d = a > b ? a - b : b - a;
-            if ((a ^ b) < 0 && ref[i][k] != got[k]) {
-                d = 1 << 30;
-            }
-            if (d > lworst) {
-                lworst = d;
-            }
-            /* what actually reaches the screen: the 8-bit colour */
-            if ((int)(ref[i][k] * 255.0f + 0.5f) != (int)(got[k] * 255.0f + 0.5f)) {
-                lbad++;
-            }
-        }
-    }
-    rt_log("bench vtx verify: lighting worst %d ulp, %d/%d channels differ in 8 bits", lworst, lbad, n * 3);
-}
-
-static void bench_run(const char* name, bool lighting, bool fog, uint32_t addr, int count, int rounds) {
-    bench_state(lighting, fog);
-    gfx_process_vertices(addr, 0, count); /* warm the caches */
-    uint64_t t0 = sceKernelGetSystemTimeWide();
-    for (int i = 0; i < rounds; i++) {
-        gRsp.mvp_dirty = true;
-        gRsp.lights_dirty = true;
-        gfx_process_vertices(addr, 0, count);
-    }
-    uint64_t us = sceKernelGetSystemTimeWide() - t0;
-    uint32_t verts = (uint32_t)count * (uint32_t)rounds;
-    rt_log("bench vtx %-10s %5u ns/vertex (%u verts in %u us)", name, (unsigned)(us * 1000 / verts), (unsigned)verts,
-           (unsigned)us);
-}
-
-void rt_gfx_bench(void) {
-    uint32_t v[2];
-    int n = rt_load_number_list("bench_vtx.txt", v, 2);
-    if (n < 1) {
-        return;
-    }
-    int count = (int)v[0];
-    int rounds = n > 1 ? (int)v[1] : 2000;
-    if (count < 1 || count > MAX_VERTICES) {
-        count = 32;
-    }
-    uint32_t addr = 0x80300000u;
-    bench_setup(addr, count);
-    rt_log("bench vtx: %d vertices x %d rounds", count, rounds);
-    bench_vfpu_selftest();
-    bench_verify(addr, count);
-    bench_run("plain", false, false, addr, count, rounds);
-    bench_run("fog", false, true, addr, count, rounds);
-    bench_run("light", true, false, addr, count, rounds);
-    sVfpuLighting = false;
-    bench_run("light (C)", true, false, addr, count, rounds);
-    sVfpuLighting = true;
-    bench_run("light+fog", true, true, addr, count, rounds);
-    memset(&gRsp, 0, sizeof(gRsp));
 }

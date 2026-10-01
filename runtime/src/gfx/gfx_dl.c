@@ -12,7 +12,6 @@
 #include <string.h>
 
 #include "gfx_internal.h"
-#include "prof.h"
 
 /* The S2DEX2 microcode's text in RDRAM: G_LOAD_UCODE with this switches to it. */
 #define UCODE_S2DEX2_TEXT 0x800FF370u
@@ -213,7 +212,6 @@ static void handle_movemem(uint32_t w0, uint32_t w1) {
 }
 
 static void handle_matrix(uint32_t w0, uint32_t w1) {
-    PROF_BEGIN(PROF_GFX_MTX);
     uint32_t params = (w0 & 0xFF) ^ 0x01; /* F3DEX2 stores G_MTX_PUSH inverted */
     Mat4 m __attribute__((aligned(16)));
     read_matrix(seg_addr(w1), m);
@@ -241,7 +239,6 @@ static void handle_matrix(uint32_t w0, uint32_t w1) {
         gRsp.lights_dirty = true;
     }
     gRsp.mvp_dirty = true;
-    PROF_END(PROF_GFX_MTX);
 }
 
 static void set_other_mode(bool high, uint32_t w0, uint32_t w1) {
@@ -406,14 +403,8 @@ static void run_dl(uint32_t dl) {
             case G_VTX: {
                 int n = (w0 >> 12) & 0xFF;
                 int end = (w0 & 0xFF) >> 1;
-                PROF_BEGIN(PROF_GFX_VTX);
                 gfx_process_vertices(seg_addr(w1), end - n, n);
-                PROF_END(PROF_GFX_VTX);
                 gStats.vertices += n;
-                {
-                    PROF_BEGIN(PROF_EMPTY);
-                    PROF_END(PROF_EMPTY);
-                }
                 break;
             }
             case G_MODIFYVTX: {

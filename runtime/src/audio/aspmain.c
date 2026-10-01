@@ -45,16 +45,6 @@ static uint32_t sDebugCmd;
 #define DM_FILTER_TAPS 0xFD0 /* 0xFD0..0xFFF: FILTER coefficient window */
 
 
-#ifdef ASP_PROFILE
-#include <time.h>
-uint64_t asp_profile_ns[32];
-static uint64_t asp_profile_now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-}
-#endif
-
 /*
  * Everything a task writes lives in one block of its own cache lines. On the
  * PSP this runs on the Media Engine, which writes its data cache back in whole
@@ -982,13 +972,7 @@ void asp_run_task(uint8_t* rdram, const AspTask* task) {
 #endif
         if (op < 24) {
             asp_opcode_counts[op]++;
-#ifdef ASP_PROFILE
-            uint64_t t0 = asp_profile_now();
             sCommands[op](w0, w1);
-            asp_profile_ns[op] += asp_profile_now() - t0;
-#else
-            sCommands[op](w0, w1);
-#endif
         } else {
             asp_opcode_counts[31]++;
         }

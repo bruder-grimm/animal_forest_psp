@@ -322,7 +322,7 @@ void rt_sched_init(void) {
     sExtSignal = sceKernelCreateSema("rt_ext_signal", 0, 0, 0x7FFFFFFF, NULL);
 }
 
-bool rt_on_game_thread(void) {
+static bool on_game_thread(void) {
     return sCurrent != NULL && sCurrent->thid == sceKernelGetThreadId();
 }
 
@@ -737,7 +737,7 @@ static int native_thread(SceSize args, void* argp) {
  * the baton.
  */
 void rt_sched_native_wait(void (*fn)(void*), void* arg) {
-    if (!rt_on_game_thread()) {
+    if (!on_game_thread()) {
         fn(arg);
         return;
     }
@@ -936,11 +936,6 @@ void osDestroyThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     sceKernelSignalSema(t->sema, 1);
 }
 
-void osYieldThread_recomp(uint8_t* rdram, recomp_context* ctx) {
-    rt_process_external();
-    switch_out(TS_RUNNABLE);
-}
-
 void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
     GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
     if (t == NULL) {
@@ -961,11 +956,6 @@ void osGetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
 void osGetThreadId_recomp(uint8_t* rdram, recomp_context* ctx) {
     GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
     ctx->r2 = t != NULL ? (gpr)t->id : 0;
-}
-
-void __osCleanupThread_recomp(uint8_t* rdram, recomp_context* ctx) {
-    sCurrent->destroyed = true;
-    switch_out(TS_DEAD);
 }
 
 /* The game's idle loop (the recompiler turns its `for (;;);` into this). */

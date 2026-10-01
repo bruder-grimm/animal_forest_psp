@@ -395,18 +395,7 @@ static int dma_thread(SceSize args, void* argp) {
     return 0;
 }
 
-/*
- * Debug: sync_dma.txt does every cartridge read inline instead of on the I/O
- * thread. On the N64 a small PI DMA completes in microseconds; here a request
- * can wait behind a slow ROM block load (up to 7 ms), so this rules the queue
- * in or out when something looks like data arriving late.
- */
 static void start_dma(uint32_t phys, uint32_t ram, uint32_t size, uint32_t direction, uint32_t mq, uint32_t mb) {
-    if (RT_SWITCH("sync_dma.txt")) {
-        do_dma(phys, ram, size, direction);
-        rt_post_message(mq, mb, false, true);
-        return;
-    }
     if (sDmaSignal < 0) {
         sDmaLock = sceKernelCreateSema("rt_dma_lock", 0, 1, 1, NULL);
         sDmaSignal = sceKernelCreateSema("rt_dma", 0, 0, DMA_QUEUE_SIZE, NULL);
@@ -465,10 +454,6 @@ void osCartRomInit_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 RT_STUB(osCreatePiManager_recomp)
-RT_STUB_RETURN(osPiGetCmdQueue_recomp, 0)
-RT_STUB(__osPiCreateAccessQueue_recomp)
-RT_STUB(__osPiGetAccess_recomp)
-RT_STUB(__osPiRelAccess_recomp)
 
 /* s32 osEPiStartDma(OSPiHandle* handle, OSIoMesg* mb, s32 direction) */
 void osEPiStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -485,37 +470,6 @@ void osEPiStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
 
-/* s32 osPiStartDma(OSIoMesg* mb, s32 pri, s32 direction, u32 devAddr, void* vAddr, u32 nbytes, OSMesgQueue* mq) */
-void osPiStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
-    uint32_t mb = ctx->r4;
-    uint32_t direction = ctx->r6;
-    uint32_t dev = ctx->r7;
-    uint32_t ram = rt_stack_arg(ctx, 4);
-    uint32_t size = rt_stack_arg(ctx, 5);
-    uint32_t mq = rt_stack_arg(ctx, 6);
-
-    wr_w32(mb + IOMESG_RETQUEUE, mq);
-    wr_w32(mb + IOMESG_DRAMADDR, ram);
-    wr_w32(mb + IOMESG_DEVADDR, dev);
-    wr_w32(mb + IOMESG_SIZE, size);
-
-    start_dma(ROM_PHYS_BASE | dev, ram, size, direction, mq, mb);
-    ctx->r2 = 0;
-}
-
-/* s32 __osEPiRawStartDma(OSPiHandle* handle, s32 direction, u32 devAddr, void* dramAddr, u32 size) */
-void __osEPiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
-    uint32_t base = rd_w32(ctx->r4 + PIHANDLE_BASE);
-    do_dma(base | ctx->r6, ctx->r7, rt_stack_arg(ctx, 4), ctx->r5);
-    ctx->r2 = 0;
-}
-
-/* s32 __osPiRawStartDma(s32 direction, u32 devAddr, void* dramAddr, u32 size) */
-void __osPiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
-    do_dma(ROM_PHYS_BASE | ctx->r5, ctx->r6, ctx->r7, ctx->r4);
-    ctx->r2 = 0;
-}
-
 /* s32 osEPiReadIo(OSPiHandle* handle, u32 devAddr, u32* data) */
 void osEPiReadIo_recomp(uint8_t* rdram, recomp_context* ctx) {
     uint32_t base = rd_w32(ctx->r4 + PIHANDLE_BASE);
@@ -523,17 +477,3 @@ void osEPiReadIo_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
 
-void __osEPiRawReadIo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    osEPiReadIo_recomp(rdram, ctx);
-}
-
-void osEPiWriteIo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    RT_LOG_ONCE("osEPiWriteIo ignored (dev %08X)", ctx->r5);
-    ctx->r2 = 0;
-}
-
-void __osEPiRawWriteIo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    osEPiWriteIo_recomp(rdram, ctx);
-}
-
-RT_STUB_RETURN(osEPiLinkHandle, 0)

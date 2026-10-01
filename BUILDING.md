@@ -136,8 +136,6 @@ after that only what changed is rebuilt.
 | `TEXT_EN`, `NAMES_EN` | `work/text/*.bin` | the English text `gmake install` copies |
 | `PPSSPP_GAME_DIR` | `~/.config/ppsspp/PSP/GAME/AFPSP` | where `gmake install` installs |
 | `GEN_OPT` | `-O2` | optimisation of the generated code (`-Os` was slower) |
-| `PROF=1` | off | timing slots in the frame stats line (costs ~1 ms a frame) |
-| `GFXPROF=1` | off | the renderer's sampling profiler |
 
 `gmake clean` removes `build/psp`.
 
@@ -173,7 +171,7 @@ bars (a file `no_stretch.txt` next to the EBOOT starts the game at 4:3).
 
 The runtime logs to `afpsp.log` next to the EBOOT and has a set of debug
 switches (files next to the EBOOT: scripted input, screenshots, frame dumps
-and replays, profilers); `runtime/README.md` lists them and explains the log.
+and replays); `runtime/README.md` lists them and explains the log.
 
 ## Troubleshooting
 

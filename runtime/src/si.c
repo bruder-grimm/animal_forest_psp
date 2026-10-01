@@ -162,10 +162,6 @@ uint32_t rt_input_polls(void) {
     return sPolls;
 }
 
-uint16_t rt_input_buttons(void) {
-    return sButtons;
-}
-
 void rt_input_init(void) {
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
@@ -592,15 +588,7 @@ void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 RT_STUB(__osSiGetAccess_recomp)
 RT_STUB(__osSiRelAccess_recomp)
-RT_STUB(__osSiCreateAccessQueue_recomp)
-RT_STUB_RETURN(__osSiDeviceBusy_recomp, 0)
 
-void __osSiRawReadIo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    wr_w32(ctx->r5, 0);
-    ctx->r2 = 0;
-}
-
-RT_STUB_RETURN(__osSiRawWriteIo_recomp, 0)
 
 /* ---- Controller Pak / rumble / EEPROM: not present ---------------------- */
 
@@ -608,22 +596,12 @@ RT_STUB_RETURN(__osSiRawWriteIo_recomp, 0)
 
 RT_STUB_RETURN(osPfsInitPak_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsRepairId_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(osPfsChecker_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsAllocateFile_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsDeleteFile_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsReadWriteFile_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsFileState_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsFreeBlocks_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osPfsNumFiles_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osPfsGetStatus_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osPfsRWInode_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osPfsSelectBank_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osCheckId_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osCheckPackId_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osGetId_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osRepairPackId_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osContRamRead_recomp, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osContRamWrite_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(osMotorInit_recomp, PFS_ERR_NOPACK)
 RT_STUB_RETURN(__osMotorAccess_recomp, PFS_ERR_NOPACK)
 
@@ -633,25 +611,10 @@ void osPfsFindFile_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = PFS_ERR_NOPACK;
 }
 
-/* s32 osPfsIsPlug(OSMesgQueue* mq, u8* pattern) */
-void osPfsIsPlug_recomp(uint8_t* rdram, recomp_context* ctx) {
-    wr_u8(ctx->r5, 0);
-    ctx->r2 = 0;
-}
-
 void osEepromRead_recomp(uint8_t* rdram, recomp_context* ctx) {
     rt_fill_rdram(ctx->r6, 0, 8);
     ctx->r2 = (gpr)-1;
 }
 
 RT_STUB_RETURN(osEepromWrite_recomp, (gpr)-1)
-RT_STUB_RETURN(__osEepStatus_recomp, 1)
 RT_STUB_RETURN(osGbpakInit, PFS_ERR_NOPACK)
-RT_STUB_RETURN(__osContAddressCrc_recomp, 0)
-RT_STUB_RETURN(__osContDataCrc_recomp, 0)
-RT_STUB(__osContGetInitData_recomp)
-RT_STUB(__osPackRequestData_recomp)
-RT_STUB(__osPfsGetInitData_recomp)
-RT_STUB(__osPfsGetOneChannelData_recomp)
-RT_STUB(__osPfsRequestData_recomp)
-RT_STUB(__osPfsRequestOneChannel_recomp)

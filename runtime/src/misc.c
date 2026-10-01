@@ -41,10 +41,7 @@ uint8_t* recomp_mem_check(uint8_t* rdram, uint32_t base, int32_t disp, const cha
 
 /* ---- init / memory ------------------------------------------------------ */
 
-RT_STUB(osInitialize_recomp)
 RT_STUB(__osInitialize_common_recomp)
-RT_STUB(__osInitialize_autodetect)
-RT_STUB(__createSpeedParam_recomp)
 RT_STUB_RETURN(osGetMemSize_recomp, RT_OSMEMSIZE)
 RT_STUB_RETURN(osAfterPreNMI, 0)
 
@@ -58,15 +55,9 @@ void osSetIntMask_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = prev;
 }
 
-void osGetIntMask_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ctx->r2 = sIntMask;
-}
-
 /* Game threads only change hands inside OS calls (sched.c), so there is nothing to mask. */
 RT_STUB_RETURN(__osDisableInt_recomp, 1)
 RT_STUB(__osRestoreInt_recomp)
-RT_STUB(__osSetGlobalIntMask_recomp)
-RT_STUB(__osResetGlobalIntMask_recomp)
 
 /* ---- CPU: caches, TLB, cop0 --------------------------------------------- */
 
@@ -74,22 +65,11 @@ void osVirtualToPhysical_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = ctx->r4 & 0x1FFFFFFF;
 }
 
-void __osProbeTLB_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ctx->r2 = ctx->r4 & 0x1FFFFFFF;
-}
-
 RT_STUB(osInvalDCache_recomp)
 RT_STUB(osInvalICache_recomp)
 RT_STUB(osWritebackDCache_recomp)
 RT_STUB(osWritebackDCacheAll_recomp)
-RT_STUB(osMapTLBRdb_recomp)
 RT_STUB(osUnmapTLBAll_recomp)
-RT_STUB(__osSetSR_recomp)
-RT_STUB(__osSetCompare_recomp)
-RT_STUB(__osSetWatchLo_recomp)
-RT_STUB(__osNop_recomp)
-RT_STUB_RETURN(__osGetSR_recomp, 0)
-RT_STUB_RETURN(__osGetCause_recomp, 0)
 RT_STUB_RETURN(__osGetActiveQueue, 0)
 RT_STUB_RETURN(__osGetCurrFaultedThread, 0)
 
@@ -137,35 +117,12 @@ void __ll_div_recomp(uint8_t* rdram, recomp_context* ctx) {
     ret64(ctx, b == 0 ? 0 : (uint64_t)(a / b));
 }
 
-void __ll_rem_recomp(uint8_t* rdram, recomp_context* ctx) {
-    uint64_t a = (uint64_t)arg64_0(ctx);
-    int64_t b = arg64_1(ctx);
-    ret64(ctx, b == 0 ? a : a % (uint64_t)b);
-}
-
-void __ll_mod_recomp(uint8_t* rdram, recomp_context* ctx) {
-    int64_t a = arg64_0(ctx), b = arg64_1(ctx);
-    if (b == 0) {
-        ret64(ctx, (uint64_t)a);
-        return;
-    }
-    int64_t rem = a % b;
-    if ((rem > 0 && b < 0) || (rem < 0 && b > 0)) {
-        rem += b;
-    }
-    ret64(ctx, (uint64_t)rem);
-}
-
 void __ll_mul_recomp(uint8_t* rdram, recomp_context* ctx) {
     ret64(ctx, (uint64_t)arg64_0(ctx) * (uint64_t)arg64_1(ctx));
 }
 
 void __ll_lshift_recomp(uint8_t* rdram, recomp_context* ctx) {
     ret64(ctx, (uint64_t)arg64_0(ctx) << (arg64_1(ctx) & 63));
-}
-
-void __ll_rshift_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ret64(ctx, (uint64_t)(arg64_0(ctx) >> (arg64_1(ctx) & 63)));
 }
 
 void __ull_rshift_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -182,42 +139,6 @@ void __ull_rem_recomp(uint8_t* rdram, recomp_context* ctx) {
     ret64(ctx, b == 0 ? a : a % b);
 }
 
-/* void __ull_divremi(u64* quotient, u64* remainder, u64 dividend, u16 divisor) */
-void __ull_divremi_recomp(uint8_t* rdram, recomp_context* ctx) {
-    uint64_t dividend = (uint64_t)arg64_1(ctx);
-    uint16_t divisor = (uint16_t)rt_stack_arg(ctx, 4);
-    uint64_t q = divisor ? dividend / divisor : 0;
-    uint64_t r = divisor ? dividend % divisor : dividend;
-    wr_w32(ctx->r4, (uint32_t)(q >> 32));
-    wr_w32(ctx->r4 + 4, (uint32_t)q);
-    wr_w32(ctx->r5, (uint32_t)(r >> 32));
-    wr_w32(ctx->r5 + 4, (uint32_t)r);
-}
-
-void __d_to_ll_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ret64(ctx, (uint64_t)(int64_t)ctx->f12.d);
-}
-
-void __f_to_ll_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ret64(ctx, (uint64_t)(int64_t)ctx->f12.fl);
-}
-
-void __d_to_ull_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ret64(ctx, (uint64_t)ctx->f12.d);
-}
-
-void __f_to_ull_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ret64(ctx, (uint64_t)ctx->f12.fl);
-}
-
-void __ll_to_d_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ctx->f0.d = (double)arg64_0(ctx);
-}
-
-void __ll_to_f_recomp(uint8_t* rdram, recomp_context* ctx) {
-    ctx->f0.fl = (float)arg64_0(ctx);
-}
-
 void __ull_to_d_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->f0.d = (double)(uint64_t)arg64_0(ctx);
 }
@@ -225,10 +146,6 @@ void __ull_to_d_recomp(uint8_t* rdram, recomp_context* ctx) {
 void __ull_to_f_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->f0.fl = (float)(uint64_t)arg64_0(ctx);
 }
-
-/* ---- debug output ------------------------------------------------------- */
-
-RT_STUB(rmonPrintf_recomp)
 
 /* ---- recompiler hooks --------------------------------------------------- */
 
@@ -252,31 +169,3 @@ void recomp_unrecompiled(uint8_t* rdram, recomp_context* ctx, const char* name, 
     rt_log("unrecompiled function %s (%08X) called from %08X", name, vram, ctx->r31);
     ctx->r2 = 0;
 }
-
-/* ---- unreachable --------------------------------------------------------- */
-
-/* Only other libultra functions call these, and the runtime replaces those too. */
-#define UNREACHABLE_FUNC(name)                                           \
-    void name(uint8_t* rdram, recomp_context* ctx) {                     \
-        RT_LOG_ONCE("unexpected call to " #name " from %08X", ctx->r31); \
-        ctx->r2 = 0;                                                     \
-    }
-
-UNREACHABLE_FUNC(__osDequeueThread_recomp)
-UNREACHABLE_FUNC(__osDevMgrMain_recomp)
-UNREACHABLE_FUNC(__osDispatchThread_recomp)
-UNREACHABLE_FUNC(__osEnqueueAndYield_recomp)
-UNREACHABLE_FUNC(__osEnqueueThread_recomp)
-UNREACHABLE_FUNC(__osExceptionPreamble_recomp)
-UNREACHABLE_FUNC(__osException_recomp)
-UNREACHABLE_FUNC(__osInsertTimer_recomp)
-UNREACHABLE_FUNC(__osPopThread_recomp)
-UNREACHABLE_FUNC(__osSetTimerIntr_recomp)
-UNREACHABLE_FUNC(__osTimerInterrupt_recomp)
-UNREACHABLE_FUNC(__osTimerServicesInit_recomp)
-UNREACHABLE_FUNC(corrupted_init_recomp)
-UNREACHABLE_FUNC(corrupted_recomp)
-UNREACHABLE_FUNC(handle_CpU_recomp)
-UNREACHABLE_FUNC(send_mesg_recomp)
-UNREACHABLE_FUNC(gspS2DEX2_fifoTextStart_recomp)
-UNREACHABLE_FUNC(rspbootTextStart_recomp)

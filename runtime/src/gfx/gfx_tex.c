@@ -59,9 +59,6 @@ static int sEntriesTop = 0; /* no entry at or above this index has been used */
 static int16_t sSlots[CACHE_SLOTS];
 static uint32_t sFrame = 1;
 static uint32_t sBytesUsed = 0;
-/* bake_log.txt: log the first 60 bakes, from the frame number in the file on (default 0). */
-static int sBakeLog = -1;
-static uint32_t sBakeLogFrom = 0;
 
 /* Decode scratch: N64 textures are at most 256x256; S2DEX backgrounds (and
  * captured framebuffers) are up to 320x240. */
@@ -675,12 +672,6 @@ uint32_t gfx_tex_take_deferred(void) {
 }
 
 void gfx_tex_take_build_stats(uint32_t* builds, uint32_t* bakes, uint32_t* us) {
-    if (sBakeLog < 0) {
-        uint32_t from[1] = { 0 };
-        sBakeLog = rt_data_file_exists("bake_log.txt") ? 60 : 0;
-        rt_load_number_list("bake_log.txt", from, 1);
-        sBakeLogFrom = from[0];
-    }
     *builds = sBuilds;
     *bakes = sBakes;
     *us = sBuildUs;
@@ -707,13 +698,6 @@ static void build(const TexKey* k, const Axis* ax, const Axis* ay, GuTexture* t)
     sBuildUs += dt;
     if (k->variant & TEXVAR_COMBINE2) {
         sBakeUsFrame += dt;
-    }
-    if (sBakeLog > 0 && (k->variant & TEXVAR_TWO) && sFrame >= sBakeLogFrom) {
-        sBakeLog--;
-        rt_log("bake: frame %u %ux%u sub %u,%u kind %u fmt %u/%u + %u/%u at %08X + %08X off %.3f,%.3f ratio %.3f,%.3f, %u us",
-               sFrame, t->gu_width, t->gu_height, t->sub_x, t->sub_y, k->bake_kind, k->fmt, k->siz, k->src2.fmt,
-               k->src2.siz, k->addr_bits >> 3, k->src2.addr_bits >> 3, k->off_x, k->off_y, k->ratio_x, k->ratio_y,
-               dt);
     }
     sBuilds++;
     sBakes += (k->variant & TEXVAR_TWO) != 0;
@@ -790,7 +774,7 @@ static void build_impl(const TexKey* k, const Axis* ax, const Axis* ay, GuTextur
             if (combine2) {
                 uint32_t base = row[cols[x]], other = row2[cols2[x]];
                 uint32_t t0 = k->base_second ? other : base, t1 = k->base_second ? base : other;
-                /* Same as gfx_bake_texel, with the alpha memoised: evaluating the
+                /* Same as gfx_combiner.c's bake_texel, with the alpha memoised: evaluating the
                  * combiner per texel made the name-entry window's scrolling
                  * background cost 13-51 ms per bake. */
                 texel = split_tag ? gfx_bake_split_lookup(t0, t1, split_tag)
@@ -1079,9 +1063,6 @@ const GuTexture* gfx_tex_get(const TexKey* key_in) {
                 if (ph != e->pal_hash) {
                     e->pal_hash = ph;
                     changed = true;
-                }
-                if (RT_SWITCH("rebake.txt") && (key->variant & TEXVAR_TWO)) {
-                    changed = true; /* rebake.txt: rebuild two-texture bakes every frame, as scrolling does */
                 }
                 if (e->stale || ((sFrame + (uint32_t)sSlots[slot]) & (TEXEL_CHECK_PERIOD - 1)) == 0) {
                     e->stale = false;

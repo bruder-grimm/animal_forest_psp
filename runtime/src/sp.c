@@ -58,7 +58,3 @@ void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 RT_STUB_RETURN(__osSpSetPc_recomp, 0)
-RT_STUB(__osSpSetStatus_recomp)
-RT_STUB_RETURN(__osSpGetStatus_recomp, 0x1) /* halted */
-RT_STUB_RETURN(__osSpDeviceBusy_recomp, 0)
-RT_STUB_RETURN(__osSpRawStartDma_recomp, 0)

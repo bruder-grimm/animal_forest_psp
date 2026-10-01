@@ -13,7 +13,6 @@
  *   gfx_frame.c    frames: framebuffers, projection, render targets, softening, present
  *   gfx_tex.c      texture decoding and the texture cache
  *   gfx_debug.c    screenshots, RDRAM dumps, replay, traces
- *   gfx_prof.c     sampling profiler (gmake GFXPROF=1)
  */
 #ifndef AFPSP_GFX_INTERNAL_H
 #define AFPSP_GFX_INTERNAL_H
@@ -70,14 +69,6 @@ extern ScreenMap gMap;
 
 /* Debugging switches (gfx_debug.c) that the drawing code checks as it goes. */
 extern bool gTracing;  /* log every draw of this task (trace_tasks.txt) */
-extern int gAblate;    /* gfx_ablate.txt: leave out part of the renderer, for profiling */
-extern int gDrawLimit; /* replay step mode: draws per frame that reach the GE (-1: all) */
-
-/* Ablation levels 1-3 leave out ever more of the triangle path: 1 the triangle
- * output, 2 the triangles, 3 the vertex stage too. (4 and 5 are other cuts.) */
-static inline bool gfx_ablated(int level) {
-    return gAblate >= level && gAblate <= 3;
-}
 
 /* ---- F3DEX2 / RDP modes ------------------------------------------------- */
 
@@ -332,9 +323,6 @@ extern int gBakeRgbTile;
 
 /* The colour a vertex gets: the fit's function of its shade. */
 static inline uint32_t vertex_color(const CombinerFit* fit, float r, float g, float b, float a) {
-    if (gAblate == 5) {
-        return 0xFFFFFFFF;
-    }
     float sh[3] = { r, g, b };
     uint32_t out = 0;
     for (int ch = 0; ch < 3; ch++) {
@@ -476,8 +464,6 @@ void gfx_tex_invalidate_range(uint32_t addr, uint32_t len);
 void gfx_tex_flush_retired(void);
 /* One texel as RGBA8888, whatever format and layout it is stored in. */
 uint32_t gfx_tex_texel(const GuTexture* t, uint32_t x, uint32_t y);
-/* TEXVAR_COMBINE2: one baked texel from the pair (gfx_combiner.c evaluates the combiner). */
-uint32_t gfx_bake_texel(uint32_t t0, uint32_t t1);
 /* A split combiner's baked texel (BAKE_X or BAKE_Y) for a pair of source texels, memoised:
  * gfx_bake_split_prepare once per bake (the tag), then gfx_bake_split_lookup per texel. */
 #define SPLIT_MEMO 16384
@@ -600,6 +586,7 @@ extern uint32_t gDisplayZimg; /* the depth image drawn with the screen */
 
 void gfx_open_frame(void);
 void gfx_set_viewport(void);
+void gfx_ge_viewport(int* cx, int* cy, int* w, int* h);
 void gfx_set_scissor(void);
 void gfx_set_projection(void);
 void gfx_upload_projection(int variant);
@@ -664,15 +651,12 @@ extern GfxStats gStats;
 
 /* ---- debugging (gfx_debug.c; the switches are declared at the top) ------ */
 
-void gfx_debug_init(void);
 /* The start of each graphics task: dumps, captures and traces it asks for. */
 void gfx_debug_task_start(uint32_t task_number, uint32_t task);
-/* False for a draw left out (skip_draws.txt, replay step mode, ablation). */
+/* False for a draw left out (skip_draws.txt, replay step mode). */
 bool gfx_draw_enabled(void);
 /* A buffer for this frame's screenshot, or NULL if none is wanted. */
 uint32_t* gfx_debug_shot_buffer(uint32_t frame);
 void gfx_debug_save_shot(uint32_t frame);
-/* gmake GFXPROF=1: starts the renderer's sampling profiler (gfx_prof.c). */
-void gfx_prof_init(void);
 
 #endif

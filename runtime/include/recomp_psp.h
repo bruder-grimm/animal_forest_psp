@@ -354,7 +354,6 @@ bool rt_names_letter(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_letter2(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_letterz(uint8_t* rdram, recomp_context* ctx);
 void rt_names_letter_footer(uint8_t* rdram, recomp_context* ctx);
-void rt_names_test_submenu(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_mail_tag(uint8_t* rdram, recomp_context* ctx);
 bool rt_names_free_str(uint8_t* rdram, recomp_context* ctx);
 void rt_names_keyboard(uint8_t* rdram, recomp_context* ctx);

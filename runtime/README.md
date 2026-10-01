@@ -18,7 +18,7 @@ runtime/
     log.c               afpsp.log, memory stick helpers, debug switch files
     sections.c          function lookup for indirect calls, overlay tracking
     sched.c             N64 threads and message queues on PSP threads
-    preempt.c           preemption points in recompiled code; sampling profiler
+    preempt.c           preemption points in recompiled code
     timer.c             osSetTimer, osGetTime
     misc.c              the rest of libultra; the recompiler's error hooks
     pi.c                cartridge ROM reads and PI DMA
@@ -33,7 +33,6 @@ runtime/
     text_en.c           English dialogue (text_en.bin)
     names_en.c          English names, items and letters (names_en.bin)
     strings_en.c        English dates and times
-    prof.c/.h           timing slots for the stats line (gmake PROF=1); the sampling profilers' histograms
 ```
 
 ## How it fits together
@@ -97,35 +96,16 @@ file.
 | `no_stretch.txt` | start with the picture at 4:3 between black bars (START + SELECT switches) | gfx_frame.c |
 | `dump_frames.txt` | save the RDRAM of these graphics tasks | gfx_debug.c |
 | `replay.txt` | `<dump> <task> [step]`: render a dump forever instead of booting | gfx_debug.c |
-| `replay_scroll.txt` | scroll these tiles each replayed frame | gfx_debug.c |
 | `trace_tasks.txt` | log every draw of these graphics tasks | gfx_debug.c |
 | `skip_draws.txt` | leave out these draws (1-based) | gfx_debug.c |
-| `gfx_ablate.txt` | leave out part of the renderer (levels 1-5), for profiling | gfx_debug.c |
-| `bench_vtx.txt` | benchmark and self-test the vertex stage at startup | gfx_vertex.c |
 | `dump_tex.txt` | write the first 400 textures built | gfx_tex.c |
-| `bake_log.txt` | log 60 two-texture bakes, from the frame in the file | gfx_tex.c |
-| `rebake.txt` | rebuild two-texture bakes every frame | gfx_tex.c |
 | `soften.txt` | softening strength in percent (0 = off; default 30) | gfx_frame.c |
-| `soften_bench.txt` | time the softening pass on the GE | gfx_frame.c |
 | `no_snap.txt`, `no_weld.txt`, `no_cut.txt`, `no_split.txt`, `hard_edges.txt` | turn off vertex snapping, welding of nearly coincident vertices, stencil cut-outs, split combiners, soft texture edges | gfx_draw.c, gfx_combiner.c |
 | `no_yield.txt` | ignore the game's graphics task yields | gfx_worker.c |
 | `no_me.txt` | run audio on the main CPU | audio/me_audio.c |
 | `sync_log.txt` | write every log line before going on (for a crash that loses the last lines) | log.c |
-| `cpu_mhz.txt` | the CPU clock to run at instead of 333 (222, 266), to measure headroom | main.c |
-| `src32.txt` | let the firmware resample the audio | audio.c |
 | `audio_wav.txt` | `start length` (s): record the output to `afpsp_audio.wav` | audio.c |
-| `audio_raw.txt` | `first count`: record the game's sample buffers to `afpsp_raw.wav` | audio.c |
 | `dump_audio.txt` | dump these audio tasks' RDRAM as `aspt_<n>.bin` | audio.c |
-| `sync_dma.txt` | do cartridge reads inline instead of on the I/O thread | pi.c |
-| `prof_sample.txt` | sample game code every ms to `afpsp_samples.txt` (format in prof.h) | preempt.c |
-| `flash_test.txt` | exercise the save path at boot (writes junk to the save) | flash.c |
-| `exit_test.txt` | `seconds [1]`: take the HOME exit path by itself | main.c |
-| `standby_test.txt` | `seconds [times]`: go into standby by itself; the firmware wakes the PSP at once, with the power left on (so the Media Engine keeps its state, unlike in a real standby). PSPLink does not survive its next reset after one | main.c |
-| `kana_log.txt` | log each distinct line of text drawn with Japanese still in it (decode with tools/afcharset.py) | names_en.c |
-| `letter_test.txt` | build English test letters and log them; puts four in the pockets, and Z + START opens the pockets on any save | names_en.c |
-
-`gmake PROF=1` adds timing slots to the frame line; `gmake GFXPROF=1` builds
-the renderer's sampling profiler (gfx/gfx_prof.c).
 
 ## Reading the log
 
@@ -142,7 +122,7 @@ tasks the audio side does:
 - `frame N (poll P): ...` -- per-frame counts, then `busy` (game threads; also
   as time per frame, the number to compare for the game's own code),
   `gfx`, `blocked` (the game waiting for the renderer) and `audio` shares,
-  the timing slots, and per game thread `t<id> <CPU>%/w<avg>,<worst wait>/h<longest hold>,<calls>`.
+  and per game thread `t<id> <CPU>%/w<avg>,<worst wait>/h<longest hold>,<calls>`.
 - `audio rate: game N Hz, hardware N Hz` -- both should be ~32000.
 - `audio: ... underruns N ...` -- underruns are gaps in the sound;
   `retraces lost` are audio frames the game never made.

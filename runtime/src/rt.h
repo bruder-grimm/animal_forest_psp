@@ -31,10 +31,8 @@ extern uint8_t* g_rdram;
 #define RT_SP_STATUS     0x80000010u  /* target of the sched RSP-status patches (recomp/af.jp.toml) */
 #define RT_CART_HANDLE   0x80000080u  /* osCartRomInit's OSPiHandle */
 #define RT_FLASH_HANDLE  0x80000100u  /* osFlashInit's OSPiHandle */
-#define RT_SCRATCH       0x80000180u  /* 128 bytes: letter_test.txt's scratch (names_en.c) */
 #define RT_NAMES_SCRATCH 0x80000200u  /* 3 x 64 bytes: expanded English names (names_en.c) */
 /* 0x80000300-0x8000035B: libultra's globals and osAppNMIBuffer (the game uses both). */
-#define RT_TEST_MAIL     0x80000360u  /* 122 bytes: letter_test.txt's letter (names_en.c) */
 #define RT_TAG_SCRATCH   0x800003E0u  /* 32 bytes: a word of the pocket menu's letter tag (names_en.c) */
 
 /* Word, halfword and byte access to RDRAM by N64 address (see recomp_psp.h). */
@@ -196,7 +194,6 @@ bool rt_send_now(uint32_t mq, uint32_t msg, bool jam);
 void rt_process_external(void);
 /* ... and lets a higher-priority runnable game thread take over. */
 void rt_check_preempt(void);
-bool rt_on_game_thread(void);
 /* Runs blocking host work for the current game thread, letting the others run meanwhile. */
 void rt_sched_native_wait(void (*fn)(void*), void* arg);
 /* Game thread only: sleeps for us microseconds, letting the others run meanwhile. */
@@ -212,14 +209,9 @@ void rt_sched_report(char* buf, int size, uint32_t span_us);
 void rt_sched_vi_report(char* buf, int size);
 uint32_t rt_sched_vi_dropped(void);
 
-/* ---- preemption points (preempt.c) -------------------------------------- */
-
-void rt_preempt_init(void);
-
 /* ---- timers (timer.c) --------------------------------------------------- */
 
 void rt_timer_init(void);
-uint64_t rt_os_time(void); /* N64 counter ticks since boot */
 /* Has rt_sched_poke called at system time at_us (or at an earlier time already asked for). */
 void rt_timer_poke(uint64_t at_us);
 
@@ -241,7 +233,6 @@ void rt_dma_report(char* buf, int size);
 
 void rt_input_init(void);
 uint32_t rt_input_polls(void); /* controller reads so far (the input script's time base) */
-uint16_t rt_input_buttons(void); /* N64 buttons of the last read */
 void rt_rtc_init(void);
 void rt_rtc_tick(void);        /* writes rtc.bin if the game changed the clock */
 
@@ -250,8 +241,6 @@ void rt_rtc_tick(void);        /* writes rtc.bin if the game changed the clock *
 void rt_save_init(void);
 void rt_save_tick(void);  /* called twice a second; writes a save once writes have settled */
 void rt_save_flush(void); /* writes a pending save now */
-/* Debug: flash_test.txt, run once the game's threads are up (vi.c). */
-void rt_debug_flash_test(recomp_context* ctx);
 
 /* ---- renderer (gfx/) ---------------------------------------------------- */
 
@@ -261,11 +250,9 @@ void rt_gfx_present(uint32_t framebuffer);
 /* osSpTaskYield/osSpTaskYielded: let the game preempt the frame to run audio. */
 void rt_gfx_yield(void);
 bool rt_gfx_yielded(void);
-uint32_t rt_gfx_frame_count(void);
 /* Debug tools */
 void rt_gfx_request_capture(void); /* SELECT + R: dump the next frame (gfx_debug.c) */
 void rt_gfx_toggle_stretch(void);  /* START + SELECT: the picture stretched, or at 4:3 (gfx_frame.c) */
-void rt_gfx_bench(void);           /* bench_vtx.txt: times the vertex stage (gfx_vertex.c) */
 bool rt_gfx_replay(void);          /* replay.txt: renders a dumped frame forever (gfx_debug.c) */
 
 /* ---- audio (audio.c; the Media Engine in audio/me_audio.h) -------------- */

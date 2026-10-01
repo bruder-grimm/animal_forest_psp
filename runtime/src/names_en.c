@@ -65,9 +65,6 @@ static uint32_t sMsgSrc;  /* the message copy source whose expansion is in SCRAT
 static uint32_t sMailBase;  /* letters: see make_names_en.py */
 static uint32_t sPieceBase; /* fixed parts of letter headers and footers, used whole by tokens */
 
-static void letter_test(void);
-static bool sTestLetters, sTestDone;
-
 static bool load(void) {
     if (sState != 0) {
         return sState > 0;
@@ -107,10 +104,6 @@ static bool load(void) {
     sItemEnd = ITEM_FTR + (sJpTail - BASE_ITEM - ITEM_FTR_SLOT) * 10;
     sState = 1;
     rt_log("names_en: English names, item names and letters from %s (%u slots)", path, (unsigned)sCount);
-    if (rt_data_file_exists("letter_test.txt")) {
-        letter_test();
-        sTestLetters = true;
-    }
     return true;
 }
 
@@ -645,148 +638,6 @@ void rt_names_letter_footer(uint8_t* rdram, recomp_context* ctx) {
 }
 
 
-/* ---- letter_test.txt ---------------------------------------------------- */
-
-static const char* const kTestNames[] = { "Marvin", "Bob", "Biff", "Tulip", "Nookway", "Castle" };
-
-/* The 20 free strings letters take their names from, filled with test names;
- * with player != 0 the first is the player's name (6 bytes of RDRAM there). */
-static void test_free_strings(uint32_t player) {
-    for (uint32_t i = 0; i < 20; i++) {
-        const char* v = kTestNames[i % RT_COUNT(kTestNames)];
-        uint32_t vl = (uint32_t)strlen(v);
-        for (uint32_t j = 0; j < FREE_LEN; j++) {
-            uint8_t c = (i == 0 && player != 0) ? (j < 6 ? rd_u8(player + j) : ' ') : (j < vl ? (uint8_t)v[j] : ' ');
-            wr_u8(FREE_STR + i * FREE_LEN + j, c);
-        }
-    }
-}
-
-/* A villager letter made through the mHandbillz_load hook: every part number
- * 5, or parts 100..104. The name position goes to *back. */
-static bool test_villager_letter(uint32_t header, uint32_t hsize, uint32_t body, uint32_t footer, uint32_t fsize,
-                                 bool fives, uint32_t back) {
-    uint32_t info = RT_SCRATCH + 8; /* a HandbillzInfo */
-    wr_w32(info + 0x0, header);
-    wr_w32(info + 0x4, hsize);
-    wr_w32(info + 0x8, body);
-    wr_w32(info + 0xC, BODY_LEN);
-    wr_w32(info + 0x10, footer);
-    wr_w32(info + 0x14, fsize);
-    for (uint32_t i = 0; i < 5; i++) {
-        wr_w32(info + 0x18 + 4 * i, fives ? 5 : 100 + i);
-    }
-    recomp_context ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.r4 = info;
-    bool ok = rt_names_letterz(g_rdram, &ctx);
-    wr_w32(back, rd_w32(info + 0x2C));
-    return ok;
-}
-
-/* Logs a header or footer as the letter screen shows it, tokens expanded. */
-static void log_field(const char* what, uint32_t addr, uint32_t n) {
-    uint8_t in[FOOTER_LEN], out[EXPANDED_MAX + 1];
-    for (uint32_t i = 0; i < n; i++) in[i] = rd_u8(addr + i);
-    int e = expand_bytes(in, n, out, EXPANDED_MAX);
-    if (e < 0) { memcpy(out, in, n); e = (int)n; }
-    out[e] = 0;
-    rt_log("letter_test:   %s [%s]", what, (char*)out);
-}
-
-/* Builds a few letters with made-up names and logs how the letter screen would
- * show them (header with the name put in, body lines, footer). Runs once, the
- * first time names_en.bin is used. */
-static void letter_test(void) {
-    test_free_strings(0);
-    uint32_t header = RT_TEST_MAIL, footer = header + HEADER_LEN, body = footer + FOOTER_LEN;
-    uint32_t back = RT_SCRATCH;
-    static const int32_t nos[] = { 2, 200, 530, 532, 541 };
-    for (uint32_t t = 0; t < RT_COUNT(nos) + 2; t++) {
-        bool ok;
-        if (t < RT_COUNT(nos)) {
-            ok = letter(header, HEADER_LEN, back, footer, FOOTER_LEN, body, nos[t]);
-            rt_log("letter_test: letter %d: %s", (int)nos[t], ok ? "English" : "ROM");
-        } else {
-            bool fives = t == RT_COUNT(nos);
-            /* buffers longer than the fields, as the game passes them */
-            ok = test_villager_letter(header, 20, body, footer, 26, fives, back);
-            rt_log("letter_test: villager letter %s: %s", fives ? "5" : "100..", ok ? "English" : "ROM");
-        }
-        if (!ok) continue;
-        /* the header as the letter screen puts it together (func_80889CD8_jp) */
-        uint32_t b = rd_w32(back);
-        uint8_t h[24];
-        uint32_t hn = 0;
-        for (uint32_t i = 0; i < b; i++) h[hn++] = rd_u8(header + i);
-        for (const char* p = kTestNames[0]; *p; p++) h[hn++] = (uint8_t)*p;
-        uint32_t hl = HEADER_LEN;
-        while (hl > 0 && rd_u8(header + hl - 1) == ' ') hl--;
-        for (uint32_t i = b; i < hl; i++) h[hn++] = rd_u8(header + i);
-        rt_copy_to_rdram(RT_SCRATCH + 64, h, hn);
-        log_field("header", RT_SCRATCH + 64, hn);
-        for (uint32_t k = 0; k < BODY_LINES; k++) {
-            uint8_t line[EXPANDED_MAX + 1];
-            int n = letter_line(body + 4 * k, k, line);
-            line[n < 0 ? 0 : n] = 0;
-            rt_log("letter_test:   %u %3upx [%s]", (unsigned)k, (unsigned)text_width(line, n < 0 ? 0 : (uint32_t)n),
-                   (char*)line);
-        }
-        uint32_t fl = FOOTER_LEN;
-        while (fl > 0 && rd_u8(footer + fl - 1) == ' ') fl--;
-        log_field("footer", footer, fl);
-    }
-}
-
-/* In the game: once the player is loaded, pocket letters 0-3 become English
- * test letters (ROM letters 2 and 532, villager letters 5 and 100..), for
- * looking at the letter screen. */
-#define COMMON_DATA 0x80126EA0u
-static void letter_test_pockets(void) {
-    uint32_t priv = rd_w32(COMMON_DATA + 0x10138);
-    if (priv < 0x80000400u || priv >= 0x80400000u || rd_u8(priv) == ' ' || rd_u8(priv) == 0) return;
-    sTestDone = true;
-    test_free_strings(priv);
-    for (uint32_t t = 0; t < 4; t++) {
-        uint32_t m = priv + 0x40A + t * 0xA4;
-        for (uint32_t j = 0; j < 0xA4; j++) wr_u8(m + j, 0);
-        for (uint32_t j = 0; j < 0x10; j++) wr_u8(m + j, rd_u8(priv + j)); /* recipient: the player */
-        wr_u8(m + 0x10, 0);
-        const char* from = "Bob   Castle";
-        for (uint32_t j = 0; j < 12; j++) wr_u8(m + 0x12 + j, (uint8_t)from[j]);
-        wr_u8(m + 0x12 + 0x10, 1); /* sender: a villager */
-        uint32_t c = m + 0x26, back = RT_SCRATCH;
-        if (t < 2) {
-            letter(c + 4, HEADER_LEN, back, c + 0x6E, FOOTER_LEN, c + 0x0E, t == 0 ? 2 : 532);
-        } else {
-            test_villager_letter(c + 4, HEADER_LEN, c + 0x0E, c + 0x6E, FOOTER_LEN, t == 2, back);
-        }
-        wr_u8(c + 1, (uint8_t)rd_w32(back));
-    }
-    rt_log("letter_test: pocket letters 0-3 are English test letters");
-}
-
-/*
- * With letter_test.txt, Z + START opens the pockets even where the game would
- * not (a first-day save), so the test letters can be read. Called at the start of
- * mSM_submenu_ctrl(Game_Play*); the game's own code then starts the menu.
- */
-void rt_names_test_submenu(uint8_t* rdram, recomp_context* ctx) {
-    static bool held;
-    bool start = (rt_input_buttons() & 0x3000) == 0x3000, pressed = start && !held; /* Z + START */
-    held = start;
-    uint32_t submenu = (uint32_t)ctx->r4 + 0x1CBC;
-    if (!sTestLetters || !pressed || rd_w32(submenu + 0x0C) != 0 || rd_w32(submenu + 0x04) != 0) return;
-    recomp_context saved = *ctx;
-    ctx->r4 = (int32_t)submenu;
-    ctx->r5 = 1; /* the pockets */
-    ctx->r6 = 0;
-    ctx->r7 = 0;
-    mSM_open_submenu(rdram, ctx);
-    *ctx = saved;
-    rt_log("letter_test: pockets opened");
-}
-
 /* ---- the pocket menu (tag_ovl) ------------------------------------------ */
 
 /*
@@ -1091,56 +942,17 @@ bool rt_names_mail_tag(uint8_t* rdram, recomp_context* ctx) {
 
 /* ---- display ------------------------------------------------------------ */
 
-/*
- * Debug (kana_log.txt): logs each distinct line drawn with Japanese still in
- * it, with the address it came from; tools/afcharset.py decodes the bytes.
- */
-static bool japanese_byte(uint8_t c) {
-    /* the kana the font keeps in the ASCII range: む め も や ゆ よ ら り る れ */
-    return c < 0x20 || c == 0x23 || c == 0x24 || c == 0x5B || c == 0x5D || c == 0x5E || c == 0x60 ||
-           (c >= 0x7B && c <= 0x7E) || (c >= 0x80 && c != 0xCD);
-}
-
-static void kana_log(uint32_t from, const uint8_t* text, int len) {
-    static uint32_t seen[512];
-    static int nseen;
-    int jp = 0;
-    for (int i = 0; i < len; i++) {
-        if (text[i] == 0x7F && i + 1 < len) { i++; continue; }
-        jp += japanese_byte(text[i]);
-    }
-    if (jp == 0) return;
-    uint32_t h = 2166136261u;
-    for (int i = 0; i < len; i++) h = (h ^ text[i]) * 16777619u;
-    for (int i = 0; i < nseen; i++) if (seen[i] == h) return;
-    if (nseen < 512) seen[nseen++] = h;
-    char hex[2 * EXPANDED_MAX + 1];
-    int n = len < EXPANDED_MAX ? len : EXPANDED_MAX;
-    for (int i = 0; i < n; i++) snprintf(hex + 2 * i, 3, "%02x", text[i]);
-    hex[2 * n] = 0;
-    rt_log("kana: %08x len %d %s", (unsigned)from, len, hex);
-}
-
 /* func_80090CC0_jp(Game*, char* str, s32 len, ...): draws one line of text */
 bool rt_names_draw(uint8_t* rdram, recomp_context* ctx) {
     uint8_t buf[EXPANDED_MAX];
     uint32_t src = (uint32_t)ctx->r5;
     int n = -1;
-    if (sTestLetters && !sTestDone) letter_test_pockets();
     if (sState > 0 && (int32_t)ctx->r6 >= 3 && rd_u8(src) == TOKEN_MARK && rd_u8(src + 1) == LINE_MARK) {
         int k = byte_digit(rd_u8(src + 2));
         if (k >= 0 && k < BODY_LINES) n = letter_line(src, (uint32_t)k, buf);
     }
     if (n < 0 && sState > 0) n = screen_text(src, (uint32_t)ctx->r6, buf);
     if (n < 0) n = expand(src, (uint32_t)ctx->r6, buf);
-    if (RT_SWITCH("kana_log.txt")) {
-        if (n >= 0) {
-            kana_log(src, buf, n);
-        } else if ((int32_t)ctx->r6 > 0 && (int32_t)ctx->r6 <= EXPANDED_MAX) {
-            rt_copy_from_rdram(src, buf, (uint32_t)ctx->r6);
-            kana_log(src, buf, (int)ctx->r6);
-        }
-    }
     if (n >= 0) {
         rt_copy_to_rdram(SCRATCH_DRAW, buf, (uint32_t)n);
         ctx->r5 = (int32_t)SCRATCH_DRAW;
