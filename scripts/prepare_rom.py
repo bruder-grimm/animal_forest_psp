@@ -79,12 +79,6 @@ def normalize(data, order):
     return bytes(b)
 
 
-def is_n64_rom(path):
-    """Does the file start like an N64 ROM (in any byte order)?"""
-    with open(path, "rb") as f:
-        return f.read(4) in MAGIC
-
-
 def identify(path):
     path = Path(path)
     size = path.stat().st_size

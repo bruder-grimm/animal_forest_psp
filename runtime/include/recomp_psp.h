@@ -74,6 +74,9 @@ void rt_preempt(void);
 /* misc.c: the address folded the plain way, for the checking build below. */
 uint8_t* recomp_mem_check(uint8_t* rdram, uint32_t base, int32_t disp, const char* func);
 
+/* What the generated code folds a base register with (see MEM_PTR below). */
+#define RDRAM_BASE_MASK (2 * RDRAM_SIZE - 1)
+
 #if defined(RECOMP_GENERATED_CODE) && defined(RECOMP_MEM_CHECK)
 /* gmake MEMCHECK=1: every access is folded the plain way, and one that MEM_PTR
  * below would have put somewhere else is logged. */
@@ -107,7 +110,6 @@ uint8_t* recomp_mem_check(uint8_t* rdram, uint32_t base, int32_t disp, const cha
  * A displacement that isn't a constant (RELOC_LO16 of an overlay symbol) is
  * folded with its base as before.
  */
-#define RDRAM_BASE_MASK (2 * RDRAM_SIZE - 1)
 #define MEM_PTR(a, b)                                                              \
     (MEM_IS_DISP(a)   ? (rdram + ((uint32_t)(b) & RDRAM_BASE_MASK)) + (int32_t)(a) \
      : MEM_IS_DISP(b) ? (rdram + ((uint32_t)(a) & RDRAM_BASE_MASK)) + (int32_t)(b) \
@@ -309,6 +311,21 @@ typedef struct {
     uint8_t mips3_float_mode;
 } recomp_context;
 
+/*
+ * Generated with register_locals (recomp/af.jp.toml): each function keeps the
+ * GPRs in locals and relies on the MIPS calling convention -- a callee reads
+ * only a0-a3 and sp, returns only v0/v1, and restores s0-s8 and sp itself --
+ * so the context sees just those at calls and returns. Hooks, syscalls and
+ * events get the whole register file. Nothing changes for code that follows
+ * the convention; the compiler keeps the rest in registers.
+ */
+#define RL_DECLARE() gpr r1 = ctx->r1, r2 = ctx->r2, r3 = ctx->r3, r4 = ctx->r4, r5 = ctx->r5, r6 = ctx->r6, r7 = ctx->r7, r8 = ctx->r8, r9 = ctx->r9, r10 = ctx->r10, r11 = ctx->r11, r12 = ctx->r12, r13 = ctx->r13, r14 = ctx->r14, r15 = ctx->r15, r16 = ctx->r16, r17 = ctx->r17, r18 = ctx->r18, r19 = ctx->r19, r20 = ctx->r20, r21 = ctx->r21, r22 = ctx->r22, r23 = ctx->r23, r24 = ctx->r24, r25 = ctx->r25, r26 = ctx->r26, r27 = ctx->r27, r28 = ctx->r28, r29 = ctx->r29, r30 = ctx->r30, r31 = ctx->r31
+#define RL_FLUSH_ARGS() do { ctx->r4 = r4; ctx->r5 = r5; ctx->r6 = r6; ctx->r7 = r7; ctx->r29 = r29; } while (0)
+#define RL_RELOAD_RET() do { r2 = ctx->r2; r3 = ctx->r3; } while (0)
+#define RL_WRITE_RET() do { ctx->r2 = r2; ctx->r3 = r3; } while (0)
+#define RL_FLUSH_ALL() do { ctx->r1 = r1; ctx->r2 = r2; ctx->r3 = r3; ctx->r4 = r4; ctx->r5 = r5; ctx->r6 = r6; ctx->r7 = r7; ctx->r8 = r8; ctx->r9 = r9; ctx->r10 = r10; ctx->r11 = r11; ctx->r12 = r12; ctx->r13 = r13; ctx->r14 = r14; ctx->r15 = r15; ctx->r16 = r16; ctx->r17 = r17; ctx->r18 = r18; ctx->r19 = r19; ctx->r20 = r20; ctx->r21 = r21; ctx->r22 = r22; ctx->r23 = r23; ctx->r24 = r24; ctx->r25 = r25; ctx->r26 = r26; ctx->r27 = r27; ctx->r28 = r28; ctx->r29 = r29; ctx->r30 = r30; ctx->r31 = r31; } while (0)
+#define RL_RELOAD_ALL() do { r1 = ctx->r1; r2 = ctx->r2; r3 = ctx->r3; r4 = ctx->r4; r5 = ctx->r5; r6 = ctx->r6; r7 = ctx->r7; r8 = ctx->r8; r9 = ctx->r9; r10 = ctx->r10; r11 = ctx->r11; r12 = ctx->r12; r13 = ctx->r13; r14 = ctx->r14; r15 = ctx->r15; r16 = ctx->r16; r17 = ctx->r17; r18 = ctx->r18; r19 = ctx->r19; r20 = ctx->r20; r21 = ctx->r21; r22 = ctx->r22; r23 = ctx->r23; r24 = ctx->r24; r25 = ctx->r25; r26 = ctx->r26; r27 = ctx->r27; r28 = ctx->r28; r29 = ctx->r29; r30 = ctx->r30; r31 = ctx->r31; } while (0)
+
 typedef void (recomp_func_t)(uint8_t* rdram, recomp_context* ctx);
 
 /* Called by the generated code; implemented in runtime/src (misc.c, sched.c, sections.c). */
@@ -327,40 +344,40 @@ void recomp_overlay_load_hook(uint8_t* rdram, recomp_context* ctx);
  * recompiled game functions. A hook returning bool that returns true has done
  * the function's work, and the game's own code is skipped.
  */
-/* runtime/src/strings_en.c: English dates and times */
-bool rt_str_year(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_month(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_day(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_week(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_hour(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_min(uint8_t* rdram, recomp_context* ctx);
-bool rt_str_sec(uint8_t* rdram, recomp_context* ctx);
-/* runtime/src/text_en.c: English dialogue from text_en.bin (hook in recomp/af.jp.toml) */
-bool rt_text_en_load(uint8_t* rdram, recomp_context* ctx);
-bool rt_text_en_width(uint8_t* rdram, recomp_context* ctx);
-bool rt_text_en_glyph(uint8_t* rdram, recomp_context* ctx);
-/* runtime/src/names_en.c: English names, choices, strings, item names (hooks in recomp/af.jp.toml) */
-bool rt_names_villager(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_choice(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_string(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_item(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_draw(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_width(uint8_t* rdram, recomp_context* ctx);
-void rt_names_msg_len(uint8_t* rdram, recomp_context* ctx, uint32_t src);
-void rt_names_msg_tail(uint8_t* rdram, recomp_context* ctx, uint32_t src);
-void rt_names_msg_det(uint8_t* rdram, recomp_context* ctx, uint32_t src);
-bool rt_names_msg_copy(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_letter(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_letter2(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_letterz(uint8_t* rdram, recomp_context* ctx);
-void rt_names_letter_footer(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_mail_tag(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_free_str(uint8_t* rdram, recomp_context* ctx);
-void rt_names_keyboard(uint8_t* rdram, recomp_context* ctx);
-void rt_names_ledit_space(uint8_t* rdram, recomp_context* ctx);
-void rt_names_ledit_cursor(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_resetti_match(uint8_t* rdram, recomp_context* ctx);
-bool rt_names_resetti_rude(uint8_t* rdram, recomp_context* ctx);
+/* runtime/src/english/: the game in English (see english.h there) */
+bool rt_en_message(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_char_width(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_glyph(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_year(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_month(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_day(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_weekday(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_hour(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_minute(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_second(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_villager_name(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_choice(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_string(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_item_name(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_draw_line(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_string_width(uint8_t* rdram, recomp_context* ctx);
+void rt_en_msg_length(uint8_t* rdram, recomp_context* ctx, uint32_t src);
+void rt_en_msg_catchphrase(uint8_t* rdram, recomp_context* ctx, uint32_t src);
+void rt_en_msg_determination(uint8_t* rdram, recomp_context* ctx, uint32_t src);
+bool rt_en_msg_copy(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_letter(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_letter2(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_villager_letter(uint8_t* rdram, recomp_context* ctx);
+void rt_en_letter_footer(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_letter_tag(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_free_string(uint8_t* rdram, recomp_context* ctx);
+void rt_en_keyboard_page(uint8_t* rdram, recomp_context* ctx);
+void rt_en_typed_space(uint8_t* rdram, recomp_context* ctx);
+void rt_en_typed_cursor(uint8_t* rdram, recomp_context* ctx);
+void rt_en_board_cursor(uint8_t* rdram, recomp_context* ctx);
+void rt_en_board_end(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_resetti_match(uint8_t* rdram, recomp_context* ctx);
+bool rt_en_resetti_rude(uint8_t* rdram, recomp_context* ctx);
 
 recomp_func_t* get_function(int32_t vram);
 

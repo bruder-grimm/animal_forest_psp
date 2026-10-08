@@ -50,6 +50,20 @@ bool gfx_draw_rect(float x0, float y0, float x1, float y1, float u0, float v0, f
 }
 
 /*
+ * A rectangle command's corners in N64 pixels (from 10.2 fixed point); fill
+ * and copy modes draw the pixels of the lower right edge as well.
+ */
+static void rect_corners(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry, float* x0, float* y0, float* x1,
+                         float* y1) {
+    uint32_t cycle = rdp_cycle_type();
+    float edge = cycle == G_CYC_FILL || cycle == G_CYC_COPY ? 1.0f : 0.0f;
+    *x0 = ulx / 4.0f;
+    *y0 = uly / 4.0f;
+    *x1 = lrx / 4.0f + edge;
+    *y1 = lry / 4.0f + edge;
+}
+
+/*
  * A rectangle the blender turns into nothing (see blender_keeps_memory in
  * gfx_draw.c) is left out before its texture is even looked up: the pocket
  * screen has sixteen of them a frame, each with a texture read out of the
@@ -67,6 +81,37 @@ static bool rect_keeps_memory(void) {
     return true;
 }
 
+/* What becomes of a texture rectangle or background copied from RDRAM at src (rect_route). */
+typedef enum {
+    ROUTE_DRAW,        /* it is drawn: the GE points at its colour image */
+    ROUTE_FROM_SCREEN, /* src is on the screen: what the PSP shows there is copied (gfx_copy_from_screen) */
+    ROUTE_DONE,        /* nothing (more) to draw */
+} RectRoute;
+
+/*
+ * Where a rectangle textured from RDRAM at src goes. The game copies the
+ * screen into buffers of its own: PreRender saves it behind a menu (into any
+ * buffer, the depth buffer's memory too), which takes what the PSP shows
+ * (gfx_capture_framebuffer); part of it into a render target (the portrait's
+ * background), which samples the PSP's colour buffer -- *fb, *sx, *sy say
+ * where src is on it, if `from_screen` allows that.
+ */
+static RectRoute rect_route(uint32_t src, bool from_screen, uint32_t* fb, float* sx, float* sy) {
+    if (gfx_drawing_to_display()) {
+        gfx_select_target();
+    } else if (!gfx_select_target_unloaded()) {
+        if (gfx_is_display_fb(src)) {
+            gfx_capture_framebuffer(src, gRdp.cimg, gRdp.cimg_width, N64_SCREEN_H);
+        }
+        return ROUTE_DONE;
+    } else if (from_screen && gfx_screen_position(src, fb, sx, sy)) {
+        return ROUTE_FROM_SCREEN;
+    } else {
+        gfx_target_ready();
+    }
+    return rect_keeps_memory() ? ROUTE_DONE : ROUTE_DRAW;
+}
+
 /* Copy mode draws the texels as they are. */
 static void copy_mode_fit(CombinerFit* fit) {
     memset(fit, 0, sizeof(*fit));
@@ -77,29 +122,37 @@ static void copy_mode_fit(CombinerFit* fit) {
     fit->abase = 1.0f;
 }
 
-static uint32_t fill_color_rgba(void) {
-    uint32_t c = gRdp.fill;
-    uint32_t r, g, b, a;
-    /* 16-bit framebuffer: fill colour is RGBA5551 in the low half. */
-    uint16_t v = (uint16_t)c;
-    r = (v >> 11) & 31;
-    g = (v >> 6) & 31;
-    b = (v >> 1) & 31;
-    a = 255;
-    r = (r << 3) | (r >> 2);
-    g = (g << 3) | (g >> 2);
-    b = (b << 3) | (b >> 2);
-    return r | (g << 8) | (b << 16) | (a << 24);
+/* The fit a textured rectangle is drawn with: copy mode's, or the combiner's (without a triangle). */
+static void rect_fit(bool copy, CombinerFit* fit) {
+    if (copy) {
+        copy_mode_fit(fit);
+        gFit = *fit;
+        gfx_fit_replaced();
+    } else {
+        gHintTri[0] = NULL;
+        gfx_classify_cached(fit);
+    }
+    gRdp.state_dirty = true;
+}
+
+/* The GE state for a textured rectangle (tex NULL: untextured after all). */
+static void rect_render_state(bool copy, const GuTexture* tex, const CombinerFit* fit) {
+    gfx_apply_render_state(false);
+    if (copy) {
+        gfx_gu_blending(false);
+    } else {
+        gfx_apply_aa_edge(tex, fit);
+    }
+    gfx_gu_texturing(tex != NULL);
+    if (tex != NULL) {
+        gfx_gu_tex_func(fit);
+    }
 }
 
 void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
-    float x0 = ulx / 4.0f, y0 = uly / 4.0f;
-    float x1 = lrx / 4.0f, y1 = lry / 4.0f;
-    uint32_t cycle = (gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3;
-    if (cycle == G_CYC_FILL || cycle == G_CYC_COPY) {
-        x1 += 1.0f;
-        y1 += 1.0f;
-    }
+    float x0, y0, x1, y1;
+    rect_corners(ulx, uly, lrx, lry, &x0, &y0, &x1, &y1);
+    uint32_t cycle = rdp_cycle_type();
 
     bool full = x0 <= 0 && y0 <= 0 && x1 >= N64_SCREEN_W - 1 && y1 >= N64_SCREEN_H - 1;
     bool to_rt = false;
@@ -146,13 +199,14 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
 
     uint32_t color;
     if (cycle == G_CYC_FILL) {
-        color = fill_color_rgba();
+        /* a 16-bit framebuffer's fill colour: RGBA5551 in the low half */
+        color = rgba5551_to_ge(gRdp.fill & 0xFFFF) | 0xFF000000u;
         if (to_rt) {
             /* The alpha (coverage) bit is the fill colour's; the stencil holds it. */
             uint32_t c = gRdp.fill;
             bool a = gTarget.siz == G_IM_SIZ_32b ? (c & 0xFF) != 0 : (c & 1) != 0;
             if (gTarget.siz == G_IM_SIZ_32b) {
-                color = (c >> 24) | ((c >> 16) & 0xFF) << 8 | ((c >> 8) & 0xFF) << 16 | 0xFF000000u;
+                color = rgb32_to_ge(c) | 0xFF000000u;
             }
             if (full) {
                 sceGuClearColor(color);
@@ -191,9 +245,8 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
     gGu.depth_test = 0;
     if (cycle != G_CYC_FILL) {
         gfx_apply_render_state(false);
-    } else if (gGu.blend) {
-        sceGuDisable(GU_BLEND);
-        gGu.blend = 0;
+    } else {
+        gfx_gu_blending(false);
     }
     if (to_rt && cycle != G_CYC_FILL) {
         sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP); /* blended over: leave coverage as it is */
@@ -207,124 +260,72 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
         sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
     }
     if (known && drawn) {
-        gfx_target_filled((color & 0xF8) << 8 | (color & 0xF800) >> 5 | (color & 0xF80000) >> 18, true);
+        gfx_target_filled(ge_to_rgba5551(color), true);
     } else if (!drawn) {
         gfx_target_not_drawn();
     }
 }
 
 void gfx_tex_rect(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, bool flip) {
-    uint32_t xh = (w0 >> 12) & 0xFFF, yh = w0 & 0xFFF;
     uint32_t tile_index = (w1 >> 24) & 7;
-    uint32_t xl = (w1 >> 12) & 0xFFF, yl = w1 & 0xFFF;
     int16_t s = (int16_t)(w2 >> 16), t = (int16_t)w2;
     int16_t dsdx = (int16_t)(w3 >> 16), dtdy = (int16_t)w3;
-
-    float x0 = xl / 4.0f, y0 = yl / 4.0f;
-    float x1 = xh / 4.0f, y1 = yh / 4.0f;
-    uint32_t cycle = (gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3;
-    if (cycle == G_CYC_FILL || cycle == G_CYC_COPY) {
-        x1 += 1.0f;
-        y1 += 1.0f;
-    }
+    float x0, y0, x1, y1;
+    rect_corners((w1 >> 12) & 0xFFF, w1 & 0xFFF, (w0 >> 12) & 0xFFF, w0 & 0xFFF, &x0, &y0, &x1, &y1);
     if (x1 <= x0 || y1 <= y0 || gfx_coverage_rect(x0, y0, x1, y1)) {
         return;
     }
-    if (!gfx_drawing_to_display()) {
-        TileDesc* src_tile = &gRdp.tiles[tile_index];
-        uint32_t src_bits = gfx_tmem_bits(src_tile->tmem);
-        uint32_t src = src_bits == TMEM_INVALID ? 0 : src_bits >> 3;
-        if (!gfx_select_target_unloaded()) {
-            /* Framebuffer-to-buffer copies (PreRender) with a texrect: capture the screen instead.
-               PreRender may use the depth buffer's memory as its save buffer. */
-            if (gfx_is_display_fb(src)) {
-                gfx_capture_framebuffer(src, gRdp.cimg, gRdp.cimg_width, N64_SCREEN_H);
-            }
-            return;
-        }
-        uint32_t fb;
-        float sx, sy;
-        if (src != 0 && !flip && gfx_screen_position(src, &fb, &sx, &sy)) {
-            /* Part of the screen copied into a render target (the portrait's background). */
-            float fs = s / 32.0f - src_tile->uls / 4.0f, ft = t / 32.0f - src_tile->ult / 4.0f;
-            float dsx = dsdx / 1024.0f, dty = dtdy / 1024.0f;
-            if (cycle == G_CYC_COPY) {
-                dsx /= 4.0f; /* copy mode steps s by 4 per pixel; t steps normally */
-            }
-            gfx_copy_from_screen(fb, x0, y0, x1, y1, sx + fs, sy + ft, sx + fs + dsx * (x1 - x0),
-                                 sy + ft + dty * (y1 - y0));
-            return;
-        }
-        gfx_target_ready();
-    } else {
-        gfx_select_target();
+    bool copy_mode = rdp_cycle_type() == G_CYC_COPY;
+    const TileDesc* tile = &gRdp.tiles[tile_index];
+    /* the tile's first texel and its steps, in texels; copy mode steps s by 4 per pixel */
+    float fs = s / 32.0f - tile->uls / 4.0f, ft = t / 32.0f - tile->ult / 4.0f;
+    float dsx = dsdx / 1024.0f, dty = dtdy / 1024.0f;
+    if (copy_mode) {
+        dsx /= 4.0f;
     }
-    if (rect_keeps_memory()) {
-        return;
+
+    uint32_t src_bits = gfx_tmem_bits(tile->tmem);
+    uint32_t src = src_bits == TMEM_INVALID ? 0 : src_bits >> 3;
+    uint32_t fb;
+    float sx, sy;
+    switch (rect_route(src, src != 0 && !flip, &fb, &sx, &sy)) {
+        case ROUTE_DONE:
+            return;
+        case ROUTE_FROM_SCREEN:
+            gfx_copy_from_screen(fb, x0, y0, x1, y1, sx + fs, sy + ft, sx + fs + dsx * (x1 - x0), sy + ft + dty * (y1 - y0));
+            return;
+        case ROUTE_DRAW:
+            break;
     }
 
     gfx_open_frame();
     gfx_flush_batch();
-
     uint8_t saved_tile = gRsp.tex_tile;
     gRsp.tex_tile = (uint8_t)tile_index;
-
     CombinerFit fit;
-    bool copy_mode = cycle == G_CYC_COPY;
-    if (copy_mode) {
-        copy_mode_fit(&fit);
-    } else {
-        gHintTri[0] = NULL;
-        gfx_classify_combiner(&fit);
-    }
-    gFit = fit;
-    gRdp.state_dirty = true;
-
-    const GuTexture* tex = NULL;
-    if (fit.uses_texture) {
-        tex = gfx_bind_texture(tile_index + fit.tex_tile, &fit);
-    }
+    rect_fit(copy_mode, &fit);
+    const GuTexture* tex = fit.uses_texture ? gfx_bind_texture(tile_index + fit.tex_tile, &fit) : NULL;
     gRsp.tex_tile = saved_tile;
-
-    gfx_apply_render_state(false);
-    if (copy_mode && gGu.blend) {
-        sceGuDisable(GU_BLEND);
-        gGu.blend = 0;
-    }
+    rect_render_state(copy_mode, tex, &fit);
     if (!copy_mode) {
-        gfx_apply_aa_edge(tex, &fit);
         gBatchTex = tex;
     }
-    gfx_gu_texturing(tex != NULL);
-    if (tex != NULL) {
-        gfx_gu_tex_func(&fit);
-    }
 
-    uint32_t color = vertex_color(&fit, 1, 1, 1, 1);
+    /* Through-mode (2D) texture coordinates are in texels, not normalised. Flipped,
+     * the axes swap: s follows y and t follows x. */
     float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
     if (tex != NULL) {
-        TileDesc* tile = &gRdp.tiles[tile_index];
-        float fs = s / 32.0f - tile->uls / 4.0f;
-        float ft = t / 32.0f - tile->ult / 4.0f;
-        float dsx = dsdx / 1024.0f;
-        float dty = dtdy / 1024.0f;
         if (copy_mode) {
-            dsx /= 4.0f;
             dty /= 4.0f;
         }
-        float w = x1 - x0;
-        float h = y1 - y0;
-        if (!flip) {
-            u0 = fs; u1 = fs + dsx * w;
-            v0 = ft; v1 = ft + dty * h;
-        } else {
-            u0 = fs; u1 = fs + dsx * h;
-            v0 = ft; v1 = ft + dty * w;
-        }
-        /* Through-mode (2D) texture coordinates are in texels, not normalised. */
+        float w = flip ? y1 - y0 : x1 - x0;
+        float h = flip ? x1 - x0 : y1 - y0;
+        u0 = fs;
+        u1 = fs + dsx * w;
+        v0 = ft;
+        v1 = ft + dty * h;
     }
-    /* flipped: swapped axes, s follows y and t follows x */
-    gfx_draw_rect(x0, y0, x1, y1, u0, v0, u1, v1, color, tex, flip);
+    gfx_draw_rect(x0, y0, x1, y1, u0, v0, u1, v1, vertex_color(&fit, 1, 1, 1, 1), tex, flip);
 }
 
 /* ---- S2DEX2 backgrounds ------------------------------------------------- */
@@ -362,27 +363,16 @@ void gfx_s2dex_bg(uint32_t addr, bool copy) {
                span_w, span_h, gRdp.cimg);
     }
 
-    if (!gfx_drawing_to_display()) {
-        if (!gfx_select_target_unloaded()) {
-            /* PreRender may use the depth buffer's memory as its save buffer. */
-            if (gfx_is_display_fb(image_ptr)) {
-                gfx_capture_framebuffer(image_ptr, gRdp.cimg, gRdp.cimg_width, N64_SCREEN_H);
-            }
+    uint32_t fb;
+    float sx, sy;
+    switch (rect_route(image_ptr, true, &fb, &sx, &sy)) {
+        case ROUTE_DONE:
             return;
-        }
-        uint32_t fb;
-        float sx, sy;
-        if (gfx_screen_position(image_ptr, &fb, &sx, &sy)) {
-            gfx_copy_from_screen(fb, fx0, fy0, fx1, fy1, sx + tex_x, sy + tex_y, sx + tex_x + span_w,
-                                 sy + tex_y + span_h);
+        case ROUTE_FROM_SCREEN:
+            gfx_copy_from_screen(fb, fx0, fy0, fx1, fy1, sx + tex_x, sy + tex_y, sx + tex_x + span_w, sy + tex_y + span_h);
             return;
-        }
-        gfx_target_ready();
-    } else {
-        gfx_select_target();
-    }
-    if (rect_keeps_memory()) {
-        return;
+        case ROUTE_DRAW:
+            break;
     }
 
     TexKey key;
@@ -405,48 +395,21 @@ void gfx_s2dex_bg(uint32_t addr, bool copy) {
     key.tile_h = (uint16_t)h;
     key.cms = key.cmt = G_TX_CLAMP;
     if (fmt == G_IM_FMT_CI) {
-        uint32_t tlut_type = (gRdp.other_h >> G_MDSFT_TEXTLUT) & 3;
-        key.tlut_type = tlut_type == 3 ? TLUT_IA16 : TLUT_RGBA16;
+        key.tlut_type = rdp_tlut_type();
         key.tlut_addr = gRdp.tlut[0] & 0x1FFFFFFF;
     }
 
     gfx_open_frame();
     gfx_flush_batch();
-
     CombinerFit fit;
-    if (copy) {
-        copy_mode_fit(&fit);
-    } else {
-        gHintTri[0] = NULL;
-        gfx_classify_combiner(&fit);
-    }
-    gFit = fit;
-    gRdp.state_dirty = true;
-
+    rect_fit(copy, &fit);
     const GuTexture* tex = gfx_tex_get_to_draw(&key);
     if (tex == NULL) {
         return;
     }
     gfx_gu_texture_image(tex);
-    if (gGu.wrap_u != GU_CLAMP || gGu.wrap_v != GU_CLAMP) {
-        sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-        gGu.wrap_u = gGu.wrap_v = GU_CLAMP;
-    }
-    int filter = (!copy && scale_w != 1024) ? GU_LINEAR : GU_NEAREST;
-    if (filter != gGu.tex_filter) {
-        sceGuTexFilter(filter, filter);
-        gGu.tex_filter = filter;
-    }
-    gfx_apply_render_state(false);
-    if (copy && gGu.blend) {
-        sceGuDisable(GU_BLEND);
-        gGu.blend = 0;
-    }
-    if (!copy) {
-        gfx_apply_aa_edge(tex, &fit);
-    }
-    gfx_gu_texturing(true);
-    gfx_gu_tex_func(&fit);
+    gfx_gu_tex_sampler(GU_CLAMP, GU_CLAMP, (!copy && scale_w != 1024) ? GU_LINEAR : GU_NEAREST);
+    rect_render_state(copy, tex, &fit);
 
     float u0 = 0, u1 = span_w, v0 = 0, v1 = span_h;
     if (flip & 0x01) { float t = u0; u0 = u1; u1 = t; }

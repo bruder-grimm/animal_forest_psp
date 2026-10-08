@@ -9,7 +9,6 @@
  */
 #include "rt.h"
 
-
 /*
  * gmake MEMCHECK=1: generated code calls this for every access with a constant
  * displacement. It folds the address the plain way and reports accesses that
@@ -19,7 +18,7 @@
  */
 uint8_t* recomp_mem_check(uint8_t* rdram, uint32_t base, int32_t disp, const char* func) {
     uint32_t plain = (base + (uint32_t)disp) & RDRAM_MASK;
-    int32_t fast = (int32_t)(base & (2 * RDRAM_SIZE - 1)) + disp;
+    int32_t fast = (int32_t)(base & RDRAM_BASE_MASK) + disp;
     if (fast != (int32_t)plain) {
         static const char* seen[64];
         static int nseen = 0;
@@ -100,11 +99,11 @@ void __osGetFpcCsr(uint8_t* rdram, recomp_context* ctx) {
 
 /* o32: long long arguments come in register pairs, high word first. */
 static inline int64_t arg64_0(recomp_context* ctx) {
-    return (int64_t)(((uint64_t)ctx->r4 << 32) | ctx->r5);
+    return (int64_t)rt_u64(ctx->r4, ctx->r5);
 }
 
 static inline int64_t arg64_1(recomp_context* ctx) {
-    return (int64_t)(((uint64_t)ctx->r6 << 32) | ctx->r7);
+    return (int64_t)rt_u64(ctx->r6, ctx->r7);
 }
 
 static inline void ret64(recomp_context* ctx, uint64_t v) {
@@ -168,4 +167,11 @@ void recomp_unsupported_64bit(const char* func) {
 void recomp_unrecompiled(uint8_t* rdram, recomp_context* ctx, const char* name, uint32_t vram) {
     rt_log("unrecompiled function %s (%08X) called from %08X", name, vram, ctx->r31);
     ctx->r2 = 0;
+}
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+void rt_misc_capture(RtCapture* c) {
+    rt_cap_io(c, "INTM", &sIntMask, sizeof(sIntMask));
+    rt_cap_io(c, "FPCS", &recomp_fpu_round_mode, sizeof(recomp_fpu_round_mode));
 }

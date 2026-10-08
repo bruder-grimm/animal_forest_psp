@@ -4,8 +4,9 @@
  * Audio RSP tasks run through the microcode HLE in audio/aspmain.c, on the
  * Media Engine where there is one (audio/me_audio.c). The game hands each
  * finished buffer of samples to func_800EFD40_jp (its inlined
- * osAiSetNextBuffer); it is copied into a ring buffer, which a PSP thread
- * plays through sceAudio's SRC channel.
+ * osAiSetNextBuffer); it is copied into a ring buffer, which audio/resample.c
+ * converts to chunks at the DAC's rate (on the Media Engine where there is one)
+ * and a PSP thread plays through sceAudio's SRC channel.
  *
  * The game sizes each new buffer from osAiGetLength (samples still queued),
  * aiming to keep a small backlog. Reporting the ring fill minus a bias makes
@@ -20,14 +21,13 @@
 #include <string.h>
 
 #include "audio/me_audio.h"
+#include "audio/resample.h"
 #include "rt.h"
 
 #define VI_NTSC_CLOCK 48681812
 
-#define OUT_CHUNK 512             /* frames per sceAudio output call */
+#define OUT_CHUNK RS_CHUNK        /* frames per sceAudio output call */
 #define OUT_RATE_44K 44100
-#define RING_FRAMES 16384         /* power of two */
-#define RING_MASK (RING_FRAMES - 1)
 /*
  * How much sound we keep ahead of the speaker. The game sizes each buffer from
  * what osAiGetLength reports, so under-reporting the ring by this much is what
@@ -50,6 +50,7 @@
 #define PRIME_TIMEOUT_US 3000000  /* give up waiting if the game makes nothing */
 
 uint64_t g_audio_us = 0;
+static SceUID sOutThread = -1;
 
 static uint32_t sTaskCount = 0;
 static bool sLastOnMe = false;    /* which core ran the last task */
@@ -57,9 +58,12 @@ static uint32_t sCpuTasks = 0;    /* tasks the main CPU ran, since the last stat
 
 /* ---- ring buffer -------------------------------------------------------- */
 
-static int16_t sRing[RING_FRAMES * 2];
-static volatile uint32_t sRingWrite = 0; /* frames, advanced by the game thread */
-static volatile uint32_t sRingRead = 0;  /* frames, advanced by the output thread */
+/*
+ * The ring (audio/resample.c) is written by the game thread. What the game is told is queued is the ring up to
+ * the end of the chunk last handed to the hardware, as when this thread did the conversion itself, however far
+ * ahead the converter has run.
+ */
+static volatile uint32_t sRingRead = 0;  /* source frames up to the last chunk handed over, advanced by the output thread */
 
 static volatile uint32_t sFrequency = 0; /* the game's output rate, once it sets one */
 static SceUID sFreqSignal = -1;
@@ -72,7 +76,7 @@ static uint32_t sConsumed = 0;   /* frames sent to the hardware, likewise (in th
 static uint32_t sRateMark = 0;
 
 static uint32_t ring_fill(void) {
-    return sRingWrite - sRingRead;
+    return rt_rs_written() - sRingRead;
 }
 
 /* ---- debug recordings --------------------------------------------------- */
@@ -119,8 +123,7 @@ static void output_wav_open(uint32_t rate) {
         return;
     }
     char path[256];
-    sWavFd = sceIoOpen(rt_data_path("afpsp_audio.wav", path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC,
-                       0777);
+    sWavFd = rt_data_create("afpsp_audio.wav", path, sizeof(path));
     if (sWavFd >= 0) {
         sWavStart = v[0] * rate;
         sWavFrames = v[1] * rate;
@@ -138,6 +141,8 @@ static void output_wav_write(const int16_t* chunk, uint32_t frames, uint32_t rat
     if (sPlayedFrames <= sWavStart) {
         return;
     }
+    /* Written by the Media Engine or by this core: either way, read it from memory. */
+    sceKernelDcacheWritebackInvalidateRange(chunk, frames * 4);
     uint32_t skip = start < sWavStart ? sWavStart - start : 0;
     uint32_t n = frames - skip;
     if (n > sWavFrames - sWavWritten) {
@@ -155,29 +160,23 @@ static void output_wav_write(const int16_t* chunk, uint32_t frames, uint32_t rat
 
 /* dump_audio.txt lists task numbers: those tasks' RDRAM goes to aspt_<n>.bin, for testing the microcode off the PSP. */
 static void maybe_dump_task(uint32_t task_number, uint32_t task) {
-    static uint32_t sDumpTasks[32];
-    static int sNumDumpTasks = -1;
-    if (sNumDumpTasks < 0) {
-        sNumDumpTasks = rt_load_number_list("dump_audio.txt", sDumpTasks, 32);
+    static RtNumbers sDumpTasks = RT_NUMBERS("dump_audio.txt");
+    if (!rt_numbers_have(&sDumpTasks, task_number)) {
+        return;
     }
-    for (int i = 0; i < sNumDumpTasks; i++) {
-        if (sDumpTasks[i] != task_number) {
-            continue;
-        }
-        char name[64];
-        char path[256];
-        snprintf(name, sizeof(name), "aspt_%05u.bin", (unsigned)task_number);
-        SceUID fd = sceIoOpen(rt_data_path(name, path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-        if (fd >= 0) {
-            uint32_t hdr[3];
-            memcpy(&hdr[0], "ASPT", 4);
-            hdr[1] = task;
-            hdr[2] = RT_OSMEMSIZE;
-            sceIoWrite(fd, hdr, sizeof(hdr));
-            sceIoWrite(fd, g_rdram, RT_OSMEMSIZE);
-            sceIoClose(fd);
-            rt_log("audio: dumped task %u to %s", (unsigned)task_number, path);
-        }
+    char name[64];
+    char path[256];
+    snprintf(name, sizeof(name), "aspt_%05u.bin", (unsigned)task_number);
+    SceUID fd = rt_data_create(name, path, sizeof(path));
+    if (fd >= 0) {
+        uint32_t hdr[3];
+        memcpy(&hdr[0], "ASPT", 4);
+        hdr[1] = task;
+        hdr[2] = RT_OSMEMSIZE;
+        sceIoWrite(fd, hdr, sizeof(hdr));
+        sceIoWrite(fd, g_rdram, RT_OSMEMSIZE);
+        sceIoClose(fd);
+        rt_log("audio: dumped task %u to %s", (unsigned)task_number, path);
     }
 }
 
@@ -246,81 +245,40 @@ static void note_underrun(void) {
     }
 }
 
+static bool sHistStale = false;   /* a real chunk has been handed over since sHist was taken */
+
 /*
- * A chunk at 44.1 kHz from the ring at the game's rate (Catmull-Rom). step is
- * source frames per output frame and *phase the position between two source
- * frames, both 16.16. Even at the AI's highest rate (step < 9.0) a chunk's
- * positions fit 32 bits.
- *
- * In fixed point (within 1 LSB rms of the float formula, at most 5): measured
- * on the PSP a chunk takes 227 us instead of 345 in floats -- the FPU's
- * conversions and latencies stalled -- which is 1% of the CPU, taken ahead
- * of the game, since this thread outranks it.
+ * Fills a chunk for an underrun. Silence would click going in and coming out, so the end of the last chunk
+ * is looped instead, fading out if the game stays behind. `last` is the last real chunk's buffer, which is
+ * still the hardware's until the call after this one returns.
  */
-static void fill_resampled(int16_t* chunk, uint32_t step, uint32_t* phase) {
-    uint32_t need = ((OUT_CHUNK * step + *phase) >> 16) + 4;
-    if (ring_fill() < need) {
-        /*
-         * Underrun. Silence would click going in and coming out, so the end of
-         * the last chunk is looped instead, fading out if the game stays behind.
-         */
-        note_underrun();
-        for (uint32_t i = 0; i < OUT_CHUNK; i++) {
-            if (sHistFill == 0) {
-                chunk[i * 2] = chunk[i * 2 + 1] = 0;
-                continue;
-            }
-            uint32_t k = i % sHistFill;
-            int32_t fade = 256 - (int32_t)(i >> 1);
-            if (fade < 0) {
-                fade = 0;
-            }
-            chunk[i * 2] = (int16_t)(sHist[k * 2] * fade >> 8);
-            chunk[i * 2 + 1] = (int16_t)(sHist[k * 2 + 1] * fade >> 8);
-        }
-        return;
+static void conceal(int16_t* chunk, const int16_t* last) {
+    if (sHistStale && last != NULL) {
+        const int16_t* tail = last + (OUT_CHUNK - CONCEAL_FRAMES) * 2;
+        /* The converter's cores wrote it: drop any copy this one's cache has. */
+        sceKernelDcacheWritebackInvalidateRange(tail, CONCEAL_FRAMES * 4);
+        memcpy(sHist, tail, sizeof(sHist));
+        sHistFill = CONCEAL_FRAMES;
+        sHistStale = false;
     }
-    uint32_t rd = sRingRead;
-    uint32_t pos = *phase;
     for (uint32_t i = 0; i < OUT_CHUNK; i++) {
-        uint32_t idx = pos >> 16;
-        /* The weights of the four source frames around the position, 1.0 = 32768,
-         * for both channels. t, t2 and t3 are 0.16 fixed point (t^2 < 2^32). */
-        int32_t t = (int32_t)(pos & 0xFFFF);
-        int32_t t2 = (int32_t)(((uint32_t)t * (uint32_t)t) >> 16);
-        int32_t t3 = (int32_t)(((uint32_t)t2 * (uint32_t)t) >> 16);
-        int32_t w0 = (2 * t2 - t3 - t) >> 2;
-        int32_t w1 = ((3 * t3 - 5 * t2) >> 2) + 32768;
-        int32_t w2 = (t + 4 * t2 - 3 * t3) >> 2;
-        int32_t w3 = (t3 - t2) >> 2;
-        const int16_t* p0 = &sRing[((rd + idx - 1) & RING_MASK) * 2];
-        const int16_t* p1 = &sRing[((rd + idx) & RING_MASK) * 2];
-        const int16_t* p2 = &sRing[((rd + idx + 1) & RING_MASK) * 2];
-        const int16_t* p3 = &sRing[((rd + idx + 2) & RING_MASK) * 2];
-        for (int ch = 0; ch < 2; ch++) {
-            /* Summed in 64 bits only so that the compiler chains multiply-adds
-             * (madd): the weights' magnitudes add up to at most 1.25, so the sum
-             * fits 32 bits and its low word is the result. */
-            int64_t acc = (int64_t)w0 * p0[ch];
-            acc += (int64_t)w1 * p1[ch];
-            acc += (int64_t)w2 * p2[ch];
-            acc += (int64_t)w3 * p3[ch];
-            int32_t v = (int32_t)acc >> 15;
-            chunk[i * 2 + ch] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        if (sHistFill == 0) {
+            chunk[i * 2] = chunk[i * 2 + 1] = 0;
+            continue;
         }
-        pos += step;
+        uint32_t k = i % sHistFill;
+        int32_t fade = 256 - (int32_t)(i >> 1);
+        if (fade < 0) {
+            fade = 0;
+        }
+        chunk[i * 2] = (int16_t)(sHist[k * 2] * fade >> 8);
+        chunk[i * 2 + 1] = (int16_t)(sHist[k * 2 + 1] * fade >> 8);
     }
-    uint32_t used = pos >> 16;
-    sRingRead = rd + used;
-    *phase = pos & 0xFFFF;
-    sConsumed += used;
-    memcpy(sHist, chunk + (OUT_CHUNK - CONCEAL_FRAMES) * 2, sizeof(sHist));
-    sHistFill = CONCEAL_FRAMES;
 }
 
 /*
- * Plays the ring. The output runs at the DAC's own 44.1 kHz, resampled here,
- * which keeps the firmware's rate converter out of the path.
+ * Plays the ring. The output runs at the DAC's own 44.1 kHz, resampled by
+ * audio/resample.c, which keeps the firmware's rate converter out of the path.
  */
 static int output_thread(SceSize args, void* argp) {
     sceKernelWaitSema(sFreqSignal, 1, NULL);
@@ -331,15 +289,16 @@ static int output_thread(SceSize args, void* argp) {
     if (ret < 0) {
         return 0;
     }
-    uint32_t step = (uint32_t)(((uint64_t)freq << 16) / rate);
-    uint32_t phase = 0;
+    rt_rs_start(freq, rate);
     sChunkUs = (uint32_t)((uint64_t)OUT_CHUNK * 1000000 / rate);
     output_wav_open(rate);
 
     bool priming = true;
     uint32_t prime_start = sceKernelGetSystemTimeLow();
+    uint32_t n = 0;   /* the next chunk of the converted stream */
     for (;;) {
         int16_t* chunk = sOutBuf[sOutIndex];
+        rt_rs_sync();
         if (priming) {
             uint32_t avail = ring_fill();
             if (avail >= PRIME_FRAMES) {
@@ -355,16 +314,34 @@ static int output_thread(SceSize args, void* argp) {
                 continue;
             }
         }
-        fill_resampled(chunk, step, &phase);
-        output_wav_write(chunk, OUT_CHUNK, rate);
-        output_chunk(chunk);
+        uint32_t src_end;
+        const int16_t* ready = rt_rs_get_chunk(n, &src_end);
+        if (ready == NULL) {
+            note_underrun();
+            conceal(chunk, n > 0 ? rt_rs_chunk_buf(n - 1) : NULL);
+            output_wav_write(chunk, OUT_CHUNK, rate);
+            output_chunk(chunk);
+            /* The chunk before this one is finished with now. */
+            rt_rs_release(n);
+            continue;
+        }
+        sConsumed += src_end - sRingRead;
+        sRingRead = src_end;
+        sHistStale = true;
+        output_wav_write(ready, OUT_CHUNK, rate);
+        output_chunk(ready);
+        /* The hardware has taken this chunk, so the one before it is finished. */
+        rt_rs_release(n);
+        n++;
     }
     return 0;
 }
 
 void rt_audio_init(void) {
+    rt_rs_init();
     sFreqSignal = sceKernelCreateSema("rt_audio_freq", 0, 0, 1, NULL);
     SceUID thid = sceKernelCreateThread("rt_audio", output_thread, 0x12, 16 * 1024, PSP_THREAD_ATTR_USER, NULL);
+    sOutThread = thid;
     sceKernelStartThread(thid, 0, NULL);
 }
 
@@ -445,13 +422,23 @@ static void log_stats(void) {
 
     char me[32] = "";
     char dma[96] = "";
+    char rs[96] = "";
     rt_me_audio_report(me, sizeof(me));
+    rt_rs_report(rs, sizeof(rs));
+    /* What the output thread has cost the main CPU since the last line. */
+    static uint64_t sOutRunPrev = 0;
+    if (sOutThread >= 0) {
+        uint64_t run = rt_thread_cpu_us(sOutThread);
+        size_t l = strlen(rs);
+        snprintf(rs + l, sizeof(rs) - l, " out thread %u us", (unsigned)(run - sOutRunPrev));
+        sOutRunPrev = run;
+    }
     rt_dma_report(dma, sizeof(dma));
-    rt_log("audio: %u tasks, fill %u, underruns %u, overflows %u, bad opcodes %u, rom blocks read %u (%u ms)%s cpu %u, retraces lost %u | hw %u late/%u chunks, worst gap %u us (chunk %u us) | %s",
+    rt_log("audio: %u tasks, fill %u, underruns %u, overflows %u, bad opcodes %u, rom blocks read %u (%u ms)%s cpu %u, retraces lost %u | hw %u late/%u chunks, worst gap %u us (chunk %u us) | %s | %s",
            (unsigned)sTaskCount, (unsigned)ring_fill(), (unsigned)sUnderruns, (unsigned)sOverflows,
            (unsigned)asp_opcode_counts[31], (unsigned)rt_rom_block_loads(), (unsigned)(rt_rom_block_us() / 1000), me,
            (unsigned)sCpuTasks, (unsigned)rt_sched_vi_dropped(), (unsigned)sHwLate, (unsigned)sHwChunks,
-           (unsigned)sHwWorstGapUs, (unsigned)sChunkUs, dma);
+           (unsigned)sHwWorstGapUs, (unsigned)sChunkUs, rs, dma);
     sCpuTasks = 0;
     sHwLate = 0;
     sHwChunks = 0;
@@ -527,7 +514,7 @@ void func_800EFD40_jp(uint8_t* rdram, recomp_context* ctx) {
     uint32_t frames = ctx->r5 / 4;
     /* Waits if the Media Engine could still be filling this buffer. */
     rt_me_audio_before_read(addr);
-    uint32_t room = RING_FRAMES - 1 - ring_fill();
+    uint32_t room = RS_RING_FRAMES - 1 - rt_rs_unread();
     if (frames > room) {
         sOverflows++;
         frames = room;
@@ -536,14 +523,14 @@ void func_800EFD40_jp(uint8_t* rdram, recomp_context* ctx) {
     const volatile uint32_t* me_src = rt_me_audio_ready()
             ? (const volatile uint32_t*)(0x40000000u | (uintptr_t)(g_rdram + (addr & RDRAM_MASK)))
             : NULL;
-    uint32_t wr = sRingWrite;
+    uint32_t wr = rt_rs_written();
     for (uint32_t i = 0; i < frames; i++) {
         uint32_t w = me_src != NULL ? me_src[i] : rd_w32(addr + 4 * i);
-        uint32_t k = (wr + i) & RING_MASK;
-        sRing[k * 2] = (int16_t)(w >> 16);
-        sRing[k * 2 + 1] = (int16_t)w;
+        uint32_t k = (wr + i) & RS_RING_MASK;
+        g_rs_ring[k * 2] = (int16_t)(w >> 16);
+        g_rs_ring[k * 2 + 1] = (int16_t)w;
     }
-    sRingWrite = wr + frames;
+    rt_rs_publish(wr, frames);
     sProduced += frames;
     sSubmitted++;
     ctx->r2 = 0;
@@ -573,3 +560,21 @@ void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 RT_STUB_RETURN(osAiGetStatus_recomp, 0)
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+/* The game's output rate (set once, at boot) and the state the audio microcode keeps between tasks. The
+ * Media Engine has nothing in hand (capture.c waits for it), and the sound queued for output is left behind. */
+void rt_audio_capture(RtCapture* c) {
+    uint32_t freq = sFrequency;
+    rt_cap_io(c, "AI  ", &freq, sizeof(freq));
+    if (rt_cap_saving(c)) {
+        sceKernelDcacheWritebackInvalidateRange(&g_asp, sizeof(g_asp));
+    }
+    rt_cap_io(c, "ASP ", &g_asp, offsetof(AspState, pad));
+    if (!rt_cap_saving(c)) {
+        g_asp.rdram = g_rdram;
+        sceKernelDcacheWritebackRange(&g_asp, sizeof(g_asp));
+        set_frequency(freq);
+    }
+}

@@ -23,6 +23,8 @@ typedef struct {
 } HostTimer;
 
 static HostTimer sTimers[MAX_TIMERS];
+/* The OSTimer of each active slot, 0 if free: what osSetTimer/osStopTimer scan (two cache lines, not twenty). */
+static uint32_t sTimerAddr[MAX_TIMERS];
 static SceUID sTimerLock = -1;
 static SceUID sTimerWake = -1;
 static uint64_t sStartUs = 0;
@@ -32,26 +34,67 @@ static uint64_t sStartUs = 0;
  * every retrace, the graph thread every frame -- and stops it again long
  * before it fires. Waking the timer thread for each of those, to work out
  * its next deadline, was two switches between PSP threads a time and 2% of
- * the CPU. So the thread never sleeps longer than TICK_US, and is only woken
- * for a timer due before it wakes anyway.
+ * the CPU. So nothing wakes it for a timer the retrace thread will see in
+ * time: every vblank rt_timer_vblank looks at the next deadline and wakes
+ * the timer thread if it comes before the following vblank. Between those
+ * the timer thread sleeps until a deadline that close, or until woken. If
+ * the vblanks stop (a capture, standby), osSetTimer wakes it as before.
  */
 static uint64_t sWakeAt = 0;   /* in the past while it is awake: it is about to look */
-#define TICK_US 16000
+#define VBLANK_US 16684        /* 59.94 Hz */
+#define VBLANK_SLACK_US 2000   /* how late a vblank's look may come */
+#define TICK_US 16000          /* the longest sleep while the vblanks don't come */
+/* When rt_timer_vblank next looks (0: it hasn't yet); a deadline before it needs the timer thread awake. */
+static uint64_t sNextVblankUs = 0;
 /* When the scheduler wants running game code interrupted (rt_timer_poke); 0: it doesn't. */
 static uint64_t sPokeAt = 0;
+
+/*
+ * sTimerLock as a "benaphore": a count of the threads that want the timers,
+ * and the semaphore only when one has to wait. osSetTimer runs about ninety
+ * times a second; as a semaphore pair the lock was 20 of its 32 us -- system
+ * calls into kernel code that is never in the cache -- though it is almost
+ * never contended. (One CPU: the count's ll/sc is all the atomicity needed.)
+ */
+static int32_t sTimerLockCount = 0;
+
+static void timer_lock(void) {
+    if (__atomic_fetch_add(&sTimerLockCount, 1, __ATOMIC_ACQUIRE) > 0) {
+        sceKernelWaitSema(sTimerLock, 1, NULL);
+    }
+}
+
+static void timer_unlock(void) {
+    if (__atomic_fetch_sub(&sTimerLockCount, 1, __ATOMIC_RELEASE) > 1) {
+        sceKernelSignalSema(sTimerLock, 1);
+    }
+}
 
 static uint64_t now_us(void) {
     return sceKernelGetSystemTimeWide();
 }
 
-/* N64 counter ticks since boot */
+/*
+ * N64 counter ticks since boot. 46875 ticks a millisecond is 375 / 8 a
+ * microsecond: a multiply and a shift, the same result as dividing by 1000
+ * (the game reads the counter often, and a 64-bit division is a libgcc call).
+ */
+_Static_assert(COUNTS_PER_SECOND / 1000000 * 8 + (COUNTS_PER_SECOND % 1000000) * 8 / 1000000 == 375, "375/8 ticks a us");
 static uint64_t os_time(void) {
     uint64_t elapsed = now_us() - sStartUs;
-    return (elapsed * (COUNTS_PER_SECOND / 1000)) / 1000;
+    return (elapsed * 375) >> 3;
 }
 
 static uint64_t counts_to_us(uint64_t counts) {
-    return (counts * 1000) / (COUNTS_PER_SECOND / 1000);
+    if (counts < 0x10000000u) {
+        return (uint32_t)counts * 8u / 375u; /* any timeout under 45 s: a 32-bit division */
+    }
+    return (counts * 8) / 375;
+}
+
+/* Whether the vblanks are coming: rt_timer_vblank looked within the last two periods. */
+static bool vblanks_running(uint64_t now) {
+    return sNextVblankUs != 0 && now < sNextVblankUs + VBLANK_US;
 }
 
 static int timer_thread(SceSize args, void* argp) {
@@ -59,7 +102,7 @@ static int timer_thread(SceSize args, void* argp) {
         uint64_t now = now_us();
         uint64_t next_fire = UINT64_MAX;
 
-        sceKernelWaitSema(sTimerLock, 1, NULL);
+        timer_lock();
         for (int i = 0; i < MAX_TIMERS; i++) {
             HostTimer* t = &sTimers[i];
             if (!t->active) {
@@ -74,6 +117,7 @@ static int timer_thread(SceSize args, void* argp) {
                     }
                 } else {
                     t->active = false;
+                    sTimerAddr[i] = 0;
                     continue;
                 }
             }
@@ -90,13 +134,16 @@ static int timer_thread(SceSize args, void* argp) {
             }
         }
         now = now_us();
-        if (next_fire == UINT64_MAX) {
+        if (vblanks_running(now)) {
+            /* Sleep until the deadline if the next vblank's look would be too late for it, else until woken. */
+            sWakeAt = next_fire < sNextVblankUs + VBLANK_SLACK_US ? next_fire : UINT64_MAX;
+        } else if (next_fire == UINT64_MAX) {
             sWakeAt = UINT64_MAX; /* no timers: sleep until one is set */
         } else {
             sWakeAt = next_fire < now + TICK_US ? next_fire : now + TICK_US;
         }
         uint64_t wake_at = sWakeAt;
-        sceKernelSignalSema(sTimerLock, 1);
+        timer_unlock();
 
         if (wake_at == UINT64_MAX) {
             sceKernelWaitSema(sTimerWake, 1, NULL);
@@ -110,24 +157,59 @@ static int timer_thread(SceSize args, void* argp) {
 
 void rt_timer_init(void) {
     sStartUs = now_us();
-    memset(sTimers, 0, sizeof(sTimers));
-    sTimerLock = sceKernelCreateSema("rt_timer_lock", 0, 1, 1, NULL);
+    sTimerLock = sceKernelCreateSema("rt_timer_lock", 0, 0, 64, NULL); /* the waits of timer_lock */
     sTimerWake = sceKernelCreateSema("rt_timer_wake", 0, 0, 1, NULL);
     SceUID thid = sceKernelCreateThread("rt_timer", timer_thread, 0x12, 16 * 1024, PSP_THREAD_ATTR_USER, NULL);
     sceKernelStartThread(thid, 0, NULL);
 }
 
-void rt_timer_poke(uint64_t at_us) {
+/* Something is due at at_us: true if that is before the timer thread next looks (it has to be woken then).
+ * The caller holds sTimerLock. */
+static bool due_before_wake_locked(uint64_t at_us) {
+    if (at_us >= sWakeAt) {
+        return false;
+    }
+    sWakeAt = at_us;
+    return true;
+}
+
+/* The same for a timer: one the next vblank's look will see in time needs nothing now. */
+static bool timer_needs_wake_locked(uint64_t at_us, uint64_t now) {
+    if (vblanks_running(now) && at_us >= sNextVblankUs + VBLANK_SLACK_US) {
+        return false;
+    }
+    return due_before_wake_locked(at_us);
+}
+
+/* Every vblank (vi.c): wakes the timer thread for a deadline before the next vblank's look. */
+void rt_timer_vblank(void) {
+    uint64_t now = now_us();
     bool wake = false;
-    sceKernelWaitSema(sTimerLock, 1, NULL);
-    if (sPokeAt == 0 || at_us < sPokeAt) {
-        sPokeAt = at_us;
-        if (at_us < sWakeAt) {
-            sWakeAt = at_us;
-            wake = true;
+    timer_lock();
+    sNextVblankUs = now + VBLANK_US;
+    uint64_t next = UINT64_MAX;
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (sTimerAddr[i] != 0 && sTimers[i].fire_at_us < next) {
+            next = sTimers[i].fire_at_us;
         }
     }
-    sceKernelSignalSema(sTimerLock, 1);
+    if (next < sNextVblankUs + VBLANK_SLACK_US) {
+        wake = due_before_wake_locked(next);
+    }
+    timer_unlock();
+    if (wake) {
+        sceKernelSignalSema(sTimerWake, 1);
+    }
+}
+
+void rt_timer_poke(uint64_t at_us) {
+    bool wake = false;
+    timer_lock();
+    if (sPokeAt == 0 || at_us < sPokeAt) {
+        sPokeAt = at_us;
+        wake = due_before_wake_locked(at_us);
+    }
+    timer_unlock();
     if (wake) {
         sceKernelSignalSema(sTimerWake, 1);
     }
@@ -137,8 +219,9 @@ void rt_timer_poke(uint64_t at_us) {
 static bool remove_timer_locked(uint32_t addr) {
     bool found = false;
     for (int i = 0; i < MAX_TIMERS; i++) {
-        if (sTimers[i].active && sTimers[i].addr == addr) {
+        if (sTimerAddr[i] == addr) {
             sTimers[i].active = false;
+            sTimerAddr[i] = 0;
             found = true;
         }
     }
@@ -148,8 +231,8 @@ static bool remove_timer_locked(uint32_t addr) {
 /* s32 osSetTimer(OSTimer* t, OSTime countdown, OSTime interval, OSMesgQueue* mq, OSMesg msg) */
 void osSetTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
     uint32_t addr = ctx->r4;
-    uint64_t countdown = ((uint64_t)ctx->r6 << 32) | ctx->r7;
-    uint64_t interval = ((uint64_t)rt_stack_arg(ctx, 4) << 32) | rt_stack_arg(ctx, 5);
+    uint64_t countdown = rt_u64(ctx->r6, ctx->r7);
+    uint64_t interval = rt_u64(rt_stack_arg(ctx, 4), rt_stack_arg(ctx, 5));
     uint32_t mq = rt_stack_arg(ctx, 6);
     uint32_t msg = rt_stack_arg(ctx, 7);
 
@@ -163,11 +246,11 @@ void osSetTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
 
     uint64_t delay = countdown != 0 ? countdown : interval;
 
-    sceKernelWaitSema(sTimerLock, 1, NULL);
+    timer_lock();
     remove_timer_locked(addr);
     int slot = -1;
     for (int i = 0; i < MAX_TIMERS; i++) {
-        if (!sTimers[i].active) {
+        if (sTimerAddr[i] == 0) {
             slot = i;
             break;
         }
@@ -175,19 +258,17 @@ void osSetTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
     bool wake = false;
     if (slot >= 0) {
         HostTimer* t = &sTimers[slot];
+        uint64_t now = now_us();
         t->active = true;
         t->addr = addr;
-        t->fire_at_us = now_us() + counts_to_us(delay);
+        t->fire_at_us = now + counts_to_us(delay);
         t->interval_us = counts_to_us(interval);
         t->mq = mq;
         t->msg = msg;
-        if (t->fire_at_us < sWakeAt) {
-            /* due before the timer thread next looks */
-            sWakeAt = t->fire_at_us;
-            wake = true;
-        }
+        sTimerAddr[slot] = addr;
+        wake = timer_needs_wake_locked(t->fire_at_us, now);
     }
-    sceKernelSignalSema(sTimerLock, 1);
+    timer_unlock();
     if (wake) {
         sceKernelSignalSema(sTimerWake, 1);
     }
@@ -199,9 +280,9 @@ void osSetTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void osStopTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
-    sceKernelWaitSema(sTimerLock, 1, NULL);
+    timer_lock();
     bool found = remove_timer_locked(ctx->r4);
-    sceKernelSignalSema(sTimerLock, 1);
+    timer_unlock();
     ctx->r2 = found ? 0 : (gpr)-1;
 }
 
@@ -211,8 +292,7 @@ void osStopTimer_recomp(uint8_t* rdram, recomp_context* ctx) {
  * message; the scheduler does the same without either (rt_sched_sleep).
  */
 void csleep(uint8_t* rdram, recomp_context* ctx) {
-    uint64_t counts = ((uint64_t)ctx->r4 << 32) | ctx->r5;
-    rt_sched_sleep(counts_to_us(counts));
+    rt_sched_sleep(counts_to_us(rt_u64(ctx->r4, ctx->r5)));
 }
 
 void osGetTime_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -223,4 +303,46 @@ void osGetTime_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 void osGetCount_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = (gpr)os_time();
+}
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+void rt_timer_hold(bool hold) {
+    if (hold) {
+        timer_lock();
+    } else {
+        timer_unlock();
+    }
+}
+
+/* The timers, due as long after the resume as they were after the capture; the game's clock goes on from where it was. */
+void rt_timer_capture(RtCapture* c) {
+    static struct {
+        HostTimer timers[MAX_TIMERS]; /* fire_at_us: us after the capture */
+        uint64_t elapsed_us;          /* since the game's clock started */
+    } s;
+    uint64_t now = now_us();
+    if (rt_cap_saving(c)) {
+        /* (the caller holds the timers: rt_timer_hold) */
+        memcpy(s.timers, sTimers, sizeof(s.timers));
+        for (int i = 0; i < MAX_TIMERS; i++) {
+            s.timers[i].fire_at_us = sTimers[i].fire_at_us > now ? sTimers[i].fire_at_us - now : 0;
+        }
+        s.elapsed_us = now - sStartUs;
+    }
+    rt_cap_io(c, "TIME", &s, sizeof(s));
+    if (rt_cap_saving(c)) {
+        return;
+    }
+    timer_lock();
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        sTimers[i] = s.timers[i];
+        sTimers[i].fire_at_us += now;
+        sTimerAddr[i] = sTimers[i].active ? sTimers[i].addr : 0;
+    }
+    sStartUs = now - s.elapsed_us;
+    sPokeAt = 0;
+    sWakeAt = 0;
+    timer_unlock();
+    sceKernelSignalSema(sTimerWake, 1);
 }

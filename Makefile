@@ -24,10 +24,11 @@ PPSSPP_GAME_DIR ?= $(HOME)/.config/ppsspp/PSP/GAME/AFPSP
 CC := psp-gcc
 
 GEN_SRCS := $(wildcard $(GEN)/funcs_*.c)
-RT_SRCS := $(wildcard runtime/src/*.c) $(wildcard runtime/src/gfx/*.c) $(wildcard runtime/src/audio/*.c)
+RT_DIRS := runtime/src runtime/src/audio runtime/src/english runtime/src/gfx
+RT_SRCS := $(foreach d,$(RT_DIRS),$(wildcard $(d)/*.c))
+RT_ASM_SRCS := $(foreach d,$(RT_DIRS),$(wildcard $(d)/*.S))
 
 GEN_OBJS := $(patsubst $(GEN)/%.c,$(BUILD)/gen/%.o,$(GEN_SRCS))
-RT_ASM_SRCS := $(wildcard runtime/src/audio/*.S)
 RT_OBJS := $(patsubst runtime/src/%.c,$(BUILD)/rt/%.o,$(RT_SRCS)) $(patsubst runtime/src/%.S,$(BUILD)/rt/%.o,$(RT_ASM_SRCS))
 
 INCLUDES := -Iruntime/include -Iruntime/src -I$(GEN) -I$(PSPDEV)/psp/include -I$(PSPSDK)/include
@@ -44,9 +45,10 @@ GEN_CFLAGS += -DRECOMP_MEM_CHECK
 endif
 RT_CFLAGS := $(COMMON_FLAGS) -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-format $(INCLUDES) $(DEFINES)
 
-LIBS := -lme-core -lpspsdk -lpspgum -lpspgu -lpsppower -lpsprtc -lpspaudio -lpspdisplay -lpspge -lpspctrl -lpspdebug -lm
+LIBS := -lme-core -lpspsdk -lpspgu -lpsppower -lpsprtc -lpspaudio -lpspdisplay -lpspge -lpspctrl -lm
+# --wrap=_sbrk: the game threads' stacks are reserved before the heap (runtime/src/sched.c).
 LDFLAGS := -L$(PSPDEV)/psp/lib -L$(PSPSDK)/lib -specs=$(PSPSDK)/lib/prxspecs \
-	-Wl,-q,-T$(PSPSDK)/lib/linkfile.prx -Wl,-zmax-page-size=128 -Wl,--gc-sections
+	-Wl,-q,-T$(PSPSDK)/lib/linkfile.prx -Wl,-zmax-page-size=128 -Wl,--gc-sections -Wl,--wrap=_sbrk
 
 ELF := $(BUILD)/$(TARGET).elf
 PRX := $(BUILD)/$(TARGET).prx
@@ -79,9 +81,15 @@ $(BUILD)/rt/%.o: runtime/src/%.S
 # sections.c includes the generated section table.
 $(BUILD)/rt/sections.o: $(GEN)/recomp_overlays.inl $(GEN)/funcs.h
 
+# Every link gets a new build id (runtime/src/capture.c: a capture can only be
+# resumed by the build that took it); build_id.txt has it for the tools.
 $(ELF): $(GEN_OBJS) $(RT_OBJS)
 	@echo "LD  $@"
-	@$(CC) $(LDFLAGS) $(PSPSDK)/lib/prxexports.o $(RT_OBJS) $(GEN_OBJS) $(LIBS) -o $@
+	@id=$$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n'); \
+	 echo "const unsigned int rt_build_id = 0x$$id;" > $(BUILD)/build_id.c; \
+	 echo "$$id" | tr a-f A-F > $(BUILD)/build_id.txt
+	@$(CC) $(RT_CFLAGS) -c $(BUILD)/build_id.c -o $(BUILD)/build_id.o
+	@$(CC) $(LDFLAGS) $(PSPSDK)/lib/prxexports.o $(RT_OBJS) $(BUILD)/build_id.o $(GEN_OBJS) $(LIBS) -o $@
 	@psp-fixup-imports $@
 
 $(PRX): $(ELF)

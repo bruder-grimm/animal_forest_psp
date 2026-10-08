@@ -37,13 +37,10 @@ typedef struct {
 } Col;
 
 typedef struct {
-    Col texel;   /* rgb = texel rgb probe, a = texel alpha probe */
-    float ta;    /* texel alpha when used in rgb slots */
-    Col other;   /* the texture the GE can't sample (constant stand-in or same as texel) */
-    float other_a;
+    Col texel;   /* the texture the GE samples (or a probe of it) */
+    Col other;   /* the texture it can't sample (a constant stand-in, or the same as texel) */
     int bound;   /* 0: TEXEL0 is `texel`, 1: TEXEL1 is `texel` */
     Col shade;
-    float sa;    /* shade alpha when used in rgb slots */
     Col prim, env;
     float prim_lod;
 } CombInputs;
@@ -52,11 +49,9 @@ static float unpack_ch(uint32_t color, int ch) {
     return ((color >> (24 - 8 * ch)) & 0xFF) / 255.0f;
 }
 
-/* Colour input a/b/d selectors */
+/* TEXEL0's and TEXEL1's channel ch (3: alpha) */
 #define TEX0(in, ch) ((in)->bound == 0 ? (in)->texel.c[ch] : (in)->other.c[ch])
 #define TEX1(in, ch) ((in)->bound == 1 ? (in)->texel.c[ch] : (in)->other.c[ch])
-#define TEX0A(in) ((in)->bound == 0 ? (in)->ta : (in)->other_a)
-#define TEX1A(in) ((in)->bound == 1 ? (in)->ta : (in)->other_a)
 
 static float cc_abd(int sel, int ch, const CombInputs* in, float combined, bool is_a, bool is_d) {
     switch (sel) {
@@ -82,10 +77,10 @@ static float cc_c(int sel, int ch, const CombInputs* in, float combined, float c
         case 5: return in->env.c[ch];
         case 6: return 0.0f;  /* SCALE */
         case 7: return combined_a;
-        case 8: return TEX0A(in);
-        case 9: return TEX1A(in);
+        case 8: return TEX0(in, 3);
+        case 9: return TEX1(in, 3);
         case 10: return in->prim.c[3];
-        case 11: return in->sa;
+        case 11: return in->shade.c[3];
         case 12: return in->env.c[3];
         case 13: return 0.0f; /* LOD fraction */
         case 14: return in->prim_lod;
@@ -96,8 +91,8 @@ static float cc_c(int sel, int ch, const CombInputs* in, float combined, float c
 static float ac_abd(int sel, const CombInputs* in, float combined) {
     switch (sel) {
         case 0: return combined;
-        case 1: return in->bound == 0 ? in->texel.c[3] : in->other.c[3];
-        case 2: return in->bound == 1 ? in->texel.c[3] : in->other.c[3];
+        case 1: return TEX0(in, 3);
+        case 2: return TEX1(in, 3);
         case 3: return in->prim.c[3];
         case 4: return in->shade.c[3];
         case 5: return in->env.c[3];
@@ -109,8 +104,8 @@ static float ac_abd(int sel, const CombInputs* in, float combined) {
 static float ac_c(int sel, const CombInputs* in, float combined) {
     switch (sel) {
         case 0: return 0.0f; /* LOD fraction */
-        case 1: return in->bound == 0 ? in->texel.c[3] : in->other.c[3];
-        case 2: return in->bound == 1 ? in->texel.c[3] : in->other.c[3];
+        case 1: return TEX0(in, 3);
+        case 2: return TEX1(in, 3);
         case 3: return in->prim.c[3];
         case 4: return in->shade.c[3];
         case 5: return in->env.c[3];
@@ -119,20 +114,31 @@ static float ac_c(int sel, const CombInputs* in, float combined) {
     }
 }
 
-static void eval_combiner(const CombInputs* in, float* out_rgb, float* out_a) {
+/* The combiner's inputs per cycle: (A - B) * C + D for the colour and for the alpha. */
+typedef struct {
+    int rgb_a[2], rgb_b[2], rgb_c[2], rgb_d[2];
+    int alpha_a[2], alpha_b[2], alpha_c[2], alpha_d[2];
+} CombinerSels;
+
+static void decode_combiner(CombinerSels* sel) {
     uint32_t w0 = gRdp.combine0;
     uint32_t w1 = gRdp.combine1;
-    int ca[2] = { (w0 >> 20) & 0xF, (w0 >> 5) & 0xF };
-    int cc[2] = { (w0 >> 15) & 0x1F, (w0 >> 0) & 0x1F };
-    int cb[2] = { (w1 >> 28) & 0xF, (w1 >> 24) & 0xF };
-    int cd[2] = { (w1 >> 15) & 0x7, (w1 >> 6) & 0x7 };
-    int aa[2] = { (w0 >> 12) & 0x7, (w1 >> 21) & 0x7 };
-    int ac[2] = { (w0 >> 9) & 0x7, (w1 >> 18) & 0x7 };
-    int ab[2] = { (w1 >> 12) & 0x7, (w1 >> 3) & 0x7 };
-    int ad[2] = { (w1 >> 9) & 0x7, (w1 >> 0) & 0x7 };
+    *sel = (CombinerSels){
+        .rgb_a = { (w0 >> 20) & 0xF, (w0 >> 5) & 0xF },
+        .rgb_b = { (w1 >> 28) & 0xF, (w1 >> 24) & 0xF },
+        .rgb_c = { (w0 >> 15) & 0x1F, (w0 >> 0) & 0x1F },
+        .rgb_d = { (w1 >> 15) & 0x7, (w1 >> 6) & 0x7 },
+        .alpha_a = { (w0 >> 12) & 0x7, (w1 >> 21) & 0x7 },
+        .alpha_b = { (w1 >> 12) & 0x7, (w1 >> 3) & 0x7 },
+        .alpha_c = { (w0 >> 9) & 0x7, (w1 >> 18) & 0x7 },
+        .alpha_d = { (w1 >> 9) & 0x7, (w1 >> 0) & 0x7 },
+    };
+}
 
-    bool two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
-    int cycles = two_cycle ? 2 : 1;
+static void eval_combiner(const CombInputs* in, float* out_rgb, float* out_a) {
+    CombinerSels sel;
+    decode_combiner(&sel);
+    int cycles = rdp_two_cycle() ? 2 : 1;
 
     float comb[3] = { 0, 0, 0 };
     float comb_a = 0;
@@ -146,16 +152,16 @@ static void eval_combiner(const CombInputs* in, float* out_rgb, float* out_a) {
         }
         float next[3];
         for (int ch = 0; ch < 3; ch++) {
-            float a = cc_abd(ca[cyc], ch, in, comb[ch], true, false);
-            float b = cc_abd(cb[cyc], ch, in, comb[ch], false, false);
-            float c = cc_c(cc[cyc], ch, in, comb[ch], comb_a);
-            float d = cc_abd(cd[cyc], ch, in, comb[ch], false, true);
+            float a = cc_abd(sel.rgb_a[cyc], ch, in, comb[ch], true, false);
+            float b = cc_abd(sel.rgb_b[cyc], ch, in, comb[ch], false, false);
+            float c = cc_c(sel.rgb_c[cyc], ch, in, comb[ch], comb_a);
+            float d = cc_abd(sel.rgb_d[cyc], ch, in, comb[ch], false, true);
             next[ch] = (a - b) * c + d;
         }
-        float a = ac_abd(aa[cyc], in, comb_a);
-        float b = ac_abd(ab[cyc], in, comb_a);
-        float c = ac_c(ac[cyc], in, comb_a);
-        float d = ac_abd(ad[cyc], in, comb_a);
+        float a = ac_abd(sel.alpha_a[cyc], in, comb_a);
+        float b = ac_abd(sel.alpha_b[cyc], in, comb_a);
+        float c = ac_c(sel.alpha_c[cyc], in, comb_a);
+        float d = ac_abd(sel.alpha_d[cyc], in, comb_a);
         comb_a = (a - b) * c + d;
         memcpy(comb, next, sizeof(comb));
     }
@@ -179,7 +185,6 @@ static void probe(float t, float ta, float s, float sa, float* rgb, float* a) {
     for (int ch = 0; ch < 4; ch++) {
         in.other.c[ch] = sProbeSame ? (ch == 3 ? ta : t) : sProbeOtherConst ? sProbeOther[ch] : 0.5f;
     }
-    in.other_a = sProbeSame ? ta : sProbeOtherConst ? sProbeOther[3] : 0.5f;
     for (int ch = 0; ch < 3; ch++) {
         in.texel.c[ch] = t;
         in.shade.c[ch] = s;
@@ -190,8 +195,6 @@ static void probe(float t, float ta, float s, float sa, float* rgb, float* a) {
     in.shade.c[3] = sa;
     in.prim.c[3] = unpack_ch(gRdp.prim, 3);
     in.env.c[3] = unpack_ch(gRdp.env, 3);
-    in.ta = ta;
-    in.sa = sa;
     in.prim_lod = gRdp.prim_lod_frac;
     eval_combiner(&in, rgb, a);
     if (sProbeBakedAlpha) {
@@ -202,6 +205,21 @@ static void probe(float t, float ta, float s, float sa, float* rgb, float* a) {
 /* Which tile the colour combine reads, for the texel bake below. */
 int gBakeRgbTile;
 
+/* The combiner evaluated on a pair of texels (TEXEL0, TEXEL1; RGBA8888) and a grey shade. */
+static void eval_pair(uint32_t t0, uint32_t t1, float shade, float shade_a, float* rgb, float* a) {
+    CombInputs in;
+    in.bound = 0;
+    for (int ch = 0; ch < 4; ch++) {
+        in.texel.c[ch] = (float)((t0 >> (8 * ch)) & 0xFF) / 255.0f;
+        in.other.c[ch] = (float)((t1 >> (8 * ch)) & 0xFF) / 255.0f;
+        in.shade.c[ch] = ch == 3 ? shade_a : shade;
+        in.prim.c[ch] = unpack_ch(gRdp.prim, ch);
+        in.env.c[ch] = unpack_ch(gRdp.env, ch);
+    }
+    in.prim_lod = gRdp.prim_lod_frac;
+    eval_combiner(&in, rgb, a);
+}
+
 /*
  * One texel of a TEXVAR_COMBINE2 texture: the colour of whichever tile the
  * colour combine reads, and the alpha combine evaluated on the pair. The
@@ -209,26 +227,10 @@ int gBakeRgbTile;
  * so the shade values here cannot affect the result.
  */
 static uint32_t bake_texel(uint32_t t0, uint32_t t1) {
-    CombInputs in;
-    in.bound = 0;
-    for (int ch = 0; ch < 4; ch++) {
-        in.texel.c[ch] = (float)((t0 >> (8 * ch)) & 0xFF) / 255.0f;
-        in.other.c[ch] = (float)((t1 >> (8 * ch)) & 0xFF) / 255.0f;
-        in.shade.c[ch] = 1.0f;
-        in.prim.c[ch] = unpack_ch(gRdp.prim, ch);
-        in.env.c[ch] = unpack_ch(gRdp.env, ch);
-    }
-    in.ta = in.texel.c[3];
-    in.other_a = in.other.c[3];
-    in.sa = 1.0f;
-    in.prim_lod = gRdp.prim_lod_frac;
     float rgb[3], a;
-    eval_combiner(&in, rgb, &a);
-    int32_t alpha = (int32_t)(a * 255.0f + 0.5f);
-    if (alpha < 0) alpha = 0;
-    if (alpha > 255) alpha = 255;
+    eval_pair(t0, t1, 1.0f, 1.0f, rgb, &a);
     uint32_t colour = (gBakeRgbTile == 0 ? t0 : t1) & 0x00FFFFFFu;
-    return colour | ((uint32_t)alpha << 24);
+    return colour | unit_to_byte(a) << 24;
 }
 
 /*
@@ -240,15 +242,13 @@ static uint32_t bake_texel(uint32_t t0, uint32_t t1) {
  */
 uint8_t gBakeAlpha[256 * 256];
 uint32_t gBakeAlphaValid[256 * 256 / 32];
-static uint32_t sBakeAlphaState[5] = { 1, 1, 1, 1, 1 };
+static CombinerState sBakeAlphaState = { 1, 1, 1, 1, 1 };
 
 /* Starts a bake: the table is kept while the combiner state it was made for lasts. */
 void gfx_bake_alpha_prepare(void) {
-    uint32_t lod;
-    memcpy(&lod, &gRdp.prim_lod_frac, 4);
-    const uint32_t state[5] = { gRdp.combine0, gRdp.combine1, gRdp.prim, gRdp.env, lod };
-    if (memcmp(state, sBakeAlphaState, sizeof(state)) != 0) {
-        memcpy(sBakeAlphaState, state, sizeof(state));
+    CombinerState state = rdp_combiner_state();
+    if (!combiner_state_equal(&state, &sBakeAlphaState)) {
+        sBakeAlphaState = state;
         memset(gBakeAlphaValid, 0, sizeof(gBakeAlphaValid));
     }
 }
@@ -282,28 +282,6 @@ static bool tiles_bakeable(int a, int b, int* base_out, float* ratio_x, float* o
  *     where S*X + Y saturates, and the second pass isn't fogged.)
  * Texels are memoised per combiner state: scrolling rebakes every frame.
  */
-static void split_eval(uint32_t t0, uint32_t t1, float shade, float shade_a, float* rgb, float* a) {
-    CombInputs in;
-    in.bound = 0;
-    for (int ch = 0; ch < 4; ch++) {
-        in.texel.c[ch] = (float)((t0 >> (8 * ch)) & 0xFF) / 255.0f;
-        in.other.c[ch] = (float)((t1 >> (8 * ch)) & 0xFF) / 255.0f;
-        in.shade.c[ch] = ch == 3 ? shade_a : shade;
-        in.prim.c[ch] = unpack_ch(gRdp.prim, ch);
-        in.env.c[ch] = unpack_ch(gRdp.env, ch);
-    }
-    in.ta = in.texel.c[3];
-    in.other_a = in.other.c[3];
-    in.sa = shade_a;
-    in.prim_lod = gRdp.prim_lod_frac;
-    eval_combiner(&in, rgb, a);
-}
-
-static inline uint32_t pack_unit(float v, int ch) {
-    int32_t i = (int32_t)(v * 255.0f + 0.5f);
-    i = i < 0 ? 0 : i > 255 ? 255 : i;
-    return (uint32_t)i << (8 * ch);
-}
 
 /*
  * Memo of split texels (gfx_bake_split_lookup in gfx_internal.h). Entries are
@@ -314,17 +292,15 @@ static inline uint32_t pack_unit(float v, int ch) {
  */
 SplitMemo gSplitMemo[SPLIT_MEMO];
 uint8_t gSplitTag[SPLIT_MEMO]; /* 0: empty, else state index + 1, and the kind in bit 7 */
-static uint32_t sSplitStates[SPLIT_STATES][5];
+static CombinerState sSplitStates[SPLIT_STATES];
 static int sSplitStateCount = 0, sSplitStateNext = 0;
 
 /* Starts a bake: the tag its texels carry in the memo (kind and current combiner state). */
 uint8_t gfx_bake_split_prepare(int kind) {
-    uint32_t lod;
-    memcpy(&lod, &gRdp.prim_lod_frac, 4);
-    const uint32_t st[5] = { gRdp.combine0, gRdp.combine1, gRdp.prim, gRdp.env, lod };
+    CombinerState st = rdp_combiner_state();
     int si = -1;
     for (int i = 0; i < sSplitStateCount && si < 0; i++) {
-        if (memcmp(st, sSplitStates[i], sizeof(st)) == 0) {
+        if (combiner_state_equal(&st, &sSplitStates[i])) {
             si = i;
         }
     }
@@ -341,20 +317,24 @@ uint8_t gfx_bake_split_prepare(int kind) {
                 }
             }
         }
-        memcpy(sSplitStates[si], st, sizeof(st));
+        sSplitStates[si] = st;
     }
     return (uint8_t)((si + 1) | (kind == BAKE_X ? 0x80 : 0));
 }
 
 uint32_t gfx_bake_split_fill(uint32_t t0, uint32_t t1, uint8_t tag, uint32_t h) {
     float c0[3], c1[3], a;
-    split_eval(t0, t1, 0.0f, 1.0f, c0, &a);
-    uint32_t v = pack_unit(a, 3);
+    eval_pair(t0, t1, 0.0f, 1.0f, c0, &a);
+    uint32_t v = unit_to_byte(a) << 24;
     if (tag & 0x80) {
-        split_eval(t0, t1, 1.0f, 1.0f, c1, &a);
-        for (int ch = 0; ch < 3; ch++) v |= pack_unit(c1[ch] - c0[ch], ch);
+        eval_pair(t0, t1, 1.0f, 1.0f, c1, &a);
+        for (int ch = 0; ch < 3; ch++) {
+            v |= unit_to_byte(c1[ch] - c0[ch]) << (8 * ch);
+        }
     } else {
-        for (int ch = 0; ch < 3; ch++) v |= pack_unit(c0[ch], ch);
+        for (int ch = 0; ch < 3; ch++) {
+            v |= unit_to_byte(c0[ch]) << (8 * ch);
+        }
     }
     gSplitTag[h] = tag;
     gSplitMemo[h].t0 = t0;
@@ -365,8 +345,8 @@ uint32_t gfx_bake_split_fill(uint32_t t0, uint32_t t1, uint8_t tag, uint32_t h) 
 
 typedef struct {
     bool valid;
-    uint32_t c0, c1, prim, env, lod;
-    uint8_t two_cycle;
+    CombinerState state;
+    bool two_cycle;
     bool ok, xconst, yzero;
     float x[3];
 } SplitDecision;
@@ -384,10 +364,10 @@ static void split_decide(SplitDecision* d) {
         uint32_t t0 = g0 | g0 << 8 | g0 << 16 | a0 << 24;
         uint32_t t1 = g1 | g1 << 8 | g1 << 16 | a1 << 24;
         float c0[3], ch[3], c1[3], cs[3], za, zb, zc, zs;
-        split_eval(t0, t1, 0.0f, 1.0f, c0, &za);
-        split_eval(t0, t1, 0.5f, 1.0f, ch, &zb);
-        split_eval(t0, t1, 1.0f, 1.0f, c1, &zc);
-        split_eval(t0, t1, 0.5f, 0.0f, cs, &zs); /* shade alpha must not matter */
+        eval_pair(t0, t1, 0.0f, 1.0f, c0, &za);
+        eval_pair(t0, t1, 0.5f, 1.0f, ch, &zb);
+        eval_pair(t0, t1, 1.0f, 1.0f, c1, &zc);
+        eval_pair(t0, t1, 0.5f, 0.0f, cs, &zs); /* shade alpha must not matter */
         if (nz(za - zb) || nz(za - zc) || nz(za - zs)) {
             return; /* the alpha reads the shade */
         }
@@ -415,20 +395,14 @@ static bool try_split(CombinerFit* fit) {
         return false;
     }
     static SplitDecision cache[32];
-    uint32_t lod;
-    memcpy(&lod, &gRdp.prim_lod_frac, 4);
-    uint8_t two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
-    uint32_t h = (gRdp.combine0 * 2654435761u ^ gRdp.combine1 * 2246822519u ^ gRdp.prim * 3266489917u ^ gRdp.env ^
-                  lod * 668265263u ^ two_cycle) >> 27;
+    CombinerState st = rdp_combiner_state();
+    bool two_cycle = rdp_two_cycle();
+    uint32_t h = (st.c0 * 2654435761u ^ st.c1 * 2246822519u ^ st.prim * 3266489917u ^ st.env ^ st.lod * 668265263u ^
+                  (uint32_t)two_cycle) >> 27;
     SplitDecision* d = &cache[h];
-    if (!d->valid || d->c0 != gRdp.combine0 || d->c1 != gRdp.combine1 || d->prim != gRdp.prim || d->env != gRdp.env ||
-        d->lod != lod || d->two_cycle != two_cycle) {
+    if (!d->valid || !combiner_state_equal(&d->state, &st) || d->two_cycle != two_cycle) {
         d->valid = true;
-        d->c0 = gRdp.combine0;
-        d->c1 = gRdp.combine1;
-        d->prim = gRdp.prim;
-        d->env = gRdp.env;
-        d->lod = lod;
+        d->state = st;
         d->two_cycle = two_cycle;
         split_decide(d);
     }
@@ -481,23 +455,18 @@ static bool try_split(CombinerFit* fit) {
  * tile, bit 1: the tile after it. In the second cycle of a 2-cycle combiner
  * the RDP feeds TEXEL0 from the second tile and TEXEL1 from the first. */
 static int combiner_texture_use(void) {
-    uint32_t w0 = gRdp.combine0, w1 = gRdp.combine1;
-    /* per cycle: rgb a, b, c, d, alpha a, b, c, d */
-    int sels[2][8] = {
-        { (w0 >> 20) & 0xF, (w1 >> 28) & 0xF, (w0 >> 15) & 0x1F, (w1 >> 15) & 0x7,
-          (w0 >> 12) & 0x7, (w1 >> 12) & 0x7, (w0 >> 9) & 0x7, (w1 >> 9) & 0x7 },
-        { (w0 >> 5) & 0xF, (w1 >> 24) & 0xF, w0 & 0x1F, (w1 >> 6) & 0x7,
-          (w1 >> 21) & 0x7, (w1 >> 3) & 0x7, (w1 >> 18) & 0x7, w1 & 0x7 },
-    };
-    bool two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
+    CombinerSels sel;
+    decode_combiner(&sel);
     int use = 0;
-    for (int cyc = 0; cyc < (two_cycle ? 2 : 1); cyc++) {
+    for (int cyc = 0; cyc < (rdp_two_cycle() ? 2 : 1); cyc++) {
         int t0 = cyc == 0 ? 1 : 2;
         int t1 = cyc == 0 ? 2 : 1;
+        /* (the colour's C can also be a texture's alpha: 8 TEXEL0, 9 TEXEL1) */
+        const int sels[8] = { sel.rgb_a[cyc], sel.rgb_b[cyc], sel.rgb_c[cyc], sel.rgb_d[cyc],
+                              sel.alpha_a[cyc], sel.alpha_b[cyc], sel.alpha_c[cyc], sel.alpha_d[cyc] };
         for (int i = 0; i < 8; i++) {
-            int sel = sels[cyc][i];
-            if (sel == 1 || (i == 2 && sel == 8)) use |= t0;
-            if (sel == 2 || (i == 2 && sel == 9)) use |= t1;
+            if (sels[i] == 1 || (i == 2 && sels[i] == 8)) use |= t0;
+            if (sels[i] == 2 || (i == 2 && sels[i] == 9)) use |= t1;
         }
     }
     return use;
@@ -837,10 +806,9 @@ int gfx_pin_signature(void) {
     return (tile_pinned(gRsp.tex_tile, e) ? 1 : 0) | (tile_pinned(gRsp.tex_tile + 1, e) ? 2 : 0);
 }
 
-static void classify_combiner_impl(CombinerFit* fit);
-
-void gfx_classify_combiner(CombinerFit* fit) {
-    classify_combiner_impl(fit);
+/* Does the current combiner read both texture tiles? (Its fit then depends on the tiles and the triangle.) */
+bool gfx_combiner_reads_two_textures(void) {
+    return combiner_texture_use() == 3;
 }
 
 static void fit_from_probes(CombinerFit* fit);
@@ -873,7 +841,7 @@ static void cached_fit(CombinerFit* fit) {
     key.prim = gRdp.prim;
     key.env = gRdp.env;
     key.lod = gRdp.prim_lod_frac;
-    key.two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
+    key.two_cycle = rdp_two_cycle();
     key.bound = (uint8_t)sProbeBound;
     key.same = sProbeSame;
     key.other_const = sProbeOtherConst;
@@ -914,7 +882,7 @@ static void cached_fit(CombinerFit* fit) {
     fit->tex_tile = tex_tile;
 }
 
-static void classify_combiner_impl(CombinerFit* fit) {
+void gfx_classify_combiner(CombinerFit* fit) {
     int use = combiner_texture_use();
     sProbeBound = (use == 2) ? 1 : 0;
     sProbeSame = !(use & 1) || !(use & 2) || tiles_share_image(gRsp.tex_tile, gRsp.tex_tile + 1);
@@ -1006,8 +974,8 @@ static bool shade_times_lerp(const float p0[3], const float kT[3], const float k
         if (l < -0.002f || l > 1.002f || h < -0.002f || h > 1.002f) {
             return false;
         }
-        lo |= (uint32_t)(int)((l < 0.0f ? 0.0f : l > 1.0f ? 1.0f : l) * 255.0f + 0.5f) << (8 * ch);
-        hi |= (uint32_t)(int)((h < 0.0f ? 0.0f : h > 1.0f ? 1.0f : h) * 255.0f + 0.5f) << (8 * ch);
+        lo |= unit_to_byte(l) << (8 * ch);
+        hi |= unit_to_byte(h) << (8 * ch);
     }
     float mid[3], mid_a;
     probe(0.5f, 0.0f, 0.5f, 0.0f, mid, &mid_a);
@@ -1125,11 +1093,7 @@ static void fit_from_probes(CombinerFit* fit) {
         fit->mode = TEX_BLEND;
         uint32_t env = 0xFF000000;
         for (int ch = 0; ch < 3; ch++) {
-            float v = p0[ch] + kT[ch];
-            int iv = (int)(v * 255.0f + 0.5f);
-            if (iv < 0) iv = 0;
-            if (iv > 255) iv = 255;
-            env |= (uint32_t)iv << (8 * ch);
+            env |= unit_to_byte(p0[ch] + kT[ch]) << (8 * ch);
         }
         fit->env = env;
     } else if (!uses_ta_rgb && !sProbeBakedAlpha && shade_times_lerp(p0, kT, kS, kTS, kSa, kTSa, fit)) {

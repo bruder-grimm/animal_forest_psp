@@ -137,9 +137,7 @@ recomp_func_t* get_function(int32_t vram_signed) {
     g_indirect_calls++;
     g_last_indirect_vram = vram_signed;
     if (g_preempt_hint) {
-        g_preempt_hint = 0;
-        rt_process_external();
-        rt_check_preempt();
+        rt_preempt();
     }
     uint32_t vram = (uint32_t)vram_signed;
     FuncSlot* cached = &sCache[hash_vram(vram) & (CACHE_SIZE - 1)];
@@ -216,5 +214,37 @@ void recomp_overlay_load_hook(uint8_t* rdram, recomp_context* ctx) {
     sNumLoaded++;
 
     section_addresses[entry->index] = (int32_t)allocated;
+    memset(sCache, 0, sizeof(sCache));
+}
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+/* Where the game has loaded overlays, and the addresses relocations use. */
+void rt_sections_capture(RtCapture* c) {
+    static struct {
+        int32_t num_loaded;
+        struct {
+            uint32_t start, end, entry; /* entry: index in section_table */
+        } loaded[MAX_LOADED];
+    } s;
+    if (rt_cap_saving(c)) {
+        s.num_loaded = sNumLoaded;
+        for (int i = 0; i < sNumLoaded; i++) {
+            s.loaded[i].start = sLoaded[i].start;
+            s.loaded[i].end = sLoaded[i].end;
+            s.loaded[i].entry = (uint32_t)(sLoaded[i].entry - section_table);
+        }
+    }
+    rt_cap_io(c, "OVLS", &s, sizeof(s));
+    rt_cap_io(c, "SECT", section_addresses, num_sections * sizeof(int32_t));
+    if (rt_cap_saving(c)) {
+        return;
+    }
+    sNumLoaded = s.num_loaded;
+    for (int i = 0; i < sNumLoaded; i++) {
+        sLoaded[i].start = s.loaded[i].start;
+        sLoaded[i].end = s.loaded[i].end;
+        sLoaded[i].entry = &section_table[s.loaded[i].entry];
+    }
     memset(sCache, 0, sizeof(sCache));
 }

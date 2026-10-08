@@ -36,27 +36,23 @@ static SceUID sFileLock = -1;    /* guards sSnapshot and the file */
 static SceUID sPending = -1;     /* wakes the writer */
 static SceUID sWriter = -1;
 
-static const char* flash_path(char* out, size_t size) {
-    return rt_data_path("flash.bin", out, size);
+/* A game resumed from a capture saves to a file of its own: flash.bin is the player's. */
+static const char* flash_name(void) {
+    return rt_capture_resumed() ? "resume_flash.bin" : "flash.bin";
 }
 
 /* Writes sSnapshot to the file. The caller holds sFileLock. */
 static void write_snapshot(void) {
-    char path[256];
+    /* Written under a name of its own and renamed, so a power loss can't corrupt the save. */
     char tmp_path[256];
-    flash_path(path, sizeof(path));
-    rt_data_path("flash.tmp", tmp_path, sizeof(tmp_path));
-
-    /* Write to a temporary file and rename, so a power loss can't corrupt the save. */
     rt_io_begin();
-    SceUID fd = sceIoOpen(tmp_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    SceUID fd = rt_data_create("flash.tmp", tmp_path, sizeof(tmp_path));
     int written = -1;
     if (fd >= 0) {
         written = sceIoWrite(fd, sSnapshot, sizeof(sSnapshot));
         sceIoClose(fd);
         if (written == (int)sizeof(sSnapshot)) {
-            sceIoRemove(path);
-            sceIoRename(tmp_path, path);
+            rt_data_rename("flash.tmp", flash_name());
         }
     }
     rt_io_end();
@@ -90,15 +86,12 @@ static int writer_thread(SceSize args, void* argp) {
 }
 
 void rt_save_init(void) {
-    char path[256];
     memset(sImage, 0xFF, sizeof(sImage));
-    SceUID fd = sceIoOpen(flash_path(path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd >= 0) {
-        int got = sceIoRead(fd, sImage, sizeof(sImage));
-        sceIoClose(fd);
-        rt_log("flash: loaded %d bytes from %s", got, path);
+    int got = rt_data_read(flash_name(), sImage, sizeof(sImage));
+    if (got >= 0) {
+        rt_log("flash: loaded %d bytes from %s", got, flash_name());
     } else {
-        rt_log("flash: no save at %s, starting erased", path);
+        rt_log("flash: no save in %s, starting erased", flash_name());
     }
 
     sFileLock = sceKernelCreateSema("rt_save", 0, 1, 1, NULL);
@@ -228,3 +221,14 @@ void osFlashReadArray_recomp(uint8_t* rdram, recomp_context* ctx) {
     ctx->r2 = 0;
 }
 
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+/* The save as the game had it, and a page it has handed over and not yet written (osFlashWriteBuffer). */
+void rt_save_capture(RtCapture* c) {
+    rt_cap_io(c, "FLSH", sImage, sizeof(sImage));
+    rt_cap_io(c, "FLWB", sWriteBuffer, sizeof(sWriteBuffer));
+    if (!rt_cap_saving(c)) {
+        sChanges = sSnapshotOf = sSaved = 0;
+        sQuietTicks = 0;
+    }
+}

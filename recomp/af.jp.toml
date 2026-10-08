@@ -13,6 +13,9 @@ unpaired_lo16_warnings = false
 bss_section_suffix = "_bss"
 # Rebuild overlay HI16/LO16 relocations from the ROM's own .ovl tables.
 overlay_reloc_suffix = "_reloc"
+# GPRs as C locals in each function, relying on the MIPS calling convention
+# (RL_* in runtime/include/recomp_psp.h): about a quarter less code.
+register_locals = true
 # The game relocates overlays itself; the runtime only needs section load addresses.
 emit_section_relocs = false
 
@@ -25,8 +28,6 @@ function_sizes = [
 # Hand-written 6502 emulator with a custom calling convention (NES furniture).
 # Stubbed until it gets a native implementation.
 stubbed_sections = [".ovl_famicom_emu"]
-
-stubs = []
 
 # libultra functions not covered by N64Recomp's built-in lists that touch
 # hardware or OS state. The PSP runtime provides these.
@@ -47,6 +48,66 @@ ignored = [
     "csleep",
 ]
 
+# Hot game code the runtime does natively (runtime/src/native_math.c): the
+# matrix stack, trigonometry, keyframe interpolation and field-info lookups.
+# Each is called hundreds of times a frame and is cold in the instruction cache
+# every time; the native versions give bit-identical results. Not recompiled,
+# but kept in the function table (pointing at the runtime's) for indirect calls.
+native = [
+    "sins",
+    "coss",
+    "sin_s",
+    "cos_s",
+    "Matrix_push",
+    "Matrix_pull",
+    "Matrix_get",
+    "Matrix_put",
+    "Matrix_copy_MtxF",
+    "Matrix_mult",
+    "Matrix_translate",
+    "Matrix_scale",
+    "Matrix_RotateX",
+    "Matrix_RotateY",
+    "Matrix_RotateZ",
+    "Matrix_rotateXYZ",
+    "Matrix_softcv3_mult",
+    "Matrix_softcv3_load",
+    "_MtxF_to_Mtx",
+    "_Matrix_to_Mtx",
+    "Matrix_Position",
+    "Matrix_Position_Zero",
+    "Matrix_Position_VecX",
+    "Matrix_Position_VecY",
+    "Matrix_Position_VecZ",
+    "Matrix_MtxF_Position2",
+    "Matrix_MtxtoMtxF",
+    "Skin_Matrix_PrjMulVector",
+    "Skin_Matrix_MulVector",
+    "Skin_Matrix_MulMatrix",
+    "Skin_Matrix_SetUnitMatrix",
+    "Skin_Matrix_Copy",
+    "Skin_Matrix_SetScale",
+    "Skin_Matrix_SetTranslate",
+    "Skin_Matrix_SetRotateXyz_s",
+    "Skin_Matrix_SetRotateZxy_s",
+    "Skin_Matrix_SetSrtMatrix",
+    "Skin_Matrix_SetSRzxyTMatrix",
+    "Skin_Matrix_SetRtMatrix",
+    "Skin_Matrix_to_Mtx",
+    "cKF_HermitCalc",
+    "cKF_KeyCalc",
+    "mFI_CheckFieldData",
+    "mFI_GetBlockXMax",
+    "mFI_GetBlockZMax",
+    "mFI_GetBlockNum",
+    "mFI_BlockCheck",
+    "mFI_UtNumCheck",
+    "mFI_GetUtNumInBK",
+    "mFI_UtNum2BlockNum",
+    "mFI_UtNum2UtCol",
+    "mFI_Wpos2UtNum",
+]
+
 # The scheduler polls the RSP status register (0xA4040010) directly. Point
 # those reads at a runtime-owned word that always reads "halted"
 # (RT_SP_STATUS in runtime/src/rt.h): the runtime reports a task's end with
@@ -60,6 +121,13 @@ value = 0x3C118000 # lui $s1, 0x8000
 func = "func_800D7794_jp"
 vram = 0x800D77C0
 value = 0x3C118000 # lui $s1, 0x8000
+
+# Register each overlay's load address with the runtime before the game's
+# own loader copies and relocates it (stack args: vramStart, vramEnd,
+# allocatedRamAddr, ovlRelocs).
+[[patches.hook]]
+func = "Overlay_Load"
+text = "recomp_overlay_load_hook(rdram, ctx);"
 
 # --- English fan translation ("Animal Forest (U) [!]", md5 f827d11e...) ----------
 # That ROM is a data-only patch of the JP build: dmadata is byte-identical, boot and
@@ -100,192 +168,198 @@ vram = 0x80AA0F5C
 value = 0x35880078 # ori $t0, $t4, 0x78 (was 0xFF)
 # [fan-translation-end]
 
+# --- The game in English (runtime/src/english/, hooks named rt_en_*) -------------
+
 # The translation left the string table's date and time units in Japanese
 # ("9がつ25にち2026ねん", "ごご3じ11ふん"), which the N64 shows too. With the
-# English ROM these write "Sep 25, 2026" and "3:11pm" instead and return early
-# (runtime/src/strings_en.c); with any other ROM the game's own code runs.
+# English ROM or the GameCube dialogue these write "Sep 25, 2026" and "3:11pm"
+# (english/dates.c); with neither the game's own code runs.
 [[patches.hook]]
 func = "mString_Load_YearStringFromRom"
-text = "if (rt_str_year(rdram, ctx)) return;"
+text = "if (rt_en_year(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_MonthStringFromRom"
-text = "if (rt_str_month(rdram, ctx)) return;"
+text = "if (rt_en_month(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_DayStringFromRom"
-text = "if (rt_str_day(rdram, ctx)) return;"
+text = "if (rt_en_day(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_WeekStringFromRom"
-text = "if (rt_str_week(rdram, ctx)) return;"
+text = "if (rt_en_weekday(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_HourStringFromRom"
-text = "if (rt_str_hour(rdram, ctx)) return;"
+text = "if (rt_en_hour(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_MinStringFromRom"
-text = "if (rt_str_min(rdram, ctx)) return;"
+text = "if (rt_en_minute(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_SecStringFromRom"
-text = "if (rt_str_sec(rdram, ctx)) return;"
+text = "if (rt_en_second(rdram, ctx)) return;"
 
-# English dialogue converted from the GameCube release (runtime/src/text_en.c,
+# English dialogue converted from the GameCube release (english/dialogue.c,
 # tools/make_text_en.py): func_8009E558_jp loads one message into a window's
 # buffer; with text_en.bin present the hook fills it from that file instead.
 [[patches.hook]]
 func = "func_8009E558_jp"
-text = "if (rt_text_en_load(rdram, ctx)) return;"
+text = "if (rt_en_message(rdram, ctx)) return;"
 
 # ... and gives its ASCII letters proportional widths (func_8009028C_jp is
 # the font's character width).
 [[patches.hook]]
 func = "func_8009028C_jp"
-text = "if (rt_text_en_width(rdram, ctx)) return;"
+text = "if (rt_en_char_width(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "func_8009069C_jp"
-text = "if (rt_text_en_glyph(rdram, ctx)) return;"
+text = "if (rt_en_glyph(rdram, ctx)) return;"
 
 # English villager names, choices, strings and item names from the GameCube
-# release (runtime/src/names_en.c, tools/make_names_en.py). The four loaders
-# write the English string, or its first bytes and a token when it does not
-# fit the N64 buffer; the font's line drawing and string width, and the
-# message window's copies (after each length query, and the copy itself),
-# expand tokens again.
+# release (english/names.c, tools/make_names_en.py). The four loaders write the
+# English string, or its first bytes and a token when it does not fit the N64
+# buffer; the font's line drawing and string width, and the message window's
+# copies (after each length query, and the copy itself), expand tokens again.
 [[patches.hook]]
 func = "mNpc_LoadNpcNameString"
-text = "if (rt_names_villager(rdram, ctx)) return;"
+text = "if (rt_en_villager_name(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mChoice_Load_ChoseStringFromRom"
-text = "if (rt_names_choice(rdram, ctx)) return;"
+text = "if (rt_en_choice(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mString_Load_StringFromRom"
-text = "if (rt_names_string(rdram, ctx)) return;"
+text = "if (rt_en_string(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "func_80096710_jp"
-text = "if (rt_names_item(rdram, ctx)) return;"
+text = "if (rt_en_item_name(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "func_80090CC0_jp"
-text = "rt_names_draw(rdram, ctx);"
+text = "rt_en_draw_line(rdram, ctx);"
 
 [[patches.hook]]
 func = "mFont_GetStringWidth"
-text = "rt_names_width(rdram, ctx);"
+text = "rt_en_string_width(rdram, ctx);"
 
 [[patches.hook]]
 func = "func_8009EB44_jp"
-text = "rt_names_msg_copy(rdram, ctx);"
+text = "rt_en_msg_copy(rdram, ctx);"
 
 [[patches.hook]]
 func = "mMsg_CopyMonth"
 before_vram = 0x8009EF34
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
 
 [[patches.hook]]
 func = "mMsg_CopyWeek"
 before_vram = 0x8009EFBC
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
 
 [[patches.hook]]
 func = "mMsg_CopyTalkName"
 before_vram = 0x8009ED5C
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)ctx->r29 + 0x2C);"
 
 [[patches.hook]]
 func = "mMsg_CopyTail"
 before_vram = 0x8009EE18
-text = "rt_names_msg_tail(rdram, ctx, (uint32_t)MEM_W(0x28, ctx->r29));"
+text = "rt_en_msg_catchphrase(rdram, ctx, (uint32_t)MEM_W(0x28, ctx->r29));"
 
 [[patches.hook]]
 func = "mMsg_CopyFree"
 before_vram = 0x8009F298
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
 
 [[patches.hook]]
 func = "mMsg_CopyItem"
 before_vram = 0x8009F61C
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)MEM_W(0x24, ctx->r29));"
 
 [[patches.hook]]
 func = "mMsg_CopyCountryName"
 before_vram = 0x8009F4C0
-text = "rt_names_msg_len(rdram, ctx, (uint32_t)ctx->r29 + 0x38);"
+text = "rt_en_msg_length(rdram, ctx, (uint32_t)ctx->r29 + 0x38);"
 
 [[patches.hook]]
 func = "mMsg_CopyDetermination"
 before_vram = 0x8009F3EC
-text = "rt_names_msg_det(rdram, ctx, (uint32_t)MEM_W(0x30, ctx->r29) + 0x21C);"
+text = "rt_en_msg_determination(rdram, ctx, (uint32_t)MEM_W(0x30, ctx->r29) + 0x21C);"
 
-# Register each overlay's load address with the runtime before the game's
-# own loader copies and relocates it (stack args: vramStart, vramEnd,
-# allocatedRamAddr, ovlRelocs).
-[[patches.hook]]
-func = "Overlay_Load"
-text = "recomp_overlay_load_hook(rdram, ctx);"
-
-# English letters (runtime/src/names_en.c): the three loaders write the English
+# English letters (english/letters.c): the three loaders write the English
 # header, footer and a body of line tokens plus a record of the letter and its
-# names; the font's line drawing (rt_names_draw above) lays the body out again,
-# and the letter screen's footer is aligned by its drawn width.
+# names; the font's line drawing (rt_en_draw_line above) lays the body out
+# again, and the letter screen's footer is aligned by its drawn width.
 [[patches.hook]]
 func = "mHandbill_Load_HandbillFromRom"
-text = "if (rt_names_letter(rdram, ctx)) return;"
+text = "if (rt_en_letter(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mHandbill_Load_HandbillFromRom2"
-text = "if (rt_names_letter2(rdram, ctx)) return;"
+text = "if (rt_en_letter2(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "mHandbillz_load"
-text = "if (rt_names_letterz(rdram, ctx)) return;"
+text = "if (rt_en_villager_letter(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "func_808899E4_jp"
 before_vram = 0x80889A84
-text = "rt_names_letter_footer(rdram, ctx);"
+text = "rt_en_letter_footer(rdram, ctx);"
 
-# The pocket menu's letter tag, drawn in English (names_en.c; the option
-# labels are translated by rt_names_draw).
+# The pocket menu's letter tag, drawn in English (letters.c; the option
+# labels are translated by rt_en_draw_line).
 [[patches.hook]]
 func = "func_80877B0C_jp"
-text = "if (rt_names_mail_tag(rdram, ctx)) return;"
+text = "if (rt_en_letter_tag(rdram, ctx)) return;"
 
 # The Happy Room Academy's letters name the room's theme through a free string.
 [[patches.hook]]
 func = "mHandbill_Set_free_str"
-text = "rt_names_free_str(rdram, ctx);"
+text = "rt_en_free_string(rdram, ctx);"
 
-# The text entry keyboard opens on its ABC page (names_en.c).
+# The text entry keyboard opens on its ABC page (english/typing.c).
 [[patches.hook]]
 func = "func_8088587C_jp"
 before_vram = 0x8088595C
-text = "rt_names_keyboard(rdram, ctx);"
+text = "rt_en_keyboard_page(rdram, ctx);"
 
 # The line being typed: no boxes over spaces, and the cursor after the text as
 # drawn (the game places both at 12 units a character).
 [[patches.hook]]
 func = "func_80884514_jp"
 before_vram = 0x808847AC
-text = "rt_names_ledit_space(rdram, ctx);"
+text = "rt_en_typed_space(rdram, ctx);"
 
 [[patches.hook]]
 func = "func_80884514_jp"
 before_vram = 0x80884A58
-text = "rt_names_ledit_cursor(rdram, ctx);"
+text = "rt_en_typed_cursor(rdram, ctx);"
+
+# The same on the bulletin board: its cursor and "End" mark after the text as
+# drawn.
+[[patches.hook]]
+func = "func_8089562C_jp"
+before_vram = 0x8089582C
+text = "rt_en_board_cursor(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_8089542C_jp"
+before_vram = 0x808955CC
+text = "rt_en_board_end(rdram, ctx);"
 
 # Mr. Resetti's phrases: a letter's case does not count, and the rude words
 # are an English list.
 [[patches.hook]]
 func = "func_809B4BB8_jp"
-text = "if (rt_names_resetti_match(rdram, ctx)) return;"
+text = "if (rt_en_resetti_match(rdram, ctx)) return;"
 
 [[patches.hook]]
 func = "func_809B4C18_jp"
-text = "if (rt_names_resetti_rude(rdram, ctx)) return;"
+text = "if (rt_en_resetti_rude(rdram, ctx)) return;"

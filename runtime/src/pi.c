@@ -110,59 +110,45 @@ static void normalise(uint8_t* buf, uint32_t len) {
     }
 }
 
-bool rt_rom_open(void) {
-    static const char* names[] = { "baserom.z64", "baserom.n64", "baserom.v64", "rom.z64", "rom.n64", "rom.v64" };
-    char path[256];
-
-    sRomLock = sceKernelCreateSema("rt_rom", 0, 1, 1, NULL);
-
-    /* rom_path.txt names the ROM when it is not next to the EBOOT -- reading it
-     * over a slow link (PSPLink's host0:) stalls the game when it streams. */
-    SceUID fd = sceIoOpen(rt_data_path("rom_path.txt", path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd >= 0) {
-        char text[256];
-        int len = sceIoRead(fd, text, sizeof(text) - 1);
-        sceIoClose(fd);
-        if (len > 0) {
-            text[len] = '\0';
-            for (int i = 0; i < len; i++) {
-                if (text[i] == '\r' || text[i] == '\n') {
-                    text[i] = '\0';
-                    break;
-                }
-            }
-            sRomFd = sceIoOpen(text, PSP_O_RDONLY, 0);
-            if (sRomFd >= 0) {
-                snprintf(sRomPath, sizeof(sRomPath), "%s", text);
-                rt_log("ROM: %s (from rom_path.txt)", text);
-            } else {
-                rt_log("ROM: %s from rom_path.txt could not be opened", text);
-            }
-        }
-    }
-
-    for (size_t i = 0; sRomFd < 0 && i < RT_COUNT(names); i++) {
-        rt_data_path(names[i], path, sizeof(path));
-        sRomFd = sceIoOpen(path, PSP_O_RDONLY, 0);
-        if (sRomFd >= 0) {
-            snprintf(sRomPath, sizeof(sRomPath), "%s", path);
-            rt_log("ROM: %s", path);
-            break;
-        }
-    }
+/* Opens the ROM file at path. */
+static bool open_rom(const char* path, const char* how) {
+    sRomFd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (sRomFd < 0) {
         return false;
     }
+    snprintf(sRomPath, sizeof(sRomPath), "%s", path);
+    rt_log("ROM: %s%s", path, how);
+    return true;
+}
 
-    sRomSize = (uint32_t)sceIoLseek(sRomFd, 0, PSP_SEEK_END);
-    sceIoLseek(sRomFd, 0, PSP_SEEK_SET);
+static bool find_rom(void) {
+    /* rom_path.txt names the ROM when it is not next to the EBOOT -- reading it
+     * over a slow link (PSPLink's host0:) stalls the game when it streams. */
+    char text[256];
+    if (rt_data_read_text("rom_path.txt", text, sizeof(text)) > 0) {
+        text[strcspn(text, "\r\n")] = '\0';
+        if (open_rom(text, " (from rom_path.txt)")) {
+            return true;
+        }
+        rt_log("ROM: %s from rom_path.txt could not be opened", text);
+    }
+    static const char* const names[] = { "baserom.z64", "baserom.n64", "baserom.v64", "rom.z64", "rom.n64", "rom.v64" };
+    char path[256];
+    for (size_t i = 0; i < RT_COUNT(names); i++) {
+        if (open_rom(rt_data_path(names[i], path, sizeof(path)), "")) {
+            return true;
+        }
+    }
+    return false;
+}
 
-    /*
-     * Cache as much of the ROM as the machine can spare: the game streams
-     * audio samples and area data from all over it, and a block that has to be
-     * read again stalls whichever thread asked for it. On a 64 MB PSP the whole
-     * ROM fits, which removes the stalls entirely.
-     */
+/*
+ * Caches as much of the ROM as the machine can spare: the game streams audio
+ * samples and area data from all over it, and a block that has to be read
+ * again stalls whichever thread asked for it. On a 64 MB PSP the whole ROM
+ * fits, which removes the stalls entirely.
+ */
+static bool alloc_cache(void) {
     uint32_t free_mem = rt_free_memory();
     uint32_t budget = free_mem > ROM_CACHE_RESERVE ? free_mem - ROM_CACHE_RESERVE : 0;
     int blocks = (int)(budget / ROM_BLOCK_BYTES);
@@ -193,8 +179,13 @@ bool rt_rom_open(void) {
     memset(sSlotOf, 0xFF, (size_t)needed * sizeof(*sSlotOf));
     rt_log("ROM cache: %d blocks (%u KB%s)", blocks, (unsigned)((uint32_t)blocks * ROM_BLOCK_BYTES / 1024),
            blocks == needed ? ", the whole ROM" : "");
+    return true;
+}
 
+/* The file's byte order, from the first word of the header. */
+static bool read_byte_order(void) {
     uint8_t magic[4];
+    sceIoLseek(sRomFd, 0, PSP_SEEK_SET);
     sceIoRead(sRomFd, magic, 4);
     if (magic[0] == 0x80 && magic[1] == 0x37) {
         sRomOrder = ROM_Z64;
@@ -209,6 +200,15 @@ bool rt_rom_open(void) {
     rt_log("ROM: %u bytes, byte order %s", (unsigned)sRomSize,
            sRomOrder == ROM_Z64 ? "z64" : (sRomOrder == ROM_V64 ? "v64" : "n64"));
     return true;
+}
+
+bool rt_rom_open(void) {
+    sRomLock = sceKernelCreateSema("rt_rom", 0, 1, 1, NULL);
+    if (!find_rom()) {
+        return false;
+    }
+    sRomSize = (uint32_t)sceIoLseek(sRomFd, 0, PSP_SEEK_END);
+    return alloc_cache() && read_byte_order();
 }
 
 /* Reads ROM block `index` into words (host-order words, as RDRAM holds them). */
@@ -265,6 +265,14 @@ static inline uint8_t word_byte(uint32_t w, uint32_t offset) {
     return (uint8_t)(w >> (24 - 8 * (offset & 3)));
 }
 
+/* The part of [offset, offset + size) in a single ROM block: its block's words and the part's start and length in it. */
+static uint32_t block_part(uint32_t offset, uint32_t size, const uint32_t** words, uint32_t* in_block) {
+    *words = get_block(offset / ROM_BLOCK_BYTES);
+    *in_block = offset % ROM_BLOCK_BYTES;
+    uint32_t n = ROM_BLOCK_BYTES - *in_block;
+    return n < size ? n : size;
+}
+
 void rt_rom_read(uint32_t offset, uint8_t* dst, uint32_t size) {
     sceKernelWaitSema(sRomLock, 1, NULL);
     while (size > 0) {
@@ -272,12 +280,9 @@ void rt_rom_read(uint32_t offset, uint8_t* dst, uint32_t size) {
             memset(dst, 0xFF, size);
             break;
         }
-        const uint32_t* words = get_block(offset / ROM_BLOCK_BYTES);
-        uint32_t in_block = offset % ROM_BLOCK_BYTES;
-        uint32_t n = ROM_BLOCK_BYTES - in_block;
-        if (n > size) {
-            n = size;
-        }
+        const uint32_t* words;
+        uint32_t in_block;
+        uint32_t n = block_part(offset, size, &words, &in_block);
         for (uint32_t i = 0; i < n; i++) {
             dst[i] = word_byte(words[(in_block + i) >> 2], in_block + i);
         }
@@ -291,16 +296,10 @@ void rt_rom_read(uint32_t offset, uint8_t* dst, uint32_t size) {
 void rt_rom_read_to_rdram(uint32_t rom_offset, uint32_t addr, uint32_t size) {
     uint8_t* rdram = g_rdram;
     sceKernelWaitSema(sRomLock, 1, NULL);
-    while (size > 0) {
-        if (rom_offset >= sRomSize) {
-            break;
-        }
-        const uint32_t* words = get_block(rom_offset / ROM_BLOCK_BYTES);
-        uint32_t in_block = rom_offset % ROM_BLOCK_BYTES;
-        uint32_t n = ROM_BLOCK_BYTES - in_block;
-        if (n > size) {
-            n = size;
-        }
+    while (size > 0 && rom_offset < sRomSize) {
+        const uint32_t* words;
+        uint32_t in_block;
+        uint32_t n = block_part(rom_offset, size, &words, &in_block);
         uint32_t i = 0;
         if (((in_block ^ addr) & 3) == 0) {
             /* aligned: whole words at once */
@@ -372,6 +371,7 @@ static uint32_t sDmaCount, sDmaBytes, sDmaUs, sDmaMaxUs;
 
 static DmaRequest sDmaQueue[DMA_QUEUE_SIZE];
 static unsigned sDmaHead = 0, sDmaTail = 0;
+static bool sDmaBusy = false; /* the thread has a request in hand */
 static SceUID sDmaLock = -1;
 static SceUID sDmaSignal = -1;
 
@@ -381,9 +381,13 @@ static int dma_thread(SceSize args, void* argp) {
         sceKernelWaitSema(sDmaLock, 1, NULL);
         DmaRequest r = sDmaQueue[sDmaHead];
         sDmaHead = (sDmaHead + 1) % DMA_QUEUE_SIZE;
+        sDmaBusy = true;
         sceKernelSignalSema(sDmaLock, 1);
         do_dma(r.phys, r.ram, r.size, r.direction);
         rt_post_message(r.mq, r.mb, false, true);
+        sceKernelWaitSema(sDmaLock, 1, NULL);
+        sDmaBusy = false;
+        sceKernelSignalSema(sDmaLock, 1);
         uint32_t took = sceKernelGetSystemTimeLow() - r.queued_us;
         sDmaCount++;
         sDmaBytes += r.size;
@@ -415,6 +419,16 @@ static void start_dma(uint32_t phys, uint32_t ram, uint32_t size, uint32_t direc
     sDmaTail = next;
     sceKernelSignalSema(sDmaLock, 1);
     sceKernelSignalSema(sDmaSignal, 1);
+}
+
+bool rt_pi_idle(void) {
+    if (sDmaLock < 0) {
+        return true;
+    }
+    sceKernelWaitSema(sDmaLock, 1, NULL);
+    bool idle = sDmaHead == sDmaTail && !sDmaBusy;
+    sceKernelSignalSema(sDmaLock, 1);
+    return idle;
 }
 
 void rt_dma_report(char* buf, int size) {

@@ -44,7 +44,6 @@ static uint32_t sDebugCmd;
 #define DM_SCRATCH 0xFB0 /* 0xFB0..0xFCF: RESAMPLE/FILTER state image */
 #define DM_FILTER_TAPS 0xFD0 /* 0xFD0..0xFFF: FILTER coefficient window */
 
-
 /*
  * Everything a task writes lives in one block of its own cache lines. On the
  * PSP this runs on the Media Engine, which writes its data cache back in whole

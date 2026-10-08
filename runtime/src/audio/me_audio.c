@@ -20,6 +20,11 @@
  * flushes its cache before handing a task over and reads the samples through
  * the uncached alias. The handshake itself uses the uncached alias.
  *
+ * Between tasks the ME also converts the game's samples to the DAC's rate, a
+ * chunk at a time (rt_rs_me_poll, resample.c): its idle loop is that work
+ * plus a look at two counters, and a task that arrives waits for one chunk at
+ * most.
+ *
  * Needs a custom firmware that lets homebrew load the library's small kernel
  * PRX (kcall.prx, next to the EBOOT). Without a working ME (or with no_me.txt
  * next to the EBOOT; PPSSPP doesn't emulate it) tasks run on the main CPU.
@@ -33,6 +38,7 @@
 #include <me-core-mapper/me-core.h>
 
 #include "me_audio.h"
+#include "resample.h"
 #include "rt.h"
 
 #define ME_TIMEOUT_US 200000
@@ -53,6 +59,17 @@ typedef struct {
 
 static MeShared sShared;
 #define SHARED ((volatile MeShared*)(UNCACHED_USER_MASK | (u32)&sShared))
+
+/* Runs on the ME, from resample.c. */
+void rt_me_cache_invalidate(uint32_t addr, uint32_t size) {
+    uint32_t start = addr & ~63u;
+    meLibDcacheInvalidateRange(start, ((addr + size + 63) & ~63u) - start);
+}
+
+void rt_me_cache_writeback(uint32_t addr, uint32_t size) {
+    uint32_t start = addr & ~63u;
+    meLibDcacheWritebackRange(start, ((addr + size + 63) & ~63u) - start);
+}
 
 /* Called through kcall: checks that kernel calls really work. */
 static int probe_kernel(void) {
@@ -132,6 +149,9 @@ void meLibOnProcess(void) {
             sh->quit = 2;
             meLibSync();
             meLibHalt();
+        } else if (rt_rs_me_poll()) {
+            /* A chunk of the audio output's rate conversion (resample.c): one at a time, so that a task
+             * that arrives meanwhile waits for at most one. */
         } else {
             sh->alive++;
             meLibDelayPipeline();
@@ -162,6 +182,21 @@ static int hold_reset(void) {
 
 static bool sMeAsleep = false;
 
+/* Waits (up to 200 ms) for the ME's idle loop to count past `alive`: is our code running there? */
+static bool heartbeat_after(u32 alive) {
+    volatile MeShared* sh = SHARED;
+    for (int i = 0; i < 20 && sh->alive == alive; i++) {
+        sceKernelDelayThread(10000);
+    }
+    return sh->alive != alive;
+}
+
+/* Starts a new period for rt_me_audio_report's busy figure. */
+static void mark_alive(void) {
+    sAliveMark = SHARED->alive;
+    sAliveTime = sceKernelGetSystemTimeLow();
+}
+
 static int me_sysevent(int ev_id, char* ev_name, void* param, int* result) {
     volatile MeShared* sh = SHARED;
     if (ev_id == SYSEVENT_SUSPEND && sMeStarted && !sMeAsleep) {
@@ -189,16 +224,12 @@ void rt_me_audio_resume(void) {
     u32 alive = sh->alive;
     int table = kcall(start_me_core, 0);
     sMeAsleep = false;
-    for (int i = 0; i < 20 && sh->alive == alive; i++) {
-        sceKernelDelayThread(10000);
-    }
-    if (table < 0 || sh->alive == alive) {
+    if (table < 0 || !heartbeat_after(alive)) {
         rt_log("me: did not restart after the resume (%d), audio stays on the main CPU", table);
         return;
     }
     sSubmitTime = sceKernelGetSystemTimeLow();
-    sAliveMark = sh->alive;
-    sAliveTime = sceKernelGetSystemTimeLow();
+    mark_alive();
     sMeReady = true;
     rt_log("me: restarted after the resume");
 }
@@ -312,10 +343,7 @@ void rt_me_audio_init(void) {
     }
     sMeStarted = true;
     install_sleep_hook();
-    for (int i = 0; i < 20 && sh->alive == 0; i++) {
-        sceKernelDelayThread(10000);
-    }
-    if (sh->alive == 0) {
+    if (!heartbeat_after(0)) {
         rt_log("me: no heartbeat, audio runs on the main CPU");
         return;
     }
@@ -329,8 +357,7 @@ void rt_me_audio_init(void) {
     sceKernelDelayThread(100000);
     u32 dt = sceKernelGetSystemTimeLow() - t0;
     sIdleRate = (float)(sh->alive - a0) / (float)dt;
-    sAliveMark = sh->alive;
-    sAliveTime = sceKernelGetSystemTimeLow();
+    mark_alive();
     rt_log("me: idle loop %.2f per us", (double)sIdleRate);
 }
 

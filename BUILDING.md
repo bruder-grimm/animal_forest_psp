@@ -232,6 +232,15 @@ input, screenshots, frame dumps and replays). One of them, an empty file
 `log.txt`, makes it write a log to `afpsp.log` next to the EBOOT; without it
 nothing is logged. `runtime/README.md` lists them and explains the log.
 
+SELECT + R takes a capture of the running game: `capture_N.state` (the whole
+game, about 4.3 MB) and `capture_N.bmp` (the frame on screen), next to the
+EBOOT, numbered with the first number not yet used there. A file `resume.txt` holding a
+capture's name (`capture_3.state`) starts the game from that moment instead of
+booting it -- on the PSP or in PPSSPP, with the debug switches and input
+scripts working as usual -- but only with the build that took it: keep that
+EBOOT (`tools/afstate.py info` names the build). Delete `resume.txt` to play
+normally again. `runtime/README.md`, "Captures", has the details.
+
 ## Troubleshooting
 
 - **`env: bash\r: No such file or directory`** (or `python3\r`, `\r: command

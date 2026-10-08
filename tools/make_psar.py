@@ -3,7 +3,7 @@
 
   make_psar.py <out> <file>...
 
-Layout (read by runtime/src/data.c): "AFDT", u32 count, then per file a
+Layout (read by runtime/src/files.c): "AFDT", u32 count, then per file a
 24-byte name, u32 offset from the section's start and u32 size (little-endian),
 then the files, each on a 16-byte boundary.
 """

@@ -31,6 +31,7 @@ static int vi_thread(SceSize args, void* argp) {
             }
         }
         rt_post_event(OS_EVENT_AI);
+        rt_timer_vblank();
 
         if ((sViCount % 30) == 0) {
             rt_save_tick();
@@ -77,3 +78,20 @@ RT_STUB(osViBlack_recomp)
 RT_STUB(osViSetSpecialFeatures_recomp)
 RT_STUB(osViSetXScale_recomp)
 RT_STUB(osViSetYScale_recomp)
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+void rt_vi_capture(RtCapture* c) {
+    struct {
+        uint32_t mq, msg, retrace_count, current_fb;
+        bool started;
+    } s = { sViMq, sViMsg, sViRetraceCount, sCurrentFb, sViStarted };
+    rt_cap_io(c, "VI  ", &s, sizeof(s));
+    if (!rt_cap_saving(c)) {
+        sViMq = s.mq;
+        sViMsg = s.msg;
+        sViRetraceCount = s.retrace_count;
+        sCurrentFb = s.current_fb;
+        sViStarted = s.started;
+    }
+}

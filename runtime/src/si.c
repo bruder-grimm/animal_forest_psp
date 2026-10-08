@@ -7,7 +7,6 @@
  * which is backed by the PSP's clock plus a user-settable offset.
  */
 #include <pspctrl.h>
-#include <pspiofilemgr.h>
 #include <psprtc.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,67 +68,63 @@ static const struct {
     { "DU", N64_DU }, { "DD", N64_DD }, { "DL", N64_DL }, { "DR", N64_DR },
 };
 
+/* One line of the script (its comment cut off): false if it has no entry. */
+static bool parse_script_line(char* line, ScriptEntry* e) {
+    *e = (ScriptEntry){ .period = 1, .hold = 3 };
+    char* tok = strtok(line, " \t\r");
+    if (tok == NULL) {
+        return false;
+    }
+    char* end;
+    e->first = (uint32_t)strtoul(tok, &end, 10);
+    e->last = e->first;
+    if (*end == '-') {
+        e->last = (uint32_t)strtoul(end + 1, &end, 10);
+        if (*end == '/') {
+            e->period = (uint32_t)strtoul(end + 1, &end, 10);
+        }
+    }
+    if (e->period == 0) {
+        e->period = 1;
+    }
+    while ((tok = strtok(NULL, " \t\r")) != NULL) {
+        if (tok[0] == 'x' && tok[1] >= '0' && tok[1] <= '9') {
+            e->hold = (uint32_t)strtoul(tok + 1, NULL, 10);
+        } else if (tok[0] == 'X' && tok[1] == '=') {
+            e->x = (int8_t)strtol(tok + 2, NULL, 10);
+            e->has_stick = true;
+        } else if (tok[0] == 'Y' && tok[1] == '=') {
+            e->y = (int8_t)strtol(tok + 2, NULL, 10);
+            e->has_stick = true;
+        } else {
+            for (size_t i = 0; i < RT_COUNT(kButtonNames); i++) {
+                if (strcmp(tok, kButtonNames[i].name) == 0) {
+                    e->buttons |= kButtonNames[i].mask;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static void load_script(void) {
     sScriptLen = 0;
-    char path[256];
-    SceUID fd = sceIoOpen(rt_data_path("input_script.txt", path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd < 0) {
-        return;
-    }
     static char text[32 * 1024];
-    int len = sceIoRead(fd, text, sizeof(text) - 1);
-    sceIoClose(fd);
-    if (len <= 0) {
+    if (rt_data_read_text("input_script.txt", text, sizeof(text)) <= 0) {
         return;
     }
-    text[len] = 0;
-    char* line = text;
-    while (line != NULL && *line && sScriptLen < MAX_SCRIPT) {
+    for (char* line = text; line != NULL && *line && sScriptLen < MAX_SCRIPT;) {
         char* next = strchr(line, '\n');
         if (next != NULL) {
-            *next++ = 0;
+            *next++ = '\0';
         }
-        char* hash = strchr(line, '#');
-        if (hash != NULL) {
-            *hash = 0;
-        }
-        ScriptEntry e = { 0, 0, 1, 3, 0, 0, 0, false };
-        char* tok = strtok(line, " \t\r");
-        if (tok != NULL) {
-            char* end;
-            e.first = (uint32_t)strtoul(tok, &end, 10);
-            e.last = e.first;
-            if (*end == '-') {
-                e.last = (uint32_t)strtoul(end + 1, &end, 10);
-                if (*end == '/') {
-                    e.period = (uint32_t)strtoul(end + 1, &end, 10);
-                }
-            }
-            if (e.period == 0) {
-                e.period = 1;
-            }
-            while ((tok = strtok(NULL, " \t\r")) != NULL) {
-                if (tok[0] == 'x' && tok[1] >= '0' && tok[1] <= '9') {
-                    e.hold = (uint32_t)strtoul(tok + 1, NULL, 10);
-                } else if (tok[0] == 'X' && tok[1] == '=') {
-                    e.x = (int8_t)strtol(tok + 2, NULL, 10);
-                    e.has_stick = true;
-                } else if (tok[0] == 'Y' && tok[1] == '=') {
-                    e.y = (int8_t)strtol(tok + 2, NULL, 10);
-                    e.has_stick = true;
-                } else {
-                    for (size_t i = 0; i < RT_COUNT(kButtonNames); i++) {
-                        if (strcmp(tok, kButtonNames[i].name) == 0) {
-                            e.buttons |= kButtonNames[i].mask;
-                        }
-                    }
-                }
-            }
-            sScript[sScriptLen++] = e;
+        line[strcspn(line, "#")] = '\0';
+        if (parse_script_line(line, &sScript[sScriptLen])) {
+            sScriptLen++;
         }
         line = next;
     }
-    rt_log("input: %d scripted entries from %s", sScriptLen, path);
+    rt_log("input: %d scripted entries from input_script.txt", sScriptLen);
 }
 
 static void apply_script(uint16_t* buttons, int8_t* x, int8_t* y) {
@@ -214,16 +209,16 @@ static void poll_pad(void) {
     if (pad.Buttons & PSP_CTRL_CIRCLE) b |= N64_CR;
 
     /*
-     * SELECT + R: capture the next frame for debugging (rt_gfx_request_capture:
-     * the RDRAM image the frame is rendered from, and what the PSP showed).
-     * The combination is kept from the game.
+     * SELECT + R: a capture of the game for debugging (capture.c: everything
+     * needed to resume it, the RDRAM the next frame is rendered from, and what
+     * the PSP showed). The combination is kept from the game.
      */
     static bool sCaptureHeld = false;
     bool capture = shift && (pad.Buttons & PSP_CTRL_RTRIGGER);
     if (capture) {
         b &= (uint16_t)~N64_R;
         if (!sCaptureHeld) {
-            rt_gfx_request_capture();
+            rt_capture_request();
         }
     }
     sCaptureHeld = capture;
@@ -258,6 +253,11 @@ static void poll_pad(void) {
     int8_t y = scale_axis(pad.Ly, true);
     if (sScriptLen > 0) {
         apply_script(&b, &x, &y);
+    }
+    /* auto_capture.txt: captures at these polls, as SELECT + R would take them (for scripted runs). */
+    static RtNumbers sCapturePolls = RT_NUMBERS("auto_capture.txt");
+    if (rt_numbers_have(&sCapturePolls, sPolls)) {
+        rt_capture_request();
     }
     sPolls++;
     sButtons = b;
@@ -342,27 +342,12 @@ static RtcState sRtc = { 0, { 0x03, 0x00 }, { 0 } };
 static bool sRtcDirty = false;
 
 static void rtc_load(void) {
-    char path[256];
-    SceUID fd = sceIoOpen(rt_data_path("rtc.bin", path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd >= 0) {
-        RtcState loaded;
-        if (sceIoRead(fd, &loaded, sizeof(loaded)) == sizeof(loaded)) {
-            sRtc = loaded;
-            /* The clock never stays stopped across restarts. */
-            sRtc.cr[1] &= ~0x04;
-        }
-        sceIoClose(fd);
+    RtcState loaded;
+    if (rt_data_read("rtc.bin", &loaded, sizeof(loaded)) == sizeof(loaded)) {
+        sRtc = loaded;
+        /* The clock never stays stopped across restarts. */
+        sRtc.cr[1] &= ~0x04;
     }
-}
-
-static void rtc_save(void) {
-    char path[256];
-    SceUID fd = sceIoOpen(rt_data_path("rtc.bin", path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, &sRtc, sizeof(sRtc));
-        sceIoClose(fd);
-    }
-    sRtcDirty = false;
 }
 
 void rt_rtc_init(void) {
@@ -370,10 +355,10 @@ void rt_rtc_init(void) {
 }
 
 void rt_rtc_tick(void) {
-    if (sRtcDirty) {
-        rt_io_begin();
-        rtc_save();
-        rt_io_end();
+    /* A game resumed from a capture has the capture's clock, which isn't the player's. */
+    if (sRtcDirty && !rt_capture_resumed()) {
+        rt_data_write("rtc.bin", &sRtc, sizeof(sRtc));
+        sRtcDirty = false;
     }
 }
 
@@ -589,7 +574,6 @@ void __osSiRawStartDma_recomp(uint8_t* rdram, recomp_context* ctx) {
 RT_STUB(__osSiGetAccess_recomp)
 RT_STUB(__osSiRelAccess_recomp)
 
-
 /* ---- Controller Pak / rumble / EEPROM: not present ---------------------- */
 
 #define PFS_ERR_NOPACK 1
@@ -618,3 +602,40 @@ void osEepromRead_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 RT_STUB_RETURN(osEepromWrite_recomp, (gpr)-1)
 RT_STUB_RETURN(osGbpakInit, PFS_ERR_NOPACK)
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+/* The pad as last read, the PIF's RAM between a command and its answer, and the cartridge clock. The clock
+ * goes on from the time it showed at the capture: offset_us is that time less the PSP's at the capture. */
+void rt_si_capture(RtCapture* c) {
+    struct {
+        RtcState rtc;
+        uint8_t pif[64];
+        uint16_t buttons;
+        int8_t stick_x, stick_y;
+        uint64_t psp_tick;
+    } s;
+    ScePspDateTime now;
+    u64 tick;
+    sceRtcGetCurrentClockLocalTime(&now);
+    sceRtcGetTick(&now, &tick);
+    if (rt_cap_saving(c)) {
+        s.rtc = sRtc;
+        memcpy(s.pif, sPifRam, sizeof(s.pif));
+        s.buttons = sButtons;
+        s.stick_x = sStickX;
+        s.stick_y = sStickY;
+        s.psp_tick = tick;
+    }
+    rt_cap_io(c, "SI  ", &s, sizeof(s));
+    if (rt_cap_saving(c)) {
+        return;
+    }
+    sRtc = s.rtc;
+    sRtc.offset_seconds = ((int64_t)s.psp_tick - (int64_t)tick) / 1000000LL + s.rtc.offset_seconds;
+    sRtcDirty = false;
+    memcpy(sPifRam, s.pif, sizeof(sPifRam));
+    sButtons = s.buttons;
+    sStickX = s.stick_x;
+    sStickY = s.stick_y;
+}

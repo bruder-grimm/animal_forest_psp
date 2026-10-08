@@ -86,12 +86,16 @@ static bool key_equal(const TexKey* a, const TexKey* b);
 static uint32_t family_slot(const TexKey* k) {
     TexKey x = *k;
     x.off_x = x.off_y = 0.0f;
+    x.win_x0 = x.win_y0 = 0;
+    x.win_w = x.win_h = 0;
     return key_hash(&x) % BAKE_FAMILIES;
 }
 
 static bool same_family(const TexKey* a, const TexKey* b) {
     TexKey x = *a, y = *b;
     x.off_x = x.off_y = y.off_x = y.off_y = 0.0f;
+    x.win_x0 = x.win_y0 = y.win_x0 = y.win_y0 = 0;
+    x.win_w = x.win_h = y.win_w = y.win_h = 0;
     return key_equal(&x, &y);
 }
 
@@ -146,6 +150,8 @@ static uint32_t key_hash(const TexKey* k) {
         memcpy(&lod, &k->comb_lod, 4);
         h ^= k->comb0 * 668265263u ^ k->comb1 * 3266489917u ^ k->comb_prim ^ k->comb_env ^ lod ^
              (uint32_t)k->bake_kind << 29;
+        h ^= ((uint32_t)(uint16_t)k->win_x0 | (uint32_t)(uint16_t)k->win_y0 << 16) * 2654435761u ^
+             ((uint32_t)k->win_w | (uint32_t)k->win_h << 16) * 374761393u;
     }
     if (k->variant & TEXVAR_LERP) {
         h ^= k->lerp_lo * 2654435761u ^ k->lerp_hi * 668265263u;
@@ -168,11 +174,28 @@ static bool key_equal(const TexKey* a, const TexKey* b) {
             (a->off_x == b->off_x && a->off_y == b->off_y && a->ratio_x == b->ratio_x &&
              a->ratio_y == b->ratio_y && a->base_second == b->base_second &&
              a->comb0 == b->comb0 && a->comb1 == b->comb1 && a->comb_prim == b->comb_prim &&
-             a->comb_env == b->comb_env && a->comb_lod == b->comb_lod && a->bake_kind == b->bake_kind)) &&
+             a->comb_env == b->comb_env && a->comb_lod == b->comb_lod && a->bake_kind == b->bake_kind &&
+             a->win_x0 == b->win_x0 && a->win_y0 == b->win_y0 && a->win_w == b->win_w && a->win_h == b->win_h)) &&
            (!(a->variant & TEXVAR_LERP) || (a->lerp_lo == b->lerp_lo && a->lerp_hi == b->lerp_hi));
 }
 
-/* The second source of a product texture as a key of its own. */
+void gfx_tex_set_second(TexKey* key, const TexKey* second) {
+    key->src2.addr_bits = second->addr_bits;
+    key->src2.row_bits = second->row_bits;
+    key->src2.tlut_addr = second->tlut_addr;
+    key->src2.tile_w = second->tile_w;
+    key->src2.tile_h = second->tile_h;
+    key->src2.fmt = second->fmt;
+    key->src2.siz = second->siz;
+    key->src2.tlut_type = second->tlut_type;
+    key->src2.cms = second->cms;
+    key->src2.cmt = second->cmt;
+    key->src2.masks = second->masks;
+    key->src2.maskt = second->maskt;
+    key->src2.row_swap = second->row_swap;
+}
+
+/* ... and back: the second source of a two-texture key as a key of its own. */
 static TexKey second_key(const TexKey* k) {
     TexKey k2 = *k;
     k2.addr_bits = k->src2.addr_bits;
@@ -230,6 +253,15 @@ static inline uint32_t axis_map(const Axis* a, uint32_t x) {
         x &= (1u << a->mask) - 1;
     }
     return x;
+}
+
+/* The source texel the RDP reads for tile texel x: clamped to the tile if the axis clamps, then wrapped. */
+static inline uint32_t axis_texel(const Axis* a, int32_t x) {
+    if (a->clamp) {
+        x = x < 0 ? 0 : (uint32_t)x >= a->size ? (int32_t)a->size - 1 : x;
+    }
+    uint32_t sx = axis_map(a, (uint32_t)x);
+    return sx <= a->src_max ? sx : a->src_max;
 }
 
 /* Source bytes the texture reads, from the byte containing texel (0,0). */
@@ -306,13 +338,6 @@ static inline uint32_t rgba(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-static inline uint32_t from_rgba16(uint16_t v) {
-    uint32_t r = (v >> 11) & 31;
-    uint32_t g = (v >> 6) & 31;
-    uint32_t b = (v >> 1) & 31;
-    return rgba((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), (v & 1) ? 255 : 0);
-}
-
 static inline uint32_t from_ia16(uint16_t v) {
     uint32_t i = v >> 8;
     return rgba(i, i, i, v & 0xFF);
@@ -320,7 +345,7 @@ static inline uint32_t from_ia16(uint16_t v) {
 
 static uint32_t palette_color(const TexKey* k, uint32_t index) {
     uint16_t v = (uint16_t)((sPalette[index * 2] << 8) | sPalette[index * 2 + 1]);
-    return k->tlut_type == TLUT_IA16 ? from_ia16(v) : from_rgba16(v);
+    return k->tlut_type == TLUT_IA16 ? from_ia16(v) : rgba5551_to_ge(v);
 }
 
 /* Byte i of a row, where the row starts on a texture memory unit boundary. */
@@ -336,7 +361,7 @@ static uint32_t decode_texel(const TexKey* k, uint32_t mode, uint32_t row_bit, u
     #define B(n) s[row_byte(r0, xb + (n), swap)]
     switch (mode) {
         case (G_IM_FMT_RGBA << 4) | G_IM_SIZ_16b:
-            return from_rgba16((uint16_t)((B(0) << 8) | B(1)));
+            return rgba5551_to_ge((uint32_t)((B(0) << 8) | B(1)));
         case (G_IM_FMT_RGBA << 4) | G_IM_SIZ_32b:
             return rgba(B(0), B(1), B(2), B(3));
         case (G_IM_FMT_IA << 4) | G_IM_SIZ_4b: {
@@ -427,34 +452,14 @@ static void layout_index_map(const Axis* a, const Axis* base, uint32_t n, float 
     for (uint32_t x = 0; x < n; x++) {
         uint32_t gx = x < base->size ? x : base->size - 1;
         float t = (float)gx * ratio + off;
-        int32_t bx = (int32_t)floorf(t + 0.5f);
-        if (a->clamp) {
-            if (bx < 0) {
-                bx = 0;
-            }
-            if ((uint32_t)bx >= a->size) {
-                bx = (int32_t)a->size - 1;
-            }
-        }
-        uint32_t sx = axis_map(a, (uint32_t)bx);
-        out[x] = sx <= a->src_max ? sx : a->src_max;
+        out[x] = axis_texel(a, (int32_t)floorf(t + 0.5f));
     }
 }
 
 static void layout_index_off(const Axis* a, const Axis* base, uint32_t n, int32_t off, uint32_t* out) {
     for (uint32_t x = 0; x < n; x++) {
         /* past a clamped axis' size its last texel repeats; a wrapped one goes round again (min_gu_width) */
-        int32_t bx = (int32_t)(x < base->size || !base->clamp ? x : base->size - 1) + off;
-        if (a->clamp) {
-            if (bx < 0) {
-                bx = 0;
-            }
-            if ((uint32_t)bx >= a->size) {
-                bx = (int32_t)a->size - 1;
-            }
-        }
-        uint32_t sx = axis_map(a, (uint32_t)bx);
-        out[x] = sx <= a->src_max ? sx : a->src_max;
+        out[x] = axis_texel(a, (int32_t)(x < base->size || !base->clamp ? x : base->size - 1) + off);
     }
 }
 
@@ -495,7 +500,7 @@ static void measure(GuTexture* t, const uint64_t* sum, const uint64_t* sq, uint3
 /*
  * The GE reads half as much for a 16-bit texture, which matters in scenes that
  * cover the screen. A format is only used where it loses nothing: the N64's own
- * RGBA16 texels expand to 8 bits reversibly (see from_rgba16), as do IA8 and I4,
+ * RGBA16 texels expand to 8 bits reversibly (see rgba5551_to_ge), as do IA8 and I4,
  * whose channels are a nibble times 17. Everything else keeps 8888.
  */
 static int pick_psm(const TexKey* k) {
@@ -585,12 +590,7 @@ static void bake_axis(const Axis* a, const Axis* a2, uint32_t n_base, uint32_t s
         w[x] = (uint32_t)(f * 256.0f + 0.5f);
         /* the other tile, as layout_index_map places it, at this finer position */
         float gx = cb < (float)(a->size - 1) ? cb : (float)(a->size - 1);
-        int32_t bx = (int32_t)floorf(gx * ratio + off + 0.5f);
-        if (a2->clamp) {
-            bx = bx < 0 ? 0 : (uint32_t)bx >= a2->size ? (int32_t)a2->size - 1 : bx;
-        }
-        uint32_t sx = axis_map(a2, (uint32_t)bx);
-        o[x] = sx <= a2->src_max ? sx : a2->src_max;
+        o[x] = axis_texel(a2, (int32_t)floorf(gx * ratio + off + 0.5f));
     }
 }
 
@@ -679,6 +679,8 @@ void gfx_tex_take_build_stats(uint32_t* builds, uint32_t* bakes, uint32_t* us) {
 }
 
 static void build_impl(const TexKey* k, const Axis* ax, const Axis* ay, GuTexture* t);
+static void layout_window(const Axis* a, const Axis* a2, int32_t x0, uint32_t n, uint32_t count, float ratio,
+                          float off, uint32_t* out, uint32_t* out2);
 
 /* TEXVAR_LERP: each channel c becomes lo + (hi - lo) * c / 255, alpha kept. */
 static inline uint32_t lerp_rgb(uint32_t texel, uint32_t lo, uint32_t hi) {
@@ -701,6 +703,123 @@ static void build(const TexKey* k, const Axis* ax, const Axis* ay, GuTexture* t)
     }
     sBuilds++;
     sBakes += (k->variant & TEXVAR_TWO) != 0;
+}
+
+/*
+ * A TEXVAR_COMBINE2 bake on the tile's own grid whose two sources have few
+ * values: each source texel gets the number of its value, and the baked texel
+ * of every pair of values is worked out once into a table the cache holds.
+ * The villagers' "happy" light is a 256 x 256 bake of two 16-shade textures,
+ * made again every frame while its rays scroll; the general loop took 48 ms
+ * over it on the PSP (a divide per texel for the block order, and memo
+ * lookups -- hashed into 192 KB for split combiners -- that missed the cache).
+ * Same texels, statistics and alpha_binary as the general loop.
+ */
+#define PAIR_SRC_MAX 4096 /* texels per source */
+#define PAIR_VALUES 64    /* values per source */
+#define PAIR_MAX 1024     /* pairs of values */
+static uint16_t sPairIdx0[PAIR_SRC_MAX], sPairIdx1[PAIR_SRC_MAX];
+static uint32_t sPairVals0[PAIR_VALUES], sPairVals1[PAIR_VALUES];
+static uint32_t sPair[PAIR_MAX];
+static uint8_t sPairUsed[PAIR_MAX];
+
+/* Numbers src's n texels by value into idx (times mul) and vals; the count of values, or -1 past PAIR_VALUES. */
+static int pair_index(const uint32_t* src, uint32_t n, uint32_t* vals, uint16_t* idx, uint32_t mul) {
+    int count = 0, k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v = src[i];
+        if (count == 0 || vals[k] != v) {
+            for (k = 0; k < count && vals[k] != v; k++) {}
+            if (k == count) {
+                if (count == PAIR_VALUES) {
+                    return -1;
+                }
+                vals[count++] = v;
+            }
+        }
+        idx[i] = (uint16_t)((uint32_t)k * mul);
+    }
+    return count;
+}
+
+static bool build_combine2_pairs(const TexKey* k, const uint32_t* cols, const uint32_t* rows, const uint32_t* cols2,
+                                 const uint32_t* rows2, uint32_t src_w, uint32_t src_h, uint32_t src2_w,
+                                 uint32_t src2_h, uint32_t white, GuTexture* t) {
+    /* TEXEL0 and TEXEL1 of the combiner: this tile and the other, either way round */
+    const bool second = k->base_second != 0;
+    const uint32_t n_base = src_w * src_h, n_other = src2_w * src2_h;
+    if (n_base > PAIR_SRC_MAX || n_other > PAIR_SRC_MAX) {
+        return false;
+    }
+    int n1 = pair_index(second ? sDecoded : sDecoded2, second ? n_base : n_other, sPairVals1, sPairIdx1, 1);
+    int n0 = n1 < 0 ? -1
+                    : pair_index(second ? sDecoded2 : sDecoded, second ? n_other : n_base, sPairVals0, sPairIdx0,
+                                 (uint32_t)n1);
+    if (n0 < 0 || n0 * n1 > PAIR_MAX) {
+        return false;
+    }
+    const uint8_t split_tag = k->bake_kind != BAKE_COLOUR ? gfx_bake_split_prepare(k->bake_kind) : 0;
+    const uint32_t rgb0 = gBakeRgbTile == 0 ? 0x00FFFFFFu : 0, rgb1 = rgb0 ^ 0x00FFFFFFu;
+    if (!split_tag) {
+        gfx_bake_alpha_prepare();
+    }
+    for (int a = 0; a < n0; a++) {
+        for (int b = 0; b < n1; b++) {
+            uint32_t t0 = sPairVals0[a], t1 = sPairVals1[b];
+            sPair[a * n1 + b] =
+                (split_tag ? gfx_bake_split_lookup(t0, t1, split_tag)
+                           : (t0 & rgb0) | (t1 & rgb1) |
+                                 (uint32_t)gfx_bake_alpha_lookup((uint8_t)(t0 >> 24), (uint8_t)(t1 >> 24)) << 24) |
+                white;
+        }
+    }
+    memset(sPairUsed, 0, (size_t)(n0 * n1));
+
+    const uint32_t gw = t->gu_width, gh = t->gu_height;
+    /* a window (gfx_bake_window) is all the GE samples: whole blocks of it */
+    const uint32_t fill_w = k->win_w ? (k->win_w + 3u) & ~3u : gw, fill_h = k->win_h ? (k->win_h + 7u) & ~7u : gh;
+    uint32_t* const dst = t->pixels;
+    const uint32_t* const c0 = second ? cols2 : cols;
+    const uint32_t* const c1 = second ? cols : cols2;
+    t->swizzled = true;
+    uint64_t sum[4] = { 0 }, sq[4] = { 0 };
+    uint32_t stat_n = 0;
+    for (uint32_t y = 0; y < fill_h; y++) {
+        const uint16_t* q0 = sPairIdx0 + (second ? rows2[y] * src2_w : rows[y] * src_w);
+        const uint16_t* q1 = sPairIdx1 + (second ? rows[y] * src_w : rows2[y] * src2_w);
+        uint32_t* out = dst + (y / 8) * (gw * 8) + (y % 8) * 4;
+        for (uint32_t x = 0; x < fill_w; x += 4, out += 32) {
+            uint32_t p0 = q0[c0[x]] + q1[c1[x]], p1 = q0[c0[x + 1]] + q1[c1[x + 1]];
+            uint32_t p2 = q0[c0[x + 2]] + q1[c1[x + 2]], p3 = q0[c0[x + 3]] + q1[c1[x + 3]];
+            sPairUsed[p0] = sPairUsed[p1] = sPairUsed[p2] = sPairUsed[p3] = 1;
+            out[0] = sPair[p0];
+            out[1] = sPair[p1];
+            out[2] = sPair[p2];
+            out[3] = sPair[p3];
+        }
+        if ((y & 3) == 0) {
+            /* the statistics' texels, every fourth of every fourth row */
+            out = dst + (y / 8) * (gw * 8) + (y % 8) * 4;
+            for (uint32_t x = 0; x < fill_w; x += 4, out += 32) {
+                stat_n++;
+                for (int ch = 0; ch < 4; ch++) {
+                    uint32_t c = (out[0] >> (8 * ch)) & 0xFF;
+                    sum[ch] += c;
+                    sq[ch] += c * c;
+                }
+            }
+        }
+    }
+    uint32_t partial_alpha = 0;
+    for (int p = 0; p < n0 * n1; p++) {
+        if (sPairUsed[p]) {
+            partial_alpha |= ((sPair[p] >> 24) + 1) & 0xFE;
+        }
+    }
+    measure(t, sum, sq, stat_n);
+    t->alpha_binary = partial_alpha == 0;
+    sceKernelDcacheWritebackRange(dst, (SceSize)gw * gh * 4);
+    return true;
 }
 
 /* Decodes a key's sources and lays them out into t. */
@@ -737,11 +856,22 @@ static void build_impl(const TexKey* k, const Axis* ax, const Axis* ay, GuTextur
     if (combine2) {
         layout_index_map(&ax2, ax, gw, k->ratio_x, k->off_x, cols2);
         layout_index_map(&ay2, ay, gh, k->ratio_y, k->off_y, rows2);
+        if (k->win_w) {
+            layout_window(ax, &ax2, k->win_x0, k->win_w, gw, k->ratio_x, k->off_x, cols, cols2);
+        }
+        if (k->win_h) {
+            layout_window(ay, &ay2, k->win_y0, k->win_h, gh, k->ratio_y, k->off_y, rows, rows2);
+        }
     } else if (two) {
         layout_index_off(&ax2, ax, gw, 0, cols2);
         layout_index_off(&ay2, ay, gh, 0, rows2);
     }
     uint32_t white = (k->variant & TEXVAR_WHITE_RGB) ? 0x00FFFFFF : 0;
+    if (combine2 && t->psm == GU_PSM_8888 && gw % 4 == 0 && gh % 8 == 0 &&
+        build_combine2_pairs(k, cols, rows, cols2, rows2, src_w, ay->src_max + 1, ax2.src_max + 1, ay2.src_max + 1,
+                             white, t)) {
+        return;
+    }
     bool lerp = (k->variant & TEXVAR_LERP) != 0;
     /*
      * The GE reads textures fastest in its own block order ("swizzled"):
@@ -849,7 +979,41 @@ void gfx_tex_flush_retired(void) {
     sNumRetired[1] = 0;
 }
 
+/*
+ * The once-a-frame look at an entry's sources: is its palette, and every
+ * TEXEL_CHECK_PERIOD frames (or when its memory was drawn into) are its
+ * texels, as they were when it was made? update: take on the new hashes
+ * (the caller then rebuilds it); otherwise a change is only reported.
+ */
+static bool sources_unchanged(CacheEntry* e, int index, bool update) {
+    bool same = true;
+    uint32_t ph = pal_hash(&e->key);
+    if (ph != e->pal_hash) {
+        if (!update) {
+            return false;
+        }
+        e->pal_hash = ph;
+        same = false;
+    }
+    if (e->stale || ((sFrame + (uint32_t)index) & (TEXEL_CHECK_PERIOD - 1)) == 0) {
+        uint32_t th = texel_hash(&e->key);
+        if (th != e->texel_hash) {
+            if (!update) {
+                return false;
+            }
+            e->texel_hash = th;
+            same = false;
+        }
+        e->stale = false;
+    }
+    e->checked_frame = sFrame;
+    return same;
+}
+
+static uint32_t sStructGen = 1; /* changes whenever a cache entry is freed (entries may then be reused) */
+
 static void free_entry(CacheEntry* e) {
+    sStructGen++;
     if (e->tex.pixels != NULL) {
         retire(e->tex.pixels);
         e->tex.pixels = NULL;
@@ -923,7 +1087,7 @@ static void dump_texture(const TexKey* key, const GuTexture* t) {
     char path[256];
     snprintf(name, sizeof(name), "gutex_%08X_%ux%u_%03u.rgba", (unsigned)(key->addr_bits >> 3), t->gu_width,
              t->gu_height, (unsigned)sDumpCount++);
-    SceUID fd = sceIoOpen(rt_data_path(name, path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    SceUID fd = rt_data_create(name, path, sizeof(path));
     if (fd >= 0) {
         /* decoded: textures may be 16-bit and swizzled */
         uint32_t* rgba = malloc((size_t)t->gu_width * t->gu_height * 4);
@@ -1005,6 +1169,54 @@ static void extend_bake_axis(Axis* a, const Axis* a2, float ratio) {
     }
 }
 
+/*
+ * Widened like that, a bake can be much more than is drawn of it: the
+ * villagers' "happy" light lays its 16-texel rays over a mirrored mask read at
+ * an eighth of their rate, a 256 x 256 bake, made again every frame as the
+ * rays scroll, of which its triangles reach about 130 x 130. Along such an
+ * axis the bake then holds just the texels the draw reaches, [lo, hi] plus
+ * one each side for the filter, and the GE clamps there. The draw code binds
+ * again when a later triangle goes past them (gfx_bind.c, gfx_bake_window_left).
+ */
+bool gfx_bake_window(TexKey* key, const float lo[2], const float hi[2]) {
+    TexKey k2 = second_key(key);
+    for (int a = 0; a < 2; a++) {
+        Axis base = a == 0 ? make_axis(key->tile_w, key->cms, key->masks) : make_axis(key->tile_h, key->cmt, key->maskt);
+        Axis other = a == 0 ? make_axis(k2.tile_w, k2.cms, k2.masks) : make_axis(k2.tile_h, k2.cmt, k2.maskt);
+        float ratio = a == 0 ? key->ratio_x : key->ratio_y;
+        Axis wide = base;
+        extend_bake_axis(&wide, &other, ratio);
+        if (wide.size == base.size || bake_sub(ratio, next_pow2(wide.size)) != 1 || !(lo[a] > -16000.0f) ||
+            !(hi[a] < 16000.0f)) {
+            continue;
+        }
+        int32_t x0 = (int32_t)floorf(lo[a]) - 1, n = (int32_t)ceilf(hi[a]) - x0 + 2;
+        if (n >= (int32_t)wide.size) {
+            continue;
+        }
+        if (a == 0) {
+            key->win_x0 = (int16_t)x0;
+            key->win_w = (uint16_t)n;
+        } else {
+            key->win_y0 = (int16_t)x0;
+            key->win_h = (uint16_t)n;
+        }
+    }
+    return key->win_w != 0 || key->win_h != 0;
+}
+
+/* A windowed axis of a bake: GU texel x is tile texel x0 + x (the last of the n repeated past them), and the
+ * other tile's texel there, as layout_index_map places it. */
+static void layout_window(const Axis* a, const Axis* a2, int32_t x0, uint32_t n, uint32_t count, float ratio,
+                          float off, uint32_t* out, uint32_t* out2) {
+    for (uint32_t x = 0; x < count; x++) {
+        int32_t bx = x0 + (int32_t)(x < n ? x : n - 1);
+        uint32_t sx = axis_map(a, (uint32_t)bx);
+        out[x] = sx <= a->src_max ? sx : a->src_max;
+        out2[x] = axis_texel(a2, (int32_t)floorf((float)bx * ratio + off + 0.5f));
+    }
+}
+
 static const GuTexture* tex_get(const TexKey* key_in, bool to_draw);
 
 const GuTexture* gfx_tex_get(const TexKey* key) {
@@ -1019,6 +1231,25 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
     if (key_in->tile_w == 0 || key_in->tile_h == 0) {
         return NULL;
     }
+    /*
+     * The usual case first: a key that is in the cache, already looked at this frame. Its size
+     * limits were checked when it went in, and nothing here depends on a render target or on
+     * the bake rounding below (a combined bake's key is rounded first, so it takes the long way).
+     */
+    if (!(key_in->variant & TEXVAR_COMBINE2) && !gTarget.dirty) {
+        uint32_t slot = key_hash(key_in) & (CACHE_SLOTS - 1);
+        while (sSlots[slot] >= 0) {
+            CacheEntry* e = &sEntries[sSlots[slot]];
+            if (key_equal(&e->key, key_in)) {
+                if (e->checked_frame == sFrame && !e->stale) {
+                    e->last_used = sFrame;
+                    return &e->tex;
+                }
+                break;
+            }
+            slot = (slot + 1) & (CACHE_SLOTS - 1);
+        }
+    }
     Axis ax = make_axis(key_in->tile_w, key_in->cms, key_in->masks);
     Axis ay = make_axis(key_in->tile_h, key_in->cmt, key_in->maskt);
     TexKey rounded;
@@ -1027,8 +1258,16 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
         TexKey k2 = second_key(key_in);
         Axis ax2 = make_axis(k2.tile_w, k2.cms, k2.masks);
         Axis ay2 = make_axis(k2.tile_h, k2.cmt, k2.maskt);
-        extend_bake_axis(&ax, &ax2, key_in->ratio_x);
-        extend_bake_axis(&ay, &ay2, key_in->ratio_y);
+        if (key_in->win_w) {
+            ax.size = key_in->win_w;
+        } else {
+            extend_bake_axis(&ax, &ax2, key_in->ratio_x);
+        }
+        if (key_in->win_h) {
+            ay.size = key_in->win_h;
+        } else {
+            extend_bake_axis(&ay, &ay2, key_in->ratio_y);
+        }
         rounded = *key_in;
         round_bake_offsets(&rounded, &ax, &ay);
         key = &rounded;
@@ -1075,30 +1314,13 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
         CacheEntry* e = &sEntries[sSlots[slot]];
         if (key_equal(&e->key, key)) {
             e->last_used = sFrame;
-            if (e->checked_frame != sFrame || e->stale) {
-                e->checked_frame = sFrame;
-                bool changed = false;
-                uint32_t ph = pal_hash(key);
-                if (ph != e->pal_hash) {
-                    e->pal_hash = ph;
-                    changed = true;
-                }
-                if (e->stale || ((sFrame + (uint32_t)sSlots[slot]) & (TEXEL_CHECK_PERIOD - 1)) == 0) {
-                    e->stale = false;
-                    uint32_t th = texel_hash(key);
-                    if (th != e->texel_hash) {
-                        e->texel_hash = th;
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    /* Build into a new buffer: the GE may still be reading the old one. */
-                    void* fresh = memalign(16, e->bytes);
-                    if (fresh != NULL) {
-                        retire(e->tex.pixels);
-                        e->tex.pixels = fresh;
-                        build(key, &ax, &ay, &e->tex);
-                    }
+            if ((e->checked_frame != sFrame || e->stale) && !sources_unchanged(e, sSlots[slot], true)) {
+                /* Build into a new buffer: the GE may still be reading the old one. */
+                void* fresh = memalign(16, e->bytes);
+                if (fresh != NULL) {
+                    retire(e->tex.pixels);
+                    e->tex.pixels = fresh;
+                    build(key, &ax, &ay, &e->tex);
                 }
             }
             return &e->tex;
@@ -1155,8 +1377,10 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
     e->tex.gu_height = (uint16_t)gh;
     e->tex.sub_x = (uint8_t)sub_x;
     e->tex.sub_y = (uint8_t)sub_y;
-    e->tex.clamp_s = ax.clamp;
-    e->tex.clamp_t = ay.clamp;
+    e->tex.clamp_s = ax.clamp || key->win_w != 0;
+    e->tex.clamp_t = ay.clamp || key->win_h != 0;
+    e->tex.win_s = key->win_x0;
+    e->tex.win_t = key->win_y0;
     sBytesUsed += bytes;
 
     e->texel_hash = texel_hash(key);
@@ -1175,6 +1399,39 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
     return &e->tex;
 }
 
+uint32_t gfx_tex_struct_gen(void) {
+    return sStructGen;
+}
+
+/* Which cache entry holds this texture (-1: it is not one, e.g. a render target's picture). */
+int gfx_tex_entry_index(const GuTexture* t) {
+    const char* base = (const char*)sEntries;
+    const char* p = (const char*)t;
+    if (p < base + offsetof(CacheEntry, tex) || p >= base + sizeof(sEntries)) {
+        return -1;
+    }
+    size_t off = (size_t)(p - base) - offsetof(CacheEntry, tex);
+    return off % sizeof(CacheEntry) == 0 ? (int)(off / sizeof(CacheEntry)) : -1;
+}
+
+const GuTexture* gfx_tex_entry(int index) {
+    return &sEntries[index].tex;
+}
+
+/*
+ * Use of an entry that was found without looking up its key: the same
+ * once-a-frame checks tex_get makes. False if the entry is gone or its texels
+ * or palette changed -- then tex_get has to make it again.
+ */
+RT_SPRAM bool gfx_tex_touch(int index) {
+    CacheEntry* e = &sEntries[index];
+    if (!e->used) {
+        return false;
+    }
+    e->last_used = sFrame;
+    return (e->checked_frame == sFrame && !e->stale) || sources_unchanged(e, index, false);
+}
+
 /*
  * The renderer drew into RDRAM [addr, addr + len) (a render target copied
  * back): textures read from there must check their contents on next use, even
@@ -1191,3 +1448,6 @@ void gfx_tex_invalidate_range(uint32_t addr, uint32_t len) {
         }
     }
 }
+
+/* (runs from the scratchpad: see spram.c) */
+RT_SPRAM_ENTRY(gfx_tex_touch);

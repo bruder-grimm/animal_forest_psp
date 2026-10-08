@@ -8,18 +8,22 @@
  *   gfx_dl.c       the display list interpreter: RSP and RDP state
  *   gfx_vertex.c   matrices and the vertex stage (transform, lighting, clip flags) on the VFPU
  *   gfx_combiner.c the RDP colour combiner fitted to the GE's texture functions
- *   gfx_draw.c     GE render state, texture binding, batching, triangle clipping
+ *   gfx_bind.c     texture binding: tile -> texture key -> GE texture
+ *   gfx_draw.c     GE render state, batching, vertex snapping, triangle clipping
  *   gfx_rect.c     rectangles: fills, texture rectangles, S2DEX2 backgrounds
- *   gfx_frame.c    frames: framebuffers, projection, render targets, softening, present
+ *   gfx_frame.c    frames: colour buffers, projection, copies of the screen, softening, present
+ *   gfx_target.c   render targets: the game's small pictures, drawn on the GE
  *   gfx_tex.c      texture decoding and the texture cache
  *   gfx_debug.c    screenshots, RDRAM dumps, replay, traces
  */
 #ifndef AFPSP_GFX_INTERNAL_H
 #define AFPSP_GFX_INTERNAL_H
 
+#include <pspkernel.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <pspgu.h>
 
 #include "rt.h"
@@ -64,6 +68,17 @@ typedef struct {
 } ScreenMap;
 extern ScreenMap gMap;
 
+/*
+ * VRAM (2 MB): three colour buffers at 0, 0x88000 and 0x154000 (512x272x4
+ * each) with the depth buffer at 0x110000 (gfx_frame.c), then a render
+ * target's colour and depth (gfx_target.c), whose room the softening pass
+ * borrows at the end of a frame.
+ */
+#define DEPTH_VRAM 0x110000
+#define TARGET_VRAM 0x1DC000       /* TARGET_MAX x TARGET_MAX x 4 */
+#define TARGET_DEPTH_VRAM 0x1EC000 /* TARGET_MAX x TARGET_MAX x 2, ends at 0x1F4000 */
+#define TARGET_MAX 128
+
 /* The VRAM address the CPU and sceGuCopyImage see for a GE buffer offset. */
 #define VRAM_ADDR(offset) ((void*)(0x04000000 + (uint32_t)(offset)))
 
@@ -74,15 +89,12 @@ extern bool gTracing;  /* log every draw of this task (trace_tasks.txt) */
 
 /* geometry mode */
 #define G_ZBUFFER 0x00000001
-#define G_SHADE 0x00000004
 #define G_CULL_FRONT 0x00000200
 #define G_CULL_BACK 0x00000400
 #define G_FOG 0x00010000
 #define G_LIGHTING 0x00020000
 #define G_TEXTURE_GEN 0x00040000
 #define G_TEXTURE_GEN_LINEAR 0x00080000
-#define G_SHADING_SMOOTH 0x00200000
-#define G_LIGHTING_POSITIONAL 0x00400000
 
 /* othermode */
 #define G_MDSFT_CYCLETYPE 20
@@ -104,13 +116,43 @@ extern bool gTracing;  /* log every draw of this task (trace_tasks.txt) */
 #define FORCE_BL 0x4000
 #define G_AC_THRESHOLD 1
 #define G_AC_DITHER 3
-#define G_ZS_PRIM 4
 
 #define G_MAXFBZ_FILL 0xFFFCFFFCu /* fill colour of a depth clear (G_MAXFBZ in both halves) */
+
+/* Palette formats (TexKey.tlut_type) */
+#define TLUT_NONE 0
+#define TLUT_RGBA16 2
+#define TLUT_IA16 3
 
 #define MAX_VERTICES 64
 #define MAX_MATRIX_STACK 32
 #define MAX_LIGHTS 8
+
+/* ---- pixel formats ------------------------------------------------------ */
+
+/* A GE pixel is 0xAABBGGRR; an N64 one big-endian RGBA. */
+
+/* An N64 RGBA5551 pixel as the GE's (alpha 0 or 255). */
+static inline uint32_t rgba5551_to_ge(uint32_t v) {
+    uint32_t r = (v >> 11) & 31, g = (v >> 6) & 31, b = (v >> 1) & 31;
+    return (r << 3 | r >> 2) | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2) << 16 | (v & 1 ? 0xFF000000u : 0);
+}
+
+/* A GE pixel as RGBA5551: the alpha bit is set unless its alpha is 0. */
+static inline uint32_t ge_to_rgba5551(uint32_t c) {
+    return (c & 0xF8) << 8 | (c & 0xF800) >> 5 | (c & 0xF80000) >> 18 | (c >> 24 != 0);
+}
+
+/* The colour of an N64 RGBA8888 word as the GE's, with alpha 0. */
+static inline uint32_t rgb32_to_ge(uint32_t v) {
+    return (v >> 24) | ((v >> 16) & 0xFF) << 8 | ((v >> 8) & 0xFF) << 16;
+}
+
+/* A colour channel 0..1 as a byte, rounded and clamped. */
+static inline uint32_t unit_to_byte(float v) {
+    int i = (int)(v * 255.0f + 0.5f);
+    return i < 0 ? 0 : i > 255 ? 255 : (uint32_t)i;
+}
 
 /* ---- geometry ----------------------------------------------------------- */
 
@@ -162,13 +204,11 @@ typedef struct {
 
 #define GU_VTYPE (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF)
 
+/* A light, as the vertex stage uses it: directional (a point light's position bytes are taken for a direction). */
 typedef struct {
     float col[3];
     float dir[3];      /* world direction (normalised) */
     float model_dir[3];
-    float pos[3];
-    bool point;
-    float kc, kl, kq;
 } Light;
 
 /* ---- RSP and RDP state (gfx_dl.c) --------------------------------------- */
@@ -202,6 +242,7 @@ typedef struct {
     int16_t fog_mul, fog_ofs;
     uint32_t pending_branch;
     bool s2dex;          /* the S2DEX2 microcode is loaded */
+    uint8_t vtx_first, vtx_count; /* the last G_VTX's vertices (a two-texture bake's window, gfx_draw.c) */
 } RspState;
 
 /*
@@ -223,12 +264,10 @@ typedef struct {
     uint32_t combine0, combine1;
     uint32_t env, prim, blend, fog, fill;
     float prim_lod_frac;
-    uint16_t prim_depth;
     uint32_t scissor[4];
     uint32_t cimg, zimg, timg;
     uint32_t cimg_width;
     uint8_t cimg_fmt, cimg_siz;
-    uint8_t timg_fmt, timg_siz;
     uint16_t timg_width;
     /* Texture memory: 512 units of 8 bytes. For each unit, the RDRAM bit
      * address its contents were loaded from (TMEM_INVALID if never loaded).
@@ -240,6 +279,7 @@ typedef struct {
     uint8_t tmem_swap[512];   /* unit stored with its halves exchanged */
     TmemLoad tmem_loads[TMEM_LOADS]; /* oldest first */
     int num_tmem_loads;
+    uint32_t tmem_sig;        /* tells every state of the loads above and the tables apart (tmem_load) */
     TileDesc tiles[8];
     uint32_t tlut[256];
     bool state_dirty;         /* the draw state changed since the last batch */
@@ -255,8 +295,54 @@ static inline uint32_t seg_addr(uint32_t addr) {
     return (gRsp.segments[(addr >> 24) & 0xF] + (addr & 0x00FFFFFF)) & 0x1FFFFFFF;
 }
 
+static inline uint32_t rdp_cycle_type(void) {
+    return (gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3;
+}
+
 static inline bool rdp_two_cycle(void) {
-    return ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
+    return rdp_cycle_type() == G_CYC_2CYCLE;
+}
+
+/*
+ * The blender's selectors (other mode low, bits 16-31): P * A + M * B per
+ * cycle, the first cycle's at these shifts, the second's two bits lower.
+ */
+#define BL_SHIFT_P 30
+#define BL_SHIFT_A 26
+#define BL_SHIFT_M 22
+#define BL_SHIFT_B 18
+
+/* A selector of the blender's last cycle: the second one in 2-cycle mode. */
+static inline int rdp_blend_last(int shift) {
+    return (int)(gRdp.other_l >> (rdp_two_cycle() ? shift - 2 : shift)) & 3;
+}
+
+/* Does the blender mix the pixel with memory by its alpha (M memory, B 1 - A), as translucent surfaces do? */
+static inline bool rdp_blends_by_alpha(void) {
+    uint32_t l = gRdp.other_l;
+    return ((l & FORCE_BL) || (l & ZMODE_DEC) == ZMODE_XLU) && rdp_blend_last(BL_SHIFT_M) == 1 &&
+           rdp_blend_last(BL_SHIFT_B) == 0;
+}
+
+/* The palette format a CI texture is read with. */
+static inline uint8_t rdp_tlut_type(void) {
+    return ((gRdp.other_h >> G_MDSFT_TEXTLUT) & 3) == 3 ? TLUT_IA16 : TLUT_RGBA16;
+}
+
+/* The combiner and the constants it reads (the LOD fraction as its bits): what a fit or a bake is made from. */
+typedef struct {
+    uint32_t c0, c1, prim, env, lod;
+} CombinerState;
+
+static inline CombinerState rdp_combiner_state(void) {
+    CombinerState st = { gRdp.combine0, gRdp.combine1, gRdp.prim, gRdp.env, 0 };
+    memcpy(&st.lod, &gRdp.prim_lod_frac, sizeof(st.lod));
+    return st;
+}
+
+/* (field by field: a memcmp is a library call, and this is on the state path) */
+static inline bool combiner_state_equal(const CombinerState* a, const CombinerState* b) {
+    return a->c0 == b->c0 && a->c1 == b->c1 && a->prim == b->prim && a->env == b->env && a->lod == b->lod;
 }
 
 /* Runs a graphics task's display list (on the renderer thread). */
@@ -316,6 +402,11 @@ typedef struct {
 extern const RspVertex* gHintTri[3];
 
 void gfx_classify_combiner(CombinerFit* fit);
+bool gfx_combiner_reads_two_textures(void);
+/* Classifies into `fit` (and gFit), reusing gFit when the combiner and its constants are unchanged. */
+void gfx_classify_cached(CombinerFit* fit);
+/* gFit was set by something other than a classification (a copy-mode rectangle's fit). */
+void gfx_fit_replaced(void);
 /* Which tiles the hint triangle samples only at a clamped edge (bits 0 and 1). */
 int gfx_pin_signature(void);
 /* Which of a TEXVAR_COMBINE2 pair the baked colour comes from (0: T0, 1: T1; set when binding one). */
@@ -326,17 +417,9 @@ static inline uint32_t vertex_color(const CombinerFit* fit, float r, float g, fl
     float sh[3] = { r, g, b };
     uint32_t out = 0;
     for (int ch = 0; ch < 3; ch++) {
-        float v = fit->base[ch] + fit->s[ch] * sh[ch] + fit->sa[ch] * a;
-        int iv = (int)(v * 255.0f + 0.5f);
-        if (iv < 0) iv = 0;
-        if (iv > 255) iv = 255;
-        out |= (uint32_t)iv << (8 * ch);
+        out |= unit_to_byte(fit->base[ch] + fit->s[ch] * sh[ch] + fit->sa[ch] * a) << (8 * ch);
     }
-    float va = fit->abase + fit->as * a;
-    int ia = (int)(va * 255.0f + 0.5f);
-    if (ia < 0) ia = 0;
-    if (ia > 255) ia = 255;
-    return out | ((uint32_t)ia << 24);
+    return out | unit_to_byte(fit->abase + fit->as * a) << 24;
 }
 
 /* ---- textures (gfx_tex.c) ----------------------------------------------- */
@@ -354,10 +437,6 @@ static inline uint32_t vertex_color(const CombinerFit* fit, float r, float g, fl
 
 #define G_TX_MIRROR 0x1
 #define G_TX_CLAMP 0x2
-
-#define TLUT_NONE 0
-#define TLUT_RGBA16 2
-#define TLUT_IA16 3
 
 /* Bits per texel, by G_IM_SIZ_* */
 static const uint8_t kTexelBits[4] = { 4, 8, 16, 32 };
@@ -430,6 +509,8 @@ typedef struct {
     float ratio_x, off_x, ratio_y, off_y;
     uint8_t base_second;    /* this tile is the combiner's TEXEL1, not TEXEL0 */
     uint8_t bake_kind;      /* BAKE_COLOUR, or which half of a split combiner (BAKE_X, BAKE_Y) */
+    int16_t win_x0, win_y0; /* a bake of only win_w x win_h texels from these on (gfx_bake_window; 0: all) */
+    uint16_t win_w, win_h;
     uint32_t comb0, comb1;  /* the combine words the bake was made from */
     uint32_t comb_prim, comb_env;
     float comb_lod;         /* primitive LOD fraction, a combiner input too */
@@ -450,15 +531,21 @@ typedef struct {
     bool alpha_binary;    /* every texel's alpha is 0 or 255 (partial only where filtered) */
     uint16_t buf_width;   /* a render target's picture in VRAM (gfx_target_texture): texels from a row to the
                              next; what it shows changes with the pointer staying the same. 0 for any other. */
+    int16_t win_s, win_t; /* the tile texel at GU texel 0 (a windowed bake, clamped on that axis) */
 } GuTexture;
 
 void gfx_tex_init(void);
 void gfx_tex_new_frame(void);
+/* Makes `second` the second source of a two-texture key (TEXVAR_PRODUCT, TEXVAR_COMBINE2). */
+void gfx_tex_set_second(TexKey* key, const TexKey* second);
 /* Returns a decoded texture for key (cached; content-hashed for RAM textures). */
 const GuTexture* gfx_tex_get(const TexKey* key);
 /* The same for a texture that is only drawn with, never looked at: a render
  * target's picture is then sampled where it is in VRAM (gfx_target_texture). */
 const GuTexture* gfx_tex_get_to_draw(const TexKey* key);
+/* A TEXVAR_COMBINE2 key whose draw reaches texels [lo, hi] of its tile: bakes only those, where
+ * that is less than the period the bake would otherwise cover. Returns whether it did. */
+bool gfx_bake_window(TexKey* key, const float lo[2], const float hi[2]);
 /* Texture builds (and two-texture bakes among them) and their time since the last call. */
 void gfx_tex_take_build_stats(uint32_t* builds, uint32_t* bakes, uint32_t* us);
 /* Bakes put off by the per-frame budget since the last call (an older bake of the pair was used). */
@@ -469,6 +556,13 @@ void gfx_tex_invalidate_range(uint32_t addr, uint32_t len);
 void gfx_tex_flush_retired(void);
 /* One texel as RGBA8888, whatever format and layout it is stored in. */
 uint32_t gfx_tex_texel(const GuTexture* t, uint32_t x, uint32_t y);
+/* A texture found again without its key (gfx_draw.c's bind memo): the generation of the cache's
+ * entries (it changes when one is freed), an entry's index (-1: not one), the texture in an entry,
+ * and the once-a-frame checks of a use (false: gone or changed, look it up again). */
+uint32_t gfx_tex_struct_gen(void);
+int gfx_tex_entry_index(const GuTexture* t);
+const GuTexture* gfx_tex_entry(int index);
+bool gfx_tex_touch(int index);
 /* A split combiner's baked texel (BAKE_X or BAKE_Y) for a pair of source texels, memoised:
  * gfx_bake_split_prepare once per bake (the tag), then gfx_bake_split_lookup per texel. */
 #define SPLIT_MEMO 16384
@@ -503,6 +597,29 @@ static inline uint8_t gfx_bake_alpha_lookup(uint8_t a0, uint8_t a1) {
     return gfx_bake_alpha_fill(k);
 }
 
+/* ---- texture binding (gfx_bind.c) --------------------------------------- */
+
+/* The bound texture's coordinate transform: u = s * scale_u - off_u, s in 1/32 texel (v likewise). */
+typedef struct {
+    float scale_u, scale_v, off_u, off_v;
+} TexTransform;
+
+extern TexTransform gTexTransform;
+extern TexKey gBoundKey; /* the key of the texture bound last (for traces) */
+
+/* Tile coordinates -> texture key; false if the tile's texture memory was never loaded. */
+bool gfx_make_tile_key(const TileDesc* tile, bool white_rgb, TexKey* key);
+/* A tile's shift as the factor it scales texture coordinates by. */
+float gfx_tile_shift(uint8_t shift);
+/* Binds the texture the fit samples of tile tile_index (and the next one, for two-texture fits); NULL if none. */
+const GuTexture* gfx_bind_texture(int tile_index, const CombinerFit* fit);
+/* A split combiner's second pass: its other bake (BAKE_Y), found but not bound. */
+const GuTexture* gfx_split_second_texture(int tile_index, const CombinerFit* fit);
+/* A bake of only the texels its draw reaches is bound (bit 0: along s, bit 1: along t) ... */
+extern uint8_t gBakeWindow;
+/* ... and the triangle (gHintTri) reaches past them. */
+bool gfx_bake_window_left(void);
+
 /* ---- GE state and drawing (gfx_draw.c) ---------------------------------- */
 
 /* What the GE was last told, so unchanged state isn't sent again (-1: unknown). */
@@ -527,13 +644,24 @@ typedef struct {
 
 extern GuCache gGu;
 extern CombinerFit gFit;                /* the fit of the current draw state */
+
+/* The GE's texture wrap modes and filter. */
+static inline void gfx_gu_tex_sampler(int wrap_u, int wrap_v, int filter) {
+    if (wrap_u != gGu.wrap_u || wrap_v != gGu.wrap_v) {
+        sceGuTexWrap(wrap_u, wrap_v);
+        gGu.wrap_u = wrap_u;
+        gGu.wrap_v = wrap_v;
+    }
+    if (filter != gGu.tex_filter) {
+        sceGuTexFilter(filter, filter);
+        gGu.tex_filter = filter;
+    }
+}
 extern const GuTexture* gBatchTex;      /* the texture it samples, NULL for none */
 
 void gfx_gu_reset_cache(void);
-/* Tile coordinates -> texture key; false if the tile's texture memory was never loaded. */
-bool gfx_make_tile_key(const TileDesc* tile, bool white_rgb, TexKey* key);
-float gfx_tile_shift(uint8_t shift);
-const GuTexture* gfx_bind_texture(int tile_index, const CombinerFit* fit);
+/* Alpha blending (by the source alpha) on or off. */
+void gfx_gu_blending(bool on);
 void gfx_gu_texture_image(const GuTexture* tex);
 void gfx_gu_texturing(bool on);
 void gfx_gu_tex_func(const CombinerFit* fit);
@@ -548,6 +676,8 @@ void gfx_apply_render_state(bool depth_allowed);
 void gfx_gu_stencil_off(void);
 /* Does the screen's stencil say which surfaces stand upright (see sStencilClass)? */
 bool gfx_stencil_classes(void);
+/* Is the render mode an antialiased texture edge (G_RM_AA_TEX_EDGE and its kin)? */
+bool gfx_aa_edge_mode(void);
 void gfx_apply_aa_edge(const GuTexture* tex, const CombinerFit* fit);
 /* The other modes changed: the draw state is dirty, and gRdp.keeps_memory is worked out again. */
 void gfx_other_mode_changed(void);
@@ -564,6 +694,8 @@ void gfx_forget_packed(int first, int count);
 void gfx_batches_new_frame(void);
 void gfx_update_snap(void);
 void gfx_weld_reset(void);
+/* G_VTX: the snapping work for the vertices just loaded that does not depend on the triangles. */
+void gfx_snap_precompute(const RspVertex* verts, int start, int count);
 
 /* ---- rectangles (gfx_rect.c) -------------------------------------------- */
 
@@ -574,7 +706,7 @@ void gfx_fill_rect(uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry);
 void gfx_tex_rect(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3, bool flip);
 void gfx_s2dex_bg(uint32_t addr, bool copy);
 
-/* ---- frames and render targets (gfx_frame.c) ---------------------------- */
+/* ---- frames (gfx_frame.c) and render targets (gfx_target.c) ------------- */
 
 #define PROJ_NORMAL 0 /* the N64 projection, identity view */
 #define PROJ_FLAT_Z 1 /* depth ignored: clip z pinned to 0, so NoN geometry in front of the near plane (2D UI) isn't dropped */
@@ -587,15 +719,18 @@ void gfx_s2dex_bg(uint32_t addr, bool copy);
 extern bool gFrameOpen;   /* a GE display list is open for the current frame */
 extern int gProjVariant;  /* PROJ_* uploaded to the GE, -1 unknown or pinned */
 
-/* A small colour image of the game's own that is drawn on the GE and copied back (see gfx_frame.c). */
+/* What the renderer has learned from earlier frames about the game's framebuffers (a part of a capture). */
+void gfx_frame_capture(RtCapture* c);
+
+/* A small colour image of the game's own that is drawn on the GE and copied back (see gfx_target.c). */
 typedef struct {
     bool bound;            /* the GE draws into the target */
-    bool dirty;            /* RT_VRAM holds drawing that RDRAM doesn't have yet */
+    bool dirty;            /* TARGET_VRAM holds drawing that RDRAM doesn't have yet */
     bool was_clean;        /* ... and didn't before the draw now being set up (gfx_select_target) */
     uint32_t solid_rows;   /* its rows above this one are covered all the way across (see gfx_target_covered) */
-    bool unloaded;         /* RT_VRAM has yet to get its picture from RDRAM (below solid_rows; see gfx_target_ready) */
+    bool unloaded;         /* TARGET_VRAM has yet to get its picture from RDRAM (below solid_rows; see gfx_target_ready) */
     uint32_t addr, width, height, siz;
-    uint32_t vram_addr, vram_sum; /* what RT_VRAM holds: RDRAM address and checksum when they last agreed */
+    uint32_t vram_addr, vram_sum; /* what TARGET_VRAM holds: RDRAM address and checksum when they last agreed */
     uint32_t pending_zclear; /* a depth image the game cleared as a colour image (0: none) */
 } RenderTarget;
 
@@ -603,6 +738,12 @@ extern RenderTarget gTarget;
 extern uint32_t gDisplayZimg; /* the depth image drawn with the screen */
 
 void gfx_open_frame(void);
+/* Points the GE at the screen's buffers again. */
+void gfx_draw_to_screen(void);
+/* Waits for the GE to finish the display list so far, and goes on with a new one. */
+void gfx_finish_list(void);
+/* The current colour and depth images are the screen's: the frame being drawn shows them. */
+void gfx_screen_images_drawn(void);
 void gfx_set_viewport(void);
 void gfx_ge_viewport(int* cx, int* cy, int* w, int* h);
 void gfx_set_scissor(void);
@@ -641,7 +782,7 @@ static inline void gfx_target_need(uint32_t addr, uint32_t len) {
         gfx_target_flush_range(addr, len);
     }
 }
-/* A fill of the whole bound target, done in RDRAM too instead of copied back (see gfx_frame.c). */
+/* A fill of the whole bound target, done in RDRAM too instead of copied back (see gfx_target.c). */
 bool gfx_target_fill_known(bool keep_alpha);
 void gfx_target_filled(uint32_t pixel, bool keep_alpha);
 void gfx_target_not_drawn(void);

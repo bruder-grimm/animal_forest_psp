@@ -2,7 +2,7 @@
 # Builds work/text/text_en.bin -- the English dialogue for the port -- from
 # your own copy of the European Animal Crossing disc (GAFP01, .iso or .ciso)
 # and the Japanese Animal Forest ROM. `gmake install` then copies it next to
-# the EBOOT, and runtime/src/text_en.c uses it when present.
+# the EBOOT, and runtime/src/english/ uses it when present.
 #
 #   scripts/make_text_en.sh "Animal Crossing (Europe) (En,Fr,De,Es,It).ciso"
 set -euo pipefail

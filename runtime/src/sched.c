@@ -11,6 +11,11 @@
  * Hardware events (VI retrace, timers, RSP completion, ...) are raised by
  * helper PSP threads. They are queued here and delivered into the game's
  * message queues by whichever game thread next enters the scheduler.
+ *
+ * Game threads run on stacks of the runtime's own (sGameStacks), at the same
+ * addresses in every run of a build, and each saves its context (RtCtx) when
+ * it starts waiting for the baton. Those stacks and contexts are what lets a
+ * capture be resumed (capture.c): new PSP threads jump back into them.
  */
 #include <pspkernel.h>
 #include <pspthreadman.h>
@@ -21,7 +26,93 @@
 #include "rt.h"
 
 #define MAX_THREADS 32
-#define THREAD_STACK_SIZE (128 * 1024)
+
+/*
+ * The game threads' stacks. A PSP thread starts on a small stack of the
+ * kernel's (HOST_STACK_SIZE) and moves to one of these. Animal Forest has
+ * about ten threads at a time (its flash thread comes and goes for every
+ * 16 KB of a save); none was seen to use more than 5 KB (captures log it:
+ * rt_sched_log_stacks), as recompiled code keeps the game's own stack in RDRAM.
+ *
+ * Where they are matters on hardware: at a thread switch the firmware kills
+ * a thread whose stack pointer is below the stack it gave the thread (it
+ * takes that for an overflow; PPSSPP doesn't check). So the game stacks are
+ * one block reserved straight after the module at startup, at the same address
+ * in every run of a build, and the game threads' own stacks are allocated from
+ * the bottom of memory (PSP_THREAD_ATTR_LOW_MEM_STACK), into a hole left for
+ * them just below it (reserve_stacks).
+ */
+#define NUM_GAME_STACKS 16
+#define GAME_STACK_SIZE (64 * 1024)
+#define HOST_STACK_SIZE (8 * 1024)
+#define HOST_STACK_ROOM ((NUM_GAME_STACKS + 8) * HOST_STACK_SIZE)
+#define STACK_FILL 0xA5A5A5A5u /* what an unused stack holds: shows how much was used */
+/* (not in this PSPSDK's pspthreadman.h) the thread's stack from the bottom of its partition */
+#define PSP_THREAD_ATTR_LOW_MEM_STACK 0x00400000
+
+/* At the top of each game stack: where the PSP thread on it left its own stack. */
+typedef struct {
+    RtCtx* exit;     /* rt_ctx_jump there to leave the game stack (thread_exit_now) */
+    uint32_t pad[3];
+} StackTop;
+
+static uint32_t (*sGameStacks)[GAME_STACK_SIZE / 4];
+static SceUID sGameStacksBlock = -1;
+/* Taken by osCreateThread, given back by the PSP thread once it has left the stack. */
+static volatile bool sStackBusy[NUM_GAME_STACKS];
+
+static void reserve_stacks(void) {
+    static bool reserved = false;
+    if (reserved) {
+        return;
+    }
+    reserved = true;
+    SceUID room = sceKernelAllocPartitionMemory(2, "rt_kstack_room", PSP_SMEM_Low, HOST_STACK_ROOM, NULL);
+    sGameStacksBlock = sceKernelAllocPartitionMemory(2, "rt_game_stacks", PSP_SMEM_Low,
+                                                     NUM_GAME_STACKS * GAME_STACK_SIZE, NULL);
+    if (sGameStacksBlock >= 0) {
+        sGameStacks = sceKernelGetBlockHeadAddr(sGameStacksBlock);
+    }
+    if (room >= 0) {
+        sceKernelFreePartitionMemory(room);
+    }
+}
+
+void* rt_sched_stacks_addr(void) {
+    return sGameStacks;
+}
+
+/*
+ * The C library takes nearly all free memory for its heap at the first
+ * malloc, which comes before main (Makefile: -Wl,--wrap=_sbrk). The game
+ * stacks are reserved first, so they come straight after the module.
+ */
+void* __real__sbrk(ptrdiff_t incr);
+void* __wrap__sbrk(ptrdiff_t incr) {
+    reserve_stacks();
+    return __real__sbrk(incr);
+}
+
+static StackTop* stack_top(int index) {
+    return (StackTop*)&sGameStacks[index][GAME_STACK_SIZE / 4] - 1;
+}
+
+/* Fills game stack i with STACK_FILL, so that how much of it gets used shows (rt_sched_log_stacks). */
+static void fill_stack(int i) {
+    for (uint32_t w = 0; w < GAME_STACK_SIZE / 4; w++) {
+        sGameStacks[i][w] = STACK_FILL;
+    }
+}
+
+/* The game stack the caller is on, or -1. */
+static int current_stack(void) {
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t base = (uintptr_t)sGameStacks;
+    if (sp < base || sp >= base + NUM_GAME_STACKS * GAME_STACK_SIZE) {
+        return -1;
+    }
+    return (int)((sp - base) / GAME_STACK_SIZE);
+}
 
 /* OSThread field offsets */
 #define OSTHREAD_NEXT 0x00
@@ -79,6 +170,9 @@ typedef struct GameThread {
     uint32_t wait_count;
     uint32_t hold_max;  /* longest unbroken stretch holding the baton */
     uint32_t hold_calls;/* indirect calls made during that stretch */
+    int stack;            /* its game stack (sGameStacks) */
+    volatile bool parked; /* waiting for the baton, with its context in park */
+    RtCtx park;
     recomp_context ctx;
 } GameThread;
 
@@ -106,6 +200,11 @@ static uint32_t sOrderCounter = 0;
 
 static inline SchedSlot* slot_of(const GameThread* t) {
     return &sSlots[t - sThreads];
+}
+
+/* A slot with a thread that hasn't ended. */
+static bool is_live(const SchedSlot* slot) {
+    return slot->state != TS_FREE && slot->state != TS_DEAD;
 }
 
 static void deliver_external(void);
@@ -282,6 +381,12 @@ static uint32_t wait_external(uint32_t timeout_us) {
     return (uint32_t)(t1 - t0);
 }
 
+static void reset_thread_stats(GameThread* t) {
+    t->cpu_us = t->idle_us = 0;
+    t->wait_max = t->wait_sum = t->wait_count = 0;
+    t->hold_max = t->hold_calls = 0;
+}
+
 /*
  * Per thread since the last report: " t<id> <CPU share>%/w<average>,<worst
  * wait for the baton>/h<longest hold>,<indirect calls in it>", then the
@@ -292,7 +397,7 @@ void rt_sched_report(char* buf, int size, uint32_t span_us) {
     charge_current();
     for (int i = 0; i < sNumSlots && len < size; i++) {
         GameThread* t = &sThreads[i];
-        if (sSlots[i].state == TS_FREE || sSlots[i].state == TS_DEAD) {
+        if (!is_live(&sSlots[i])) {
             continue;
         }
         unsigned pct = span_us ? (unsigned)((uint64_t)t->cpu_us * 100 / span_us) : 0;
@@ -302,10 +407,7 @@ void rt_sched_report(char* buf, int size, uint32_t span_us) {
             len += snprintf(buf + len, size - len, " t%d %u%%/w%u,%u/h%u,%u", t->id, pct, avg,
                             (unsigned)t->wait_max, (unsigned)t->hold_max, (unsigned)t->hold_calls);
         }
-        t->wait_max = t->wait_sum = t->wait_count = 0;
-        t->hold_max = t->hold_calls = 0;
-        t->cpu_us = 0;
-        t->idle_us = 0;
+        reset_thread_stats(t);
     }
     if (len < size) {
         snprintf(buf + len, size - len, " sw %u", (unsigned)sSwitches);
@@ -316,8 +418,15 @@ void rt_sched_report(char* buf, int size, uint32_t span_us) {
 /* ---- run queue ---------------------------------------------------------- */
 
 void rt_sched_init(void) {
+    if (sGameStacks == NULL) {
+        rt_fatal("no room for the game threads' stacks (%08X)", (unsigned)sGameStacksBlock);
+    }
+    rt_log("game stacks at %p", (void*)sGameStacks);
     memset(sThreads, 0, sizeof(sThreads));
     memset(sSlots, 0, sizeof(sSlots));
+    for (int i = 0; i < NUM_GAME_STACKS; i++) {
+        fill_stack(i);
+    }
     sExtLock = sceKernelCreateSema("rt_ext_lock", 0, 1, 1, NULL);
     sExtSignal = sceKernelCreateSema("rt_ext_signal", 0, 0, 0x7FFFFFFF, NULL);
 }
@@ -443,10 +552,31 @@ void rt_sched_poke(void) {
     push_external(&m);
 }
 
-/* The host thread deletes its own semaphore: nobody else signals it once the slot is dead. */
+/*
+ * The host thread deletes its own semaphore: nobody else signals it once the
+ * slot is dead. It leaves its game stack for its own before it exits
+ * (game_thread_main), which frees the game stack for another thread.
+ */
 static void thread_exit_now(SceUID sema) {
     sceKernelDeleteSema(sema);
+    int stack = current_stack();
+    if (stack >= 0) {
+        rt_ctx_jump(stack_top(stack)->exit);
+    }
     sceKernelExitDeleteThread(0);
+}
+
+/* Just woken with the baton: false if this host thread is to exit instead (see wait_for_baton). */
+static bool keep_baton(GameThread* self) {
+    if (self->thid != sceKernelGetThreadId()) {
+        return false;
+    }
+    self->parked = false;
+    if (self->destroyed) {
+        slot_of(self)->state = TS_DEAD;
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -454,14 +584,20 @@ static void thread_exit_now(SceUID sema) {
  * semaphore is passed in rather than read from the slot, and ownership is
  * checked by host thread id: a retired slot can be cleared and reused for a
  * new thread while its old host thread is still on its way out.
+ *
+ * The context saved here is where a capture's threads resume (rt_sched_resume):
+ * there, a new host thread holding the baton comes out of rt_ctx_save.
  */
 static void wait_for_baton(GameThread* self, SceUID sema) {
-    sceKernelWaitSema(sema, 1, NULL);
-    if (self->thid != sceKernelGetThreadId()) {
-        thread_exit_now(sema);
+    if (sGameStacks[self->stack][0] != STACK_FILL) {
+        rt_fatal("game thread %d has overflowed its stack", self->id);
     }
-    if (self->destroyed) {
-        slot_of(self)->state = TS_DEAD;
+    if (rt_ctx_save(&self->park) != 0) {
+        return;
+    }
+    self->parked = true;
+    sceKernelWaitSema(sema, 1, NULL);
+    if (!keep_baton(self)) {
         thread_exit_now(sema);
     }
 }
@@ -774,13 +910,17 @@ static void init_context(recomp_context* ctx, uint32_t sp, uint32_t arg) {
 typedef struct {
     GameThread* self;
     SceUID sema;
+    int stack;
+    bool resume; /* a thread of a capture: jump into self->park once it has the baton */
 } ThreadStart;
 
-static int game_thread_main(SceSize args, void* argp) {
-    ThreadStart start = *(ThreadStart*)argp;
-    GameThread* self = start.self;
+/* A game thread, on its game stack. */
+static void game_thread_body(void* arg) {
+    /* (start is on the host thread's own stack, which a capture doesn't keep: nothing of it is used after the wait) */
+    const ThreadStart* start = arg;
+    GameThread* self = start->self;
 
-    wait_for_baton(self, start.sema);
+    wait_for_baton(self, start->sema);
     init_context(&self->ctx, self->sp, self->arg);
     rt_log("thread %d (%08X) starting at %08X, pri %d", self->id, self->addr, self->entry,
            (int)slot_of(self)->priority);
@@ -789,7 +929,69 @@ static int game_thread_main(SceSize args, void* argp) {
 
     rt_log("thread %d (%08X) returned", self->id, self->addr);
     switch_out(TS_DEAD);
+}
+
+/*
+ * The host thread of a game thread. It moves to the thread's game stack, or,
+ * for a thread of a capture, waits for the baton here and jumps to where the
+ * thread was waiting for it. It comes back here only to exit (thread_exit_now).
+ */
+static int game_thread_main(SceSize args, void* argp) {
+    ThreadStart start = *(ThreadStart*)argp;
+    RtCtx exit;
+    stack_top(start.stack)->exit = &exit;
+    if (rt_ctx_save(&exit) == 0) {
+        if (!start.resume) {
+            rt_call_on_stack(stack_top(start.stack), game_thread_body, &start);
+        } else {
+            sceKernelWaitSema(start.sema, 1, NULL);
+            if (keep_baton(start.self)) {
+                rt_ctx_jump(&start.self->park);
+            }
+            sceKernelDeleteSema(start.sema);
+        }
+    }
+    sStackBusy[start.stack] = false;
+    sceKernelExitDeleteThread(0);
     return 0;
+}
+
+/* Starts the host thread of game thread t. */
+static void start_host_thread(GameThread* t, bool resume) {
+    char name[32];
+    snprintf(name, sizeof(name), "n64_thread_%d", t->id);
+    /* No PSP_THREAD_ATTR_VFPU: only the renderer uses the VFPU (on its own thread), and the
+     * kernel saves and restores all of its registers on every switch to or from a thread that
+     * may -- 3.5 us of each of the 15 us a switch between two such threads took on the PSP. */
+    t->thid = sceKernelCreateThread(name, game_thread_main, RT_GAME_THREAD_PRIORITY, HOST_STACK_SIZE,
+                                    PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_LOW_MEM_STACK, NULL);
+    if (t->thid < 0) {
+        rt_fatal("sceKernelCreateThread failed: %08X", (unsigned)t->thid);
+    }
+    SceKernelThreadInfo info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    if (sceKernelReferThreadStatus(t->thid, &info) == 0 && (uintptr_t)info.stack >= (uintptr_t)sGameStacks) {
+        /* The firmware would take the game stack for an overflow of this one and kill the thread. */
+        rt_fatal("thread %d's own stack is at %p, not below the game stacks", t->id, info.stack);
+    }
+    ThreadStart start = { t, t->sema, t->stack, resume };
+    sceKernelStartThread(t->thid, sizeof(start), &start);
+}
+
+static int alloc_stack(void) {
+    for (int tries = 0; tries < 1000; tries++) {
+        for (int i = 0; i < NUM_GAME_STACKS; i++) {
+            if (!sStackBusy[i]) {
+                sStackBusy[i] = true;
+                fill_stack(i);
+                return i;
+            }
+        }
+        /* A host thread on its way out still has one: give it a moment. */
+        sceKernelDelayThread(1000);
+    }
+    rt_fatal("out of game thread stacks");
 }
 
 static GameThread* alloc_thread(void) {
@@ -812,6 +1014,19 @@ static GameThread* alloc_thread(void) {
 
 /* ---- libultra: threads -------------------------------------------------- */
 
+/* The thread an OSThread* argument names: NULL is the calling one. */
+static GameThread* thread_arg(uint32_t addr) {
+    return addr == 0 ? sCurrent : find_thread(addr);
+}
+
+/* Ends a thread other than the calling one: its host thread exits as soon as it gets the baton. */
+static void retire_thread(GameThread* t) {
+    t->destroyed = true;
+    slot_of(t)->state = TS_DEAD;
+    t->thid = -1;
+    sceKernelSignalSema(t->sema, 1);
+}
+
 void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     uint32_t addr = ctx->r4;
     int32_t id = (int32_t)ctx->r5;
@@ -830,13 +1045,10 @@ void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     GameThread* existing = find_thread(addr);
     if (existing != NULL) {
         existing->addr = 0;
-        if (slot_of(existing)->state != TS_DEAD) {
+        if (existing == sCurrent) {
             existing->destroyed = true;
-            if (existing != sCurrent) {
-                slot_of(existing)->state = TS_DEAD;
-                existing->thid = -1;
-                sceKernelSignalSema(existing->sema, 1);
-            }
+        } else if (slot_of(existing)->state != TS_DEAD) {
+            retire_thread(existing);
         }
     }
 
@@ -849,6 +1061,7 @@ void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     slot_of(t)->priority = pri;
     slot_of(t)->state = TS_STOPPED;
     t->sema = sceKernelCreateSema("rt_thread", 0, 0, 1, NULL);
+    t->stack = alloc_stack();
 
     wr_w32(addr + OSTHREAD_NEXT, 0);
     wr_w32(addr + OSTHREAD_PRIORITY, (uint32_t)pri);
@@ -858,18 +1071,7 @@ void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
     wr_u16(addr + OSTHREAD_FLAGS, 0);
     wr_w32(addr + OSTHREAD_ID, (uint32_t)id);
 
-    char name[32];
-    snprintf(name, sizeof(name), "n64_thread_%d", id);
-    /* No PSP_THREAD_ATTR_VFPU: only the renderer uses the VFPU (on its own thread), and the
-     * kernel saves and restores all of its registers on every switch to or from a thread that
-     * may -- 3.5 us of each of the 15 us a switch between two such threads took on the PSP. */
-    t->thid = sceKernelCreateThread(name, game_thread_main, RT_GAME_THREAD_PRIORITY, THREAD_STACK_SIZE,
-                                    PSP_THREAD_ATTR_USER, NULL);
-    if (t->thid < 0) {
-        rt_fatal("sceKernelCreateThread failed: %08X", (unsigned)t->thid);
-    }
-    ThreadStart start = { t, t->sema };
-    sceKernelStartThread(t->thid, sizeof(start), &start);
+    start_host_thread(t, false);
 
     rt_log("osCreateThread id=%d addr=%08X entry=%08X pri=%d", id, addr, entry, pri);
 }
@@ -901,7 +1103,7 @@ void osStartThread_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void osStopThread_recomp(uint8_t* rdram, recomp_context* ctx) {
-    GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
+    GameThread* t = thread_arg(ctx->r4);
     if (t == NULL) {
         return;
     }
@@ -916,28 +1118,22 @@ void osStopThread_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void osDestroyThread_recomp(uint8_t* rdram, recomp_context* ctx) {
-    GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
+    GameThread* t = thread_arg(ctx->r4);
     if (t == NULL) {
         return;
     }
     if (t == sCurrent) {
         t->destroyed = true;
         switch_out(TS_DEAD);
-        return;
+    } else if (slot_of(t)->state != TS_DEAD) {
+        /* (a thread that has returned -- AF destroys its finished flash thread -- has no host thread
+           left, which has deleted its semaphore) */
+        retire_thread(t);
     }
-    if (slot_of(t)->state == TS_DEAD) {
-        /* Already returned (AF destroys its finished flash thread): its host thread
-           is gone and has deleted its semaphore. */
-        return;
-    }
-    t->destroyed = true;
-    slot_of(t)->state = TS_DEAD;
-    t->thid = -1;
-    sceKernelSignalSema(t->sema, 1);
 }
 
 void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
-    GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
+    GameThread* t = thread_arg(ctx->r4);
     if (t == NULL) {
         return;
     }
@@ -949,12 +1145,12 @@ void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 void osGetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
-    GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
+    GameThread* t = thread_arg(ctx->r4);
     ctx->r2 = t != NULL ? (gpr)slot_of(t)->priority : 0;
 }
 
 void osGetThreadId_recomp(uint8_t* rdram, recomp_context* ctx) {
-    GameThread* t = ctx->r4 == 0 ? sCurrent : find_thread(ctx->r4);
+    GameThread* t = thread_arg(ctx->r4);
     ctx->r2 = t != NULL ? (gpr)t->id : 0;
 }
 
@@ -982,18 +1178,20 @@ void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 #define OS_MESG_BLOCK 1
 
-void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+/* s32 osSendMesg/osJamMesg(OSMesgQueue* mq, OSMesg msg, s32 flag) */
+static void send_mesg(recomp_context* ctx, bool jam) {
     rt_process_external();
-    bool sent = do_send(ctx->r4, ctx->r5, false, ctx->r6 == OS_MESG_BLOCK);
+    bool sent = do_send(ctx->r4, ctx->r5, jam, ctx->r6 == OS_MESG_BLOCK);
     rt_check_preempt();
     ctx->r2 = sent ? 0 : (gpr)-1;
 }
 
+void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+    send_mesg(ctx, false);
+}
+
 void osJamMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
-    rt_process_external();
-    bool sent = do_send(ctx->r4, ctx->r5, true, ctx->r6 == OS_MESG_BLOCK);
-    rt_check_preempt();
-    ctx->r2 = sent ? 0 : (gpr)-1;
+    send_mesg(ctx, true);
 }
 
 void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -1019,4 +1217,169 @@ void rt_sched_run_boot(uint32_t entry_vram, uint32_t sp) {
     rt_log("running boot code at %08X, sp %08X", entry_vram, sp);
     get_function((int32_t)entry_vram)(g_rdram, &boot_ctx);
     rt_fatal("boot code returned without starting a thread");
+}
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+bool rt_sched_quiet(void) {
+    deliver_external();
+    for (int i = 0; i < sNumSlots; i++) {
+        if (!is_live(&sSlots[i]) || &sThreads[i] == sCurrent) {
+            continue;
+        }
+        /* Host work in progress would end in a wake-up that the capture couldn't hold. */
+        if (!sThreads[i].parked || (sSlots[i].state == TS_WAITING && sSlots[i].wait_kind == WAIT_NATIVE)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rt_sched_checkpoint(void (*write)(void*), void* arg) {
+    GameThread* self = sCurrent;
+    if (!on_game_thread()) {
+        rt_fatal("capture taken off a game thread");
+    }
+    if (rt_ctx_save(&self->park) != 0) {
+        return true;
+    }
+    self->parked = true;
+    write(arg);
+    self->parked = false;
+    /* (the capture's own time is not the game holding the CPU) */
+    sRunStart = sceKernelGetSystemTimeLow();
+    return false;
+}
+
+/* The bytes of t's game stack that are in use while it waits: from its saved stack pointer up. */
+static uint8_t* parked_stack(const GameThread* t, uint32_t* size) {
+    if (t->stack < 0 || t->stack >= NUM_GAME_STACKS) {
+        rt_fatal("capture: thread %d has no game stack", t->id);
+    }
+    uintptr_t base = (uintptr_t)sGameStacks[t->stack];
+    uintptr_t top = base + GAME_STACK_SIZE;
+    if (t->park.sp < base || t->park.sp >= top) {
+        rt_fatal("capture: thread %d's stack pointer %08X is off its stack", t->id, (unsigned)t->park.sp);
+    }
+    *size = (uint32_t)(top - t->park.sp);
+    return (uint8_t*)t->park.sp;
+}
+
+void rt_sched_capture(RtCapture* c) {
+    static struct {
+        int32_t num_slots;
+        int32_t current;
+        uint32_t order_counter;
+        int64_t sleep_left[MAX_THREADS]; /* us until a sleeper is due */
+        EventSlot events[OS_NUM_EVENTS];
+        uint32_t num_ext;
+        ExtMessage ext[EXT_QUEUE_SIZE];  /* posted and not yet delivered */
+    } s;
+    bool saving = rt_cap_saving(c);
+    uint64_t now = sceKernelGetSystemTimeWide();
+
+    if (saving) {
+        s.num_slots = sNumSlots;
+        s.current = (int32_t)(sCurrent - sThreads);
+        s.order_counter = sOrderCounter;
+        for (int i = 0; i < MAX_THREADS; i++) {
+            s.sleep_left[i] = (int64_t)(sSleepUntil[i] - now);
+        }
+        memcpy(s.events, sEvents, sizeof(s.events));
+        sceKernelWaitSema(sExtLock, 1, NULL);
+        s.num_ext = 0;
+        for (unsigned i = sExtHead; i != sExtTail; i = (i + 1) % EXT_QUEUE_SIZE) {
+            s.ext[s.num_ext++] = sExtQueue[i];
+        }
+        sceKernelSignalSema(sExtLock, 1);
+    }
+    rt_cap_io(c, "THRD", sThreads, sizeof(sThreads));
+    rt_cap_io(c, "SLOT", sSlots, sizeof(sSlots));
+    rt_cap_io(c, "SCHD", &s, sizeof(s));
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (is_live(&sSlots[i])) {
+            uint32_t size;
+            uint8_t* stack = parked_stack(&sThreads[i], &size);
+            rt_cap_io(c, "STAK", stack, size);
+        }
+    }
+    if (saving) {
+        return;
+    }
+
+    /* What belongs to the run that took the capture: host threads, semaphores, statistics. */
+    for (int i = 0; i < MAX_THREADS; i++) {
+        GameThread* t = &sThreads[i];
+        t->thid = -1;
+        t->sema = -1;
+        t->ready_at = 0;
+        reset_thread_stats(t);
+    }
+    for (int i = 0; i < NUM_GAME_STACKS; i++) {
+        sStackBusy[i] = false;
+    }
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (is_live(&sSlots[i])) {
+            sStackBusy[sThreads[i].stack] = true;
+        }
+    }
+    sNumSlots = s.num_slots;
+    sCurrent = &sThreads[s.current];
+    sOrderCounter = s.order_counter;
+    sSleepers = 0;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        sSleepUntil[i] = s.sleep_left[i] > 0 ? now + (uint64_t)s.sleep_left[i] : now;
+        if (is_live(&sSlots[i]) && sSlots[i].state == TS_WAITING && sSlots[i].wait_kind == WAIT_SLEEP) {
+            sSleepers++;
+        }
+    }
+    memcpy(sEvents, s.events, sizeof(sEvents));
+    sceKernelWaitSema(sExtLock, 1, NULL);
+    sExtHead = sExtTail = 0;
+    sViPending = 0;
+    for (uint32_t i = 0; i < s.num_ext && i + 1 < EXT_QUEUE_SIZE; i++) {
+        ExtMessage m = s.ext[i];
+        if (m.vi) {
+            m.posted = (uint32_t)now;
+            sViPending++;
+        }
+        sExtQueue[sExtTail++] = m;
+    }
+    sceKernelSignalSema(sExtLock, 1);
+}
+
+void rt_sched_resume(void) {
+    for (int i = 0; i < sNumSlots; i++) {
+        GameThread* t = &sThreads[i];
+        if (is_live(&sSlots[i])) {
+            t->sema = sceKernelCreateSema("rt_thread", 0, 0, 1, NULL);
+            start_host_thread(t, true);
+        }
+    }
+    rt_log("resuming thread %d", sCurrent->id);
+    sRunStart = sceKernelGetSystemTimeLow();
+    g_preempt_hint = 1;
+    sceKernelSignalSema(sExtSignal, 1);
+    sceKernelSignalSema(sCurrent->sema, 1);
+    sceKernelExitDeleteThread(0);
+    for (;;) {
+    }
+}
+
+void rt_sched_log_stacks(void) {
+    char line[256];
+    int len = snprintf(line, sizeof(line), "game stacks used (of %u KB):", GAME_STACK_SIZE / 1024);
+    for (int i = 0; i < sNumSlots && len < (int)sizeof(line); i++) {
+        if (!is_live(&sSlots[i])) {
+            continue;
+        }
+        const uint32_t* words = sGameStacks[sThreads[i].stack];
+        uint32_t unused = 0;
+        while (unused < GAME_STACK_SIZE / 4 && words[unused] == STACK_FILL) {
+            unused++;
+        }
+        len += snprintf(line + len, sizeof(line) - len, " t%d %u", sThreads[i].id,
+                        (unsigned)(GAME_STACK_SIZE - unused * 4 + 1023) / 1024);
+    }
+    rt_log("%s; kernel free %u KB", line, (unsigned)(sceKernelTotalFreeMemSize() / 1024));
 }

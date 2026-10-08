@@ -3,10 +3,11 @@
  *
  * A draw state (combiner, render mode, textures) becomes GE state when the
  * first triangle is drawn with it (prepare_3d_state): the combiner's fit
- * (gfx_combiner.c) picks the texture function and the texture to bind, the
- * render mode the depth test, blending, alpha test and fog. Triangles are
- * collected in batches until the state changes, then drawn with one
- * sceGuDrawArray.
+ * (gfx_combiner.c) picks the texture function and the texture to bind
+ * (gfx_bind.c), the render mode the depth test, blending, alpha test and fog.
+ * Triangles are collected in batches until the state changes, then drawn with
+ * one sceGuDrawArray; their vertices are snapped to the PSP's pixel grid
+ * first, so that meshes that meet leave no gaps.
  *
  * The GE projects the vertices itself (the projection matrix is uploaded by
  * gfx_frame.c) but drops any triangle that leaves its coordinate range or,
@@ -36,10 +37,8 @@ static bool sFogPass = false;
 static uint32_t sFogColor = 0;
 CombinerFit gFit;
 const GuTexture* gBatchTex = NULL;
-static float sTexScaleU = 1.0f, sTexScaleV = 1.0f;
-static float sTexOffU = 0.0f, sTexOffV = 0.0f;
+static const GuTexture* sBatchTex2 = NULL; /* a split combiner's second texture (BAKE_Y), for its second pass */
 static float sTraceZ, sTraceW; /* first vertex of the batch, for traces */
-static TexKey sTraceKey;        /* last bound texture, for traces */
 
 /* The draw state of the current batch, for traces. */
 static struct {
@@ -60,7 +59,7 @@ void gfx_gu_reset_cache(void) {
 }
 
 /* Points the GE at a texture's pixels. */
-void gfx_gu_texture_image(const GuTexture* tex) {
+RT_SPRAM void gfx_gu_texture_image(const GuTexture* tex) {
     if (gGu.tex_pixels != tex->pixels || tex->buf_width != 0) {
         if (tex->swizzled != gGu.tex_swizzled || tex->psm != gGu.tex_psm) {
             sceGuTexMode(tex->psm, 0, 0, tex->swizzled);
@@ -83,7 +82,7 @@ void gfx_gu_texturing(bool on) {
 }
 
 /* The GE texture function (and blend colour) for a fit. */
-void gfx_gu_tex_func(const CombinerFit* fit) {
+RT_SPRAM void gfx_gu_tex_func(const CombinerFit* fit) {
     int func;
     switch (fit->mode) {
         case TEX_BLEND: func = GU_TFX_BLEND; break;
@@ -207,7 +206,7 @@ static uint32_t sVertGen = 1;    /* vertex array generation (a flush starts a ne
 static float sSnapX[MAX_VERTICES], sSnapY[MAX_VERTICES];
 static uint32_t sSnapStamp[MAX_VERTICES];
 
-void gfx_forget_packed(int first, int count) {
+RT_SPRAM void gfx_forget_packed(int first, int count) {
     for (int i = first; i < first + count; i++) {
         sPackedStamp[i] = 0;
         sPackedBatch[i] = 0;
@@ -235,7 +234,8 @@ void gfx_forget_packed(int first, int count) {
  * its own, if it is at the same depth: two meshes meeting at a point agree on
  * its depth, something in front of them does not. The radius has to cover the
  * beach, where blocks meet 0.15-0.18 N64 pixel apart (a dotted line down the
- * grass and sand).
+ * grass and sand), and a diagonal join in the village whose sides are 0.23 N64
+ * pixel (0.35 PSP pixel) apart, 0.51 PSP pixel at one corner.
  *
  * The grid is the PSP's, not the N64's: half a PSP pixel apart, at 5/16 and
  * 13/16 of each pixel (SNAP_PHASE). Welded vertices are not equal on the
@@ -282,7 +282,7 @@ static struct {
 #define WELD_SLOTS 1024        /* a power of two; the village draws ~550 vertices a task */
 #define WELD_MAX_FILL 768
 #define WELD_OFS_BITS 6        /* positions in 1/64 grid step */
-#define WELD_RADIUS 44         /* in 1/64 grid step: about a third of a PSP pixel */
+#define WELD_RADIUS 80         /* in 1/64 grid step: 0.63 PSP pixel */
 #define WELD_EMPTY INT16_MIN
 #define WELD_MIN_EXTENT 0.6f  /* sum of a triangle's x and y edge extents, in NDC (~50 px) */
 typedef struct {
@@ -345,7 +345,7 @@ static inline bool weld_near(int gx, int gy) {
  * if there is none, 1 if there is, 2 if it is this very vertex, sent before.
  * Such a vertex is at (gx, gy) or at a grid point next to it.
  */
-static __attribute__((noinline)) int weld_search(int gx, int gy, int fx, int fy, int wq, int dw, int* bx, int* by) {
+RT_SPRAM static __attribute__((noinline)) int weld_search(int gx, int gy, int fx, int fy, int wq, int dw, int* bx, int* by) {
     int best = WELD_RADIUS + 1, found = 0;
     for (int k = 0; k < 9; k++) {
         int ix = kWeldNear[k][0], iy = kWeldNear[k][1];
@@ -490,7 +490,7 @@ static void snap_to(float ndc_x, float ndc_y, float cw, int gx, int gy, float* e
 }
 
 /* Snaps (and welds) a vertex. Out of line: see the weld table. */
-static __attribute__((noinline)) void snap_vertex(float ndc_x, float ndc_y, float cw, float* ex, float* ey) {
+RT_SPRAM static __attribute__((noinline)) void snap_vertex(float ndc_x, float ndc_y, float cw, float* ex, float* ey) {
     if (!sSnap.ok || cw <= 0.0f) {
         return;
     }
@@ -503,185 +503,137 @@ static __attribute__((noinline)) void snap_vertex(float ndc_x, float ndc_y, floa
     snap_to(ndc_x, ndc_y, cw, gx, gy, ex, ey);
 }
 
+/*
+ * Everything about snapping a vertex that does not depend on its weld, worked
+ * out for four vertices at a time on the VFPU when a G_VTX loads them (the scalar
+ * code above is a chain of dependent float operations, ~500 cycles a vertex).
+ * Per vertex: its position in grid steps (qx, qy), whether snapping applies, the
+ * task's snap generation, and the 2x2 matrix that turns the grid correction
+ * (gx - qx, gy - qy) into an eye-space nudge:
+ *   ex += e11 * (gx - qx) + e12 * (gy - qy),  ey += e21 * (gx - qx) + e22 * (gy - qy)
+ * which is snap_to with its division folded in.
+ */
+typedef struct {
+    float qx, qy, ok;
+    uint32_t gen;
+    float e11, e12, e21, e22;
+} SnapPre;
+static SnapPre sSnapPre[MAX_VERTICES + 4] __attribute__((aligned(64)));
+_Static_assert(sizeof(SnapPre) == 32 && offsetof(SnapPre, e11) == 16, "gfx_snap_precompute stores two quads");
 
-/* ---- textures ----------------------------------------------------------- */
-
-float gfx_tile_shift(uint8_t shift) {
-    if (shift > 10) return (float)(1 << (16 - shift));
-    if (shift > 0) return 1.0f / (float)(1 << shift);
-    return 1.0f;
+RT_SPRAM void gfx_snap_precompute(const RspVertex* verts, int start, int count) {
+    if (!sSnap.ok) {
+        return;
+    }
+    static float consts[16] __attribute__((aligned(16)));
+    consts[0] = 4.0f * sSnap.hw;
+    consts[1] = 4.0f * sSnap.tx;
+    consts[2] = 4.0f * sSnap.hh;
+    consts[3] = 4.0f * sSnap.ty;
+    consts[4] = sSnap.p00;
+    consts[5] = sSnap.p10;
+    consts[6] = sSnap.p01;
+    consts[7] = sSnap.p11;
+    consts[8] = sSnap.p03;
+    consts[9] = sSnap.p13;
+    consts[10] = 0.25f / sSnap.hw;
+    consts[11] = 0.25f / sSnap.hh;
+    consts[12] = 1.0e-12f;
+    consts[13] = 32000.0f;
+    consts[14] = 0.0f;
+    consts[15] = 0.0f;
+    __asm__ volatile(
+        "lv.q C500,  0(%0)\n"
+        "lv.q C510, 16(%0)\n"
+        "lv.q C520, 32(%0)\n"
+        "lv.q C530, 48(%0)\n"
+        :
+        : "r"(consts)
+        : "memory");
+    for (int i = start; i < start + count; i += 4) {
+        const RspVertex* v = &verts[i];
+        SnapPre* out = &sSnapPre[i];
+        uint32_t gen = sSnapGen;
+        __asm__ volatile(
+            /* rows of M000 / M100 are the four vertices: the columns are cx[4], cy[4], cw[4] / nx[4], ny[4] */
+            "lv.q R000,   0(%0)\n"
+            "lv.q R001,  64(%0)\n"
+            "lv.q R002, 128(%0)\n"
+            "lv.q R003, 192(%0)\n"
+            "lv.q R100,  16(%0)\n"
+            "lv.q R101,  80(%0)\n"
+            "lv.q R102, 144(%0)\n"
+            "lv.q R103, 208(%0)\n"
+            "vscl.q C200, C100, S500\n"                      /* qx = nx * 4hw + 4tx */
+            "vscl.q C210, C110, S502\n"                      /* qy = 4ty - ny * 4hh */
+            "vscl.q C300, C030, S510\n"                      /* a = p00 cw - cx p03 */
+            "vscl.q C400, C000, S520\n"
+            "vscl.q C310, C030, S511\n"                      /* b = p10 cw - cx p13 */
+            "vscl.q C410, C000, S521\n"
+            "vscl.q C320, C030, S512\n"                      /* c = p01 cw - cy p03 */
+            "vscl.q C420, C010, S520\n"
+            "vscl.q C330, C030, S513\n"                      /* d = p11 cw - cy p13 */
+            "vscl.q C430, C010, S521\n"
+            "vadd.q C200, C200, C500[y,y,y,y]\n"
+            "vsub.q C210, C500[w,w,w,w], C210\n"
+            "vsub.q C300, C300, C400\n"
+            "vsub.q C310, C310, C410\n"
+            "vsub.q C320, C320, C420\n"
+            "vsub.q C330, C330, C430\n"
+            "vmul.q C400, C300, C330\n"                      /* det = a d - b c */
+            "vmul.q C410, C310, C320\n"
+            "vsub.q C400, C400, C410\n"
+            "vrcp.q C410, C400\n"
+            "vmul.q C420, C030, C030\n"                      /* k = cw^2 / det */
+            "vmul.q C420, C420, C410\n"
+            "vscl.q C430, C420, S522\n"                      /* k / 4hw (as 0.25/hw) */
+            "vscl.q C420, C420, S523\n"
+            "vmul.q C600, C330, C430\n"                      /* e11 = d k e1 */
+            "vmul.q C610, C310, C420\n"                      /* e12 = b k e2 */
+            "vmul.q C620, C320[-x,-y,-z,-w], C430\n"         /* e21 = -c k e1 */
+            "vmul.q C630, C300[-x,-y,-z,-w], C420\n"         /* e22 = -a k e2 */
+            /* ok = cw > 0 and |det| > eps and |qx|, |qy| < limit */
+            "vzero.q C700\n"
+            "vslt.q C710, C700, C030\n"
+            "vabs.q C720, C400\n"
+            "vslt.q C720, C530[x,x,x,x], C720\n"
+            "vmul.q C710, C710, C720\n"
+            "vabs.q C720, C200\n"
+            "vslt.q C720, C720, C530[y,y,y,y]\n"
+            "vmul.q C710, C710, C720\n"
+            "vabs.q C720, C210\n"
+            "vslt.q C720, C720, C530[y,y,y,y]\n"
+            "vmul.q C220, C710, C720\n"
+            "mtv %2, S230\n"
+            "mtv %2, S231\n"
+            "mtv %2, S232\n"
+            "mtv %2, S233\n"
+            "sv.q R200,  0(%1)\n"
+            "sv.q R201, 32(%1)\n"
+            "sv.q R202, 64(%1)\n"
+            "sv.q R203, 96(%1)\n"
+            "sv.q R600, 16(%1)\n"
+            "sv.q R601, 48(%1)\n"
+            "sv.q R602, 80(%1)\n"
+            "sv.q R603, 112(%1)\n"
+            :
+            : "r"(v), "r"(out), "r"(gen)
+            : "memory");
+    }
 }
 
-/* Rows of a tile start `line` units apart in texture memory; resolve where
- * that puts them in RDRAM (the loaders may have copied a sub-image). */
-static bool tile_source(const TileDesc* tile, uint32_t* addr_bits, uint32_t* row_bits, uint8_t* row_swap) {
-    uint32_t tmem = tile->tmem & 0x1FF;
-    uint32_t bits = kTexelBits[tile->siz & 3];
-    uint32_t tile_w = ((tile->lrs - tile->uls) >> 2) + 1;
-    uint32_t line = tile->line;
-    if (line == 0) {
-        line = (tile_w * bits + 63) / 64;
+/* The scalar snap, with the VFPU's precomputed matrix when it is there (see SnapPre). */
+static void snap_vertex_pre(const RspVertex* v, int index, float* ex, float* ey) {
+    const SnapPre* pre = &sSnapPre[index];
+    if (pre->gen != sSnapGen || !(pre->ok > 0.5f)) {
+        snap_vertex(v->nx, v->ny, v->cw, ex, ey);
+        return;
     }
-    uint32_t start = gfx_tmem_bits(tmem);
-    if (start == TMEM_INVALID) {
-        return false;
-    }
-    uint32_t rows = line * 64;
-    if (tmem + line < 512) {
-        uint32_t next = gfx_tmem_bits(tmem + line);
-        if (next != TMEM_INVALID && next > start && next - start <= 1024u * 32u) {
-            rows = next - start;
-        }
-    }
-    *addr_bits = start;
-    *row_bits = rows;
-    /* Rows read swapped when the RDP's odd-row swap and the way the row was
-     * stored disagree; take the pattern from the first two rows. */
-    uint8_t even = gfx_tmem_swapped(tmem);
-    uint8_t odd = (uint8_t)(1 ^ (tmem + line < 512 ? gfx_tmem_swapped(tmem + line) : 0));
-    *row_swap = (uint8_t)(even | (odd << 1));
-    return true;
-}
-
-bool gfx_make_tile_key(const TileDesc* tile, bool white_rgb, TexKey* key) {
-    memset(key, 0, sizeof(*key));
-    if (!tile_source(tile, &key->addr_bits, &key->row_bits, &key->row_swap)) {
-        RT_LOG_ONCE("gfx: render tile uses unloaded texture memory %03X", tile->tmem);
-        return false;
-    }
-    key->fmt = tile->fmt;
-    key->siz = tile->siz;
-    key->tile_w = (uint16_t)(((tile->lrs - tile->uls) >> 2) + 1);
-    key->tile_h = (uint16_t)(((tile->lrt - tile->ult) >> 2) + 1);
-    key->cms = tile->cms;
-    key->cmt = tile->cmt;
-    key->masks = tile->masks;
-    key->maskt = tile->maskt;
-    key->variant = white_rgb ? TEXVAR_WHITE_RGB : 0;
-    if (tile->fmt == G_IM_FMT_CI) {
-        uint32_t tlut_type = (gRdp.other_h >> G_MDSFT_TEXTLUT) & 3;
-        key->tlut_type = tlut_type == 3 ? TLUT_IA16 : TLUT_RGBA16;
-        uint32_t slot = tile->siz == G_IM_SIZ_4b ? (uint32_t)tile->palette * 16 : 0;
-        key->tlut_addr = gRdp.tlut[slot & 0xFF] & 0x1FFFFFFF;
-    }
-    return true;
-}
-
-static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit);
-static bool aa_edge_mode(void);
-static bool sSplitSecond = false; /* bind_texture_impl: only look up the split's BAKE_Y texture */
-static const GuTexture* sBatchTex2 = NULL; /* that texture, for the batch's second pass */
-
-const GuTexture* gfx_bind_texture(int tile_index, const CombinerFit* fit) {
-    const GuTexture* tex = bind_texture_impl(tile_index, fit);
-    return tex;
-}
-
-static void fill_src2(TexKey* key, const TexKey* k2) {
-    key->src2.addr_bits = k2->addr_bits;
-    key->src2.row_bits = k2->row_bits;
-    key->src2.tlut_addr = k2->tlut_addr;
-    key->src2.tile_w = k2->tile_w;
-    key->src2.tile_h = k2->tile_h;
-    key->src2.fmt = k2->fmt;
-    key->src2.siz = k2->siz;
-    key->src2.tlut_type = k2->tlut_type;
-    key->src2.cms = k2->cms;
-    key->src2.cmt = k2->cmt;
-    key->src2.masks = k2->masks;
-    key->src2.maskt = k2->maskt;
-    key->src2.row_swap = k2->row_swap;
-}
-
-static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit) {
-    TileDesc* tile = &gRdp.tiles[tile_index & 7];
-    TexKey key;
-    /* Modulated by black, a texture's colour is all the same: the plain one will do
-     * (and can be a render target's picture as it is -- the shadow under a pocket item). */
-    bool black = fit->mode == TEX_MODULATE;
-    for (int ch = 0; ch < 3; ch++) {
-        black = black && fit->base[ch] == 0.0f && fit->s[ch] == 0.0f && fit->sa[ch] == 0.0f;
-    }
-    if (!gfx_make_tile_key(tile, fit->white_rgb && !black, &key)) {
-        return NULL;
-    }
-    if (!fit->product && !fit->combine2 && aa_edge_mode()) {
-        key.variant |= TEXVAR_BLEED;
-    }
-    if (fit->lerp && !fit->combine2) {
-        key.variant |= TEXVAR_LERP;
-        key.lerp_lo = fit->lerp_lo;
-        key.lerp_hi = fit->lerp_hi;
-    }
-    if (fit->product) {
-        TexKey k2;
-        if (gfx_make_tile_key(&gRdp.tiles[(tile_index + 1) & 7], false, &k2)) {
-            key.variant |= TEXVAR_PRODUCT;
-            fill_src2(&key, &k2);
-            key.src2.tile_w = 0; /* the product path shares this tile's size */
-            key.src2.tile_h = 0;
-        }
-    } else if (fit->combine2) {
-        /* tile_index is the grid tile (fit->bake_base); the other one of the
-         * pair is baked into it at the offset the tiles' origins imply. */
-        int other = (fit->bake_base == 0) ? tile_index + 1 : tile_index - 1;
-        TexKey k2;
-        if (gfx_make_tile_key(&gRdp.tiles[other & 7], false, &k2)) {
-            key.variant |= TEXVAR_COMBINE2;
-            fill_src2(&key, &k2);
-            key.ratio_x = fit->bake_ratio_x;
-            key.ratio_y = fit->bake_ratio_y;
-            key.off_x = fit->bake_off_x;
-            key.off_y = fit->bake_off_y;
-            key.base_second = (uint8_t)(fit->bake_base == 1);
-            key.comb0 = gRdp.combine0;
-            key.comb1 = gRdp.combine1;
-            key.comb_prim = gRdp.prim;
-            key.comb_env = gRdp.env;
-            key.comb_lod = gRdp.prim_lod_frac;
-            key.bake_kind = fit->split ? (uint8_t)fit->split_kind : BAKE_COLOUR;
-            gBakeRgbTile = fit->bake_rgb_tile;
-        }
-    }
-    if (sSplitSecond) {
-        /* the second pass of a split combiner: same bake, the other half; not bound here */
-        key.bake_kind = BAKE_Y;
-        return gfx_tex_get(&key);
-    }
-    const GuTexture* tex = gfx_tex_get_to_draw(&key);
-    if (tex == NULL) {
-        return NULL;
-    }
-    sTraceKey = key;
-
-    /* Texture coordinate transform, as the RDP does it: shift the S/T
-     * coordinate (1/32 texel units) first, then subtract the tile origin
-     * (uls/ult, 1/4 texel), then normalise:
-     *   u = (s * shift - uls * 8) / (32 * width) = s * scale - offset */
-    float shift_u = gfx_tile_shift(tile->shifts);
-    float shift_v = gfx_tile_shift(tile->shiftt);
-    /* a bake on a finer grid has sub GU texels per tile texel */
-    float norm_u = (float)(tex->sub_x ? tex->sub_x : 1) / (32.0f * tex->gu_width);
-    float norm_v = (float)(tex->sub_y ? tex->sub_y : 1) / (32.0f * tex->gu_height);
-    sTexScaleU = shift_u * norm_u;
-    sTexScaleV = shift_v * norm_v;
-    sTexOffU = (float)tile->uls * 8.0f * norm_u;
-    sTexOffV = (float)tile->ult * 8.0f * norm_v;
-
-    gfx_gu_texture_image(tex);
-    int wrap_u = tex->clamp_s ? GU_CLAMP : GU_REPEAT;
-    int wrap_v = tex->clamp_t ? GU_CLAMP : GU_REPEAT;
-    if (wrap_u != gGu.wrap_u || wrap_v != gGu.wrap_v) {
-        sceGuTexWrap(wrap_u, wrap_v);
-        gGu.wrap_u = wrap_u;
-        gGu.wrap_v = wrap_v;
-    }
-    int filter = ((gRdp.other_h >> G_MDSFT_TEXTFILT) & 3) == G_TF_POINT ? GU_NEAREST : GU_LINEAR;
-    if (filter != gGu.tex_filter) {
-        sceGuTexFilter(filter, filter);
-        gGu.tex_filter = filter;
-    }
-    return tex;
+    int gx, gy;
+    weld_grid_point(pre->qx, pre->qy, v->cw, &gx, &gy);
+    float dx = (float)gx - pre->qx, dy = (float)gy - pre->qy;
+    *ex += pre->e11 * dx + pre->e12 * dy;
+    *ey += pre->e21 * dx + pre->e22 * dy;
 }
 
 /* ---- render state ------------------------------------------------------- */
@@ -697,15 +649,11 @@ static const GuTexture* bind_texture_impl(int tile_index, const CombinerFit* fit
  * and the picture is left as it is.
  */
 static bool blender_keeps_memory(void) {
-    uint32_t l = gRdp.other_l;
-    uint32_t cycle = (gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3;
-    if (!(l & FORCE_BL) || cycle == G_CYC_FILL || cycle == G_CYC_COPY) {
+    uint32_t cycle = rdp_cycle_type();
+    if (!(gRdp.other_l & FORCE_BL) || cycle == G_CYC_FILL || cycle == G_CYC_COPY) {
         return false;
     }
-    bool two_cycle = cycle == G_CYC_2CYCLE;
-    int a = two_cycle ? (l >> 24) & 3 : (l >> 26) & 3;
-    int m = two_cycle ? (l >> 20) & 3 : (l >> 22) & 3;
-    int b = two_cycle ? (l >> 16) & 3 : (l >> 18) & 3;
+    int a = rdp_blend_last(BL_SHIFT_A), m = rdp_blend_last(BL_SHIFT_M), b = rdp_blend_last(BL_SHIFT_B);
     return a == 3 && ((m == 1 && b == 2) || (m == 2 && b == 1));
 }
 
@@ -719,23 +667,36 @@ static bool sAaEdge = false; /* an antialiased texture edge, blended by its alph
 /* Is the render mode an antialiased texture edge (see gfx_apply_aa_edge)? The
  * texture is bound with TEXVAR_BLEED for these, in case it gets blended.
  * hard_edges.txt: never. */
-static bool aa_edge_mode(void) {
+RT_SPRAM bool gfx_aa_edge_mode(void) {
     bool hard_edges = RT_SWITCH("hard_edges.txt");
     uint32_t l = gRdp.other_l;
-    uint32_t cycle = (gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3;
-    bool two_cycle = cycle == G_CYC_2CYCLE;
-    int m = two_cycle ? (l >> 20) & 3 : (l >> 22) & 3;
-    int b = two_cycle ? (l >> 16) & 3 : (l >> 18) & 3;
-    bool xlu = ((l & FORCE_BL) || (l & ZMODE_DEC) == ZMODE_XLU) && m == 1 && b == 0;
+    uint32_t cycle = rdp_cycle_type();
     uint32_t aa_bits = AA_EN | IM_RD | CVG_X_ALPHA | ALPHA_CVG_SEL;
     bool z_writes = (l & Z_UPD) && (gRsp.geometry_mode & G_ZBUFFER);
-    return !hard_edges && !xlu && !z_writes && (l & aa_bits) == aa_bits && !(l & FORCE_BL) && (l & 3) == 0 &&
-           cycle != G_CYC_FILL && cycle != G_CYC_COPY;
+    return !hard_edges && !rdp_blends_by_alpha() && !z_writes && (l & aa_bits) == aa_bits && !(l & FORCE_BL) &&
+           (l & 3) == 0 && cycle != G_CYC_FILL && cycle != G_CYC_COPY;
 }
 
 /* The blend function while gGu.blend is on. */
 static void gu_blend_func(void) {
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+}
+
+/* Alpha blending on or off (gGu.blend). */
+static inline void gu_blending(bool on) {
+    if ((int)on != gGu.blend) {
+        if (on) {
+            sceGuEnable(GU_BLEND);
+            gu_blend_func();
+        } else {
+            sceGuDisable(GU_BLEND);
+        }
+        gGu.blend = on;
+    }
+}
+
+void gfx_gu_blending(bool on) {
+    gu_blending(on);
 }
 
 /*
@@ -762,7 +723,7 @@ bool gfx_stencil_classes(void) {
     return !sUprightOff;
 }
 
-static __attribute__((noinline)) void gu_stencil(int mode) {
+RT_SPRAM static __attribute__((noinline)) void gu_stencil(int mode) {
     if (mode == gGu.stencil) {
         return;
     }
@@ -804,7 +765,7 @@ void gfx_gu_stencil_off(void) {
  * away as the ground does: it comes nearer, or its distance changes sideways
  * more than upward. (1/w is linear on the screen; the differences below are
  * those of 1/w times the product of the three w, which is positive.) */
-static __attribute__((noinline)) bool tri_upright(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2) {
+RT_SPRAM static __attribute__((noinline)) bool tri_upright(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2) {
     if (v0->cw <= 0 || v1->cw <= 0 || v2->cw <= 0) {
         return false;
     }
@@ -858,7 +819,7 @@ static int decal_tolerance(const RspVertex* v0, const RspVertex* v1, const RspVe
     return tolerance < 0xFFFF ? (int)tolerance : 0xFFFF;
 }
 
-void gfx_apply_render_state(bool depth_allowed) {
+RT_SPRAM void gfx_apply_render_state(bool depth_allowed) {
     uint32_t l = gRdp.other_l;
     bool zbuf = depth_allowed && (gRsp.geometry_mode & G_ZBUFFER) != 0;
     int depth_test = zbuf && (l & Z_CMP);
@@ -886,27 +847,23 @@ void gfx_apply_render_state(bool depth_allowed) {
         gGu.decal = 0;
     }
     int fog = 0;
-    bool two_cycle = ((gRdp.other_h >> G_MDSFT_CYCLETYPE) & 3) == G_CYC_2CYCLE;
-    int m = two_cycle ? (l >> 20) & 3 : (l >> 22) & 3;
-    int b = two_cycle ? (l >> 16) & 3 : (l >> 18) & 3;
-    int blend = ((l & FORCE_BL) || (l & ZMODE_DEC) == ZMODE_XLU) && m == 1 && b == 0;
+    int blend = rdp_blends_by_alpha();
     /* an antialiased texture edge, maybe (gfx_apply_aa_edge decides once the texture is known) */
-    sAaEdge = aa_edge_mode();
+    sAaEdge = gfx_aa_edge_mode();
     sFogPass = false;
-    bool fogged = depth_allowed && (gRsp.geometry_mode & G_FOG) && ((l >> 30) & 3) == 3 && ((l >> 26) & 3) == 2;
+    /* the first cycle blends the fog colour by the shade alpha */
+    bool fogged = depth_allowed && (gRsp.geometry_mode & G_FOG) && ((l >> BL_SHIFT_P) & 3) == 3 &&
+                  ((l >> BL_SHIFT_A) & 3) == 2;
     if (fogged && depth_mask && !blend) {
         /* opaque: exact per-vertex fog in a second pass (see sFogPass) */
         sFogPass = true;
-        uint32_t fc = gRdp.fog;
-        sFogColor = ((fc >> 24) & 0xFF) | (((fc >> 16) & 0xFF) << 8) | (((fc >> 8) & 0xFF) << 16);
+        sFogColor = rgb32_to_ge(gRdp.fog);
     } else if (fogged) {
         /* translucent: the GE's linear fog as an approximation */
         float fnear, ffar;
         if (gfx_compute_fog_range(&fnear, &ffar)) {
             fog = 1;
-            uint32_t fc = gRdp.fog;
-            uint32_t gu_fc = ((fc >> 24) & 0xFF) | (((fc >> 16) & 0xFF) << 8) | (((fc >> 8) & 0xFF) << 16);
-            sceGuFog(fnear, ffar, gu_fc);
+            sceGuFog(fnear, ffar, rgb32_to_ge(gRdp.fog));
         }
     }
     if (fog != gGu.fog) {
@@ -922,15 +879,7 @@ void gfx_apply_render_state(bool depth_allowed) {
     sStencilClass = depth_mask && depth_allowed && !gTarget.bound && !sUprightOff;
     sClassify = sStencilClass && depth_test && !blend && !decal;
 
-    if (blend != gGu.blend) {
-        if (blend) {
-            sceGuEnable(GU_BLEND);
-            gu_blend_func();
-        } else {
-            sceGuDisable(GU_BLEND);
-        }
-        gGu.blend = blend;
-    }
+    gu_blending(blend);
 
     int alpha_ref = -1;
     if ((l & 3) == G_AC_THRESHOLD) {
@@ -992,23 +941,21 @@ static bool alpha_is_tile_probe(int base) {
 /* The same, remembered per combiner state: a window is a dozen draws, each of which asks. */
 static bool alpha_is_tile(int base) {
     static struct {
-        uint32_t state[5];
+        CombinerState state;
         bool known[2], is_tile[2];
     } sMemo[8];
     static unsigned sNext = 0;
-    uint32_t lod;
-    memcpy(&lod, &gRdp.prim_lod_frac, 4);
-    const uint32_t state[5] = { gRdp.combine0, gRdp.combine1, gRdp.prim, gRdp.env, lod };
+    CombinerState state = rdp_combiner_state();
     unsigned at = 8;
     for (unsigned i = 0; i < 8; i++) {
-        if (memcmp(sMemo[i].state, state, sizeof(state)) == 0) {
+        if (combiner_state_equal(&sMemo[i].state, &state)) {
             at = i;
             break;
         }
     }
     if (at == 8) {
         at = sNext++ & 7;
-        memcpy(sMemo[at].state, state, sizeof(state));
+        sMemo[at].state = state;
         sMemo[at].known[0] = sMemo[at].known[1] = false;
     }
     if (!sMemo[at].known[base]) {
@@ -1039,17 +986,17 @@ static bool bind_cut(void) {
         gBatchTex = colour; /* the vertices get the colour tile's coordinates */
         return true;
     }
-    float su = sTexScaleU, sv = sTexScaleV, ou = sTexOffU, ov = sTexOffV;
+    TexTransform c = gTexTransform;
     gBatchTex = gfx_bind_texture(first + mask_tile, &plain);
-    if (gBatchTex == NULL || sTexScaleU == 0.0f || sTexScaleV == 0.0f) {
+    if (gBatchTex == NULL || gTexTransform.scale_u == 0.0f || gTexTransform.scale_v == 0.0f) {
         return false;
     }
     /* u = s * scale - off for each tile, so u_colour = u * ku + cu */
     sCutTex = colour;
-    sCutScaleU = su / sTexScaleU;
-    sCutScaleV = sv / sTexScaleV;
-    sCutOffU = sTexOffU * sCutScaleU - ou;
-    sCutOffV = sTexOffV * sCutScaleV - ov;
+    sCutScaleU = c.scale_u / gTexTransform.scale_u;
+    sCutScaleV = c.scale_v / gTexTransform.scale_v;
+    sCutOffU = gTexTransform.off_u * sCutScaleU - c.off_u;
+    sCutOffV = gTexTransform.off_v * sCutScaleV - c.off_v;
     return true;
 }
 
@@ -1075,7 +1022,7 @@ static bool bind_cut(void) {
  * through what the N64 covers (the pocket screen's item slots). So does a
  * draw whose vertices carry an alpha of their own. hard_edges.txt: never.
  */
-void gfx_apply_aa_edge(const GuTexture* tex, const CombinerFit* fit) {
+RT_SPRAM void gfx_apply_aa_edge(const GuTexture* tex, const CombinerFit* fit) {
     if (!sAaEdge) {
         return;
     }
@@ -1084,26 +1031,23 @@ void gfx_apply_aa_edge(const GuTexture* tex, const CombinerFit* fit) {
         sAaEdge = false;
         return;
     }
-    sceGuEnable(GU_BLEND);
-    gu_blend_func();
-    gGu.blend = 1;
+    gu_blending(true);
     sceGuAlphaFunc(GU_GREATER, 0x1F, 0xFF); /* under 1/8 coverage: not drawn, depth untouched */
     gGu.alpha_ref = 0x1F;
 }
 
-static void apply_texture_state(void) {
+RT_SPRAM static void apply_texture_state(void) {
     gBatchTex = NULL;
     sBatchTex2 = NULL;
     sCutTex = NULL;
+    gBakeWindow = 0;
     if (gFit.uses_texture && gRsp.tex_on) {
         if (!bind_cut()) {
             sCutTex = NULL;
             gBatchTex = gfx_bind_texture(gRsp.tex_tile + gFit.tex_tile, &gFit);
         }
         if (gBatchTex != NULL && gFit.split_two) {
-            sSplitSecond = true;
-            sBatchTex2 = bind_texture_impl(gRsp.tex_tile + gFit.tex_tile, &gFit);
-            sSplitSecond = false;
+            sBatchTex2 = gfx_split_second_texture(gRsp.tex_tile + gFit.tex_tile, &gFit);
         }
     }
     gfx_gu_texturing(gBatchTex != NULL);
@@ -1113,6 +1057,11 @@ static void apply_texture_state(void) {
 }
 
 /* ---- drawing batches ---------------------------------------------------- */
+
+/* Draws nidx / 3 triangles of the vertices by their indices. */
+static inline void draw_indexed(int nidx, const uint16_t* indices, const GuVertex* verts) {
+    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+}
 
 /* Points the GE at texture `to` for an extra pass over a batch drawn with
  * `from`. gGu is left alone: every pass switches back to `from` afterwards. */
@@ -1142,7 +1091,7 @@ static void draw_fog_pass(const Batch* b, const uint16_t* indices, int nidx) {
     sceGuDepthFunc(GU_EQUAL);
     if (gGu.depth_mask) sceGuDepthMask(1);
     if (gGu.alpha_test) sceGuDisable(GU_ALPHA_TEST);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, fv);
+    draw_indexed(nidx, indices, fv);
     if (gGu.texture) sceGuEnable(GU_TEXTURE_2D);
     if (!gGu.blend) sceGuDisable(GU_BLEND);
     if (!gGu.depth_test) sceGuDisable(GU_DEPTH_TEST);
@@ -1161,7 +1110,7 @@ static void draw_split_pass(const GuVertex* verts, const uint16_t* indices, int 
     sceGuBlendFunc(GU_ADD, gGu.blend ? GU_SRC_ALPHA : GU_FIX, GU_FIX, 0xFFFFFF, 0xFFFFFF);
     if (gGu.depth_mask) sceGuDepthMask(1);
     if (gGu.fog) sceGuDisable(GU_FOG);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+    draw_indexed(nidx, indices, verts);
     /* back to the first pass's state, which the batches after this one still use */
     pass_texture(t1, t2);
     sceGuTexFunc(gGu.tex_func & 0xFF, gGu.tex_func >> 8);
@@ -1175,103 +1124,73 @@ static void draw_split_pass(const GuVertex* verts, const uint16_t* indices, int 
 }
 
 /*
- * draw_cut for an antialiased edge (sAaEdge): the mask's alpha is coverage,
- * and weights the colour tile against what is behind it. The GE
- * writes its destination alpha only through stencil operations, so the weight
- * goes there in four steps: the stencil cleared under the triangles, then set
- * to 1/4 .. 4/4 by alpha-tested passes of the mask at rising thresholds. The
- * colour tile is then blended through it (DST_ALPHA), where it is not zero.
+ * See bind_cut: the stencil cleared under the triangles, set where the mask
+ * tile passes the alpha test, then the colour tile drawn where it is set.
+ *
+ * For an antialiased edge (sAaEdge) the mask's alpha is coverage, and weights
+ * the colour tile against what is behind it. The GE writes its destination
+ * alpha only through stencil operations, so the weight goes there in four
+ * steps: set to 1/4 .. 4/4 by alpha-tested passes of the mask at rising
+ * thresholds. The colour tile is then blended through it (DST_ALPHA), where
+ * it is not zero.
  */
-static void draw_cut_soft(const GuVertex* verts, const uint16_t* indices, int nidx) {
-    static const uint8_t kRef[4] = { 0x1F, 0x5F, 0x9F, 0xDF }; /* alpha above these: 1/4 .. 4/4 */
-    const GuTexture* t1 = gBatchTex;
-    const GuTexture* t2 = sCutTex;
-    sceGuPixelMask(0x00FFFFFF); /* colour kept; alpha (the stencil) written */
-    if (gGu.depth_mask) sceGuDepthMask(1);
-    sceGuDisable(GU_BLEND);
-    sceGuEnable(GU_STENCIL_TEST);
-    sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
-    sceGuStencilOp(GU_REPLACE, GU_REPLACE, GU_REPLACE);
-    sceGuDisable(GU_TEXTURE_2D);
-    sceGuDisable(GU_ALPHA_TEST);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
-    sceGuEnable(GU_TEXTURE_2D);
-    sceGuEnable(GU_ALPHA_TEST);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
-    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
-    for (int i = 0; i < 4; i++) {
-        sceGuAlphaFunc(GU_GREATER, kRef[i], 0xFF);
-        sceGuStencilFunc(GU_ALWAYS, i == 3 ? 0xFF : 0x40 * (i + 1), 0xFF);
-        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
-    }
-
-    sceGuPixelMask(0);
-    if (gGu.depth_mask) sceGuDepthMask(0);
-    sceGuDisable(GU_ALPHA_TEST);
-    sceGuStencilFunc(GU_NOTEQUAL, 0, 0xFF);
-    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP);
-    sceGuEnable(GU_BLEND);
-    sceGuBlendFunc(GU_ADD, GU_DST_ALPHA, GU_ONE_MINUS_DST_ALPHA, 0, 0);
-    sceGuTexFunc(gGu.tex_func & 0xFF, gGu.tex_func >> 8);
-    pass_texture(t2, t1);
-    sceGuTexWrap(t2->clamp_s ? GU_CLAMP : GU_REPEAT, t2->clamp_t ? GU_CLAMP : GU_REPEAT);
-    sceGuTexScale(sCutScaleU, sCutScaleV);
-    sceGuTexOffset(sCutOffU, sCutOffV);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
-
-    /* back to the batch's state */
-    sceGuDisable(GU_STENCIL_TEST);
-    gGu.stencil = GU_STENCIL_OFF;
-    gu_blend_func();
-    sceGuEnable(GU_ALPHA_TEST);
-    sceGuAlphaFunc(GU_GREATER, gGu.alpha_ref, 0xFF);
-    sceGuTexScale(1.0f, 1.0f);
-    sceGuTexOffset(0.0f, 0.0f);
-    pass_texture(t1, t2);
-    sceGuTexWrap(gGu.wrap_u, gGu.wrap_v);
-}
-
-/* See bind_cut: stencil cleared under the triangles, set where the mask tile
- * passes the alpha test, then the colour tile drawn where it is set. */
 static void draw_cut(const GuVertex* verts, const uint16_t* indices, int nidx) {
+    static const uint8_t kSoftRef[4] = { 0x1F, 0x5F, 0x9F, 0xDF }; /* mask alpha above these: 1/4 .. 4/4 */
     const GuTexture* t1 = gBatchTex;
     const GuTexture* t2 = sCutTex;
-    if (sAaEdge && gGu.alpha_test) {
-        draw_cut_soft(verts, indices, nidx);
-        return;
-    }
-    sceGuPixelMask(0x00FFFFFF); /* colour kept; alpha (the stencil) written */
+    bool soft = sAaEdge && gGu.alpha_test;
+
+    /* the stencil cleared under the triangles: colour kept, alpha (the stencil) written */
+    sceGuPixelMask(0x00FFFFFF);
     if (gGu.depth_mask) sceGuDepthMask(1);
+    if (gGu.blend) sceGuDisable(GU_BLEND);
     sceGuEnable(GU_STENCIL_TEST);
     sceGuStencilFunc(GU_ALWAYS, 0, 0xFF);
     sceGuStencilOp(GU_REPLACE, GU_REPLACE, GU_REPLACE);
     sceGuDisable(GU_TEXTURE_2D);
     sceGuDisable(GU_ALPHA_TEST);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+    draw_indexed(nidx, indices, verts);
 
+    /* the mask, alpha-tested, sets it */
     sceGuEnable(GU_TEXTURE_2D);
     sceGuEnable(GU_ALPHA_TEST);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
-    sceGuStencilFunc(GU_ALWAYS, 1, 0xFF);
-    sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+    if (soft) {
+        sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+        for (int i = 0; i < 4; i++) {
+            sceGuAlphaFunc(GU_GREATER, kSoftRef[i], 0xFF);
+            sceGuStencilFunc(GU_ALWAYS, i == 3 ? 0xFF : 0x40 * (i + 1), 0xFF);
+            draw_indexed(nidx, indices, verts);
+        }
+    } else {
+        sceGuStencilFunc(GU_ALWAYS, 1, 0xFF);
+        sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);
+        draw_indexed(nidx, indices, verts);
+    }
 
+    /* the colour tile where it is set */
     sceGuPixelMask(0);
     if (gGu.depth_mask) sceGuDepthMask(0);
     sceGuDisable(GU_ALPHA_TEST);
-    sceGuStencilFunc(GU_EQUAL, 1, 0xFF);
+    sceGuStencilFunc(soft ? GU_NOTEQUAL : GU_EQUAL, soft ? 0 : 1, 0xFF);
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_KEEP);
+    if (soft) {
+        sceGuEnable(GU_BLEND);
+        sceGuBlendFunc(GU_ADD, GU_DST_ALPHA, GU_ONE_MINUS_DST_ALPHA, 0, 0);
+    }
     sceGuTexFunc(gGu.tex_func & 0xFF, gGu.tex_func >> 8);
     pass_texture(t2, t1);
     sceGuTexWrap(t2->clamp_s ? GU_CLAMP : GU_REPEAT, t2->clamp_t ? GU_CLAMP : GU_REPEAT);
     sceGuTexScale(sCutScaleU, sCutScaleV);
     sceGuTexOffset(sCutOffU, sCutOffV);
-    sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+    draw_indexed(nidx, indices, verts);
 
     /* back to the batch's state */
     sceGuDisable(GU_STENCIL_TEST);
     gGu.stencil = GU_STENCIL_OFF;
+    if (soft) gu_blend_func();
     sceGuEnable(GU_ALPHA_TEST);
+    if (soft) sceGuAlphaFunc(GU_GREATER, gGu.alpha_ref, 0xFF);
     sceGuTexScale(1.0f, 1.0f);
     sceGuTexOffset(0.0f, 0.0f);
     pass_texture(t1, t2);
@@ -1280,15 +1199,15 @@ static void draw_cut(const GuVertex* verts, const uint16_t* indices, int nidx) {
 
 /* A batch that writes depth to the screen: where it does, so is the class of
  * the surface written, the two ranges of its indices in turn. */
-static __attribute__((noinline)) void draw_classes(const Batch* b, const GuVertex* verts, const uint16_t* indices,
+RT_SPRAM static __attribute__((noinline)) void draw_classes(const Batch* b, const GuVertex* verts, const uint16_t* indices,
                                                    bool more_passes) {
     if (b->nidx > 0) {
         gu_stencil(GU_STENCIL_FLAT);
-        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx, indices, verts);
+        draw_indexed(b->nidx, indices, verts);
     }
     if (b->nidx_up > 0) {
         gu_stencil(GU_STENCIL_UPRIGHT);
-        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, b->nidx_up, indices + b->nidx, verts);
+        draw_indexed(b->nidx_up, indices + b->nidx, verts);
     }
     if (more_passes && b->nidx > 0 && b->nidx_up > 0) {
         gu_stencil(GU_STENCIL_KEEP); /* the passes over both ranges would write one class for all of it */
@@ -1302,7 +1221,7 @@ static __attribute__((noinline)) void batch_stencil(void) {
     }
 }
 
-static void draw_batch(Batch* b) {
+RT_SPRAM static void draw_batch(Batch* b) {
     const GuVertex* verts = b->verts;
     if (b->in_arena) {
         /* drawn where it is: keep what it used (two at a time, for alignment) */
@@ -1328,7 +1247,7 @@ static void draw_batch(Batch* b) {
         if (gGu.stencil != GU_STENCIL_OFF || sDecal) {
             batch_stencil();
         }
-        sceGuDrawArray(GU_TRIANGLES, GU_VTYPE | GU_INDEX_16BIT | GU_TRANSFORM_3D, nidx, indices, verts);
+        draw_indexed(nidx, indices, verts);
     }
     if (split) {
         draw_split_pass(verts, indices, nidx);
@@ -1338,7 +1257,7 @@ static void draw_batch(Batch* b) {
     }
 }
 
-void gfx_flush_batch(void) {
+RT_SPRAM void gfx_flush_batch(void) {
     Batch* normal = &sBatches[DEPTH_NORMAL];
     Batch* near = &sBatches[DEPTH_NEAR];
     Batch* far = &sBatches[DEPTH_FAR];
@@ -1353,8 +1272,8 @@ void gfx_flush_batch(void) {
         rt_log("  draw#%u %3d+%d+%d zw %.4f/%.1f v (%.1f %.1f %.1f) uv (%.3f %.3f) col %08X | fit %d ta %d w %d tex %p %08X f%u s%u %ux%u var %X | cc %06X %08X prim %08X env %08X | gm %06X oml %08X omh %06X | z %d/%d bl %d at %d fog %d/%d",
                gStats.draw_calls, nnormal, near->nidx, far->nidx, sTraceZ, sTraceW, d->x, d->y, d->z, d->u, d->v,
                d->color, gFit.mode, gFit.tex_alpha, gFit.white_rgb, gBatchTex,
-               (unsigned)(sTraceKey.addr_bits >> 3), sTraceKey.fmt, sTraceKey.siz, sTraceKey.tile_w, sTraceKey.tile_h,
-               (unsigned)sTraceKey.variant,
+               (unsigned)(gBoundKey.addr_bits >> 3), gBoundKey.fmt, gBoundKey.siz, gBoundKey.tile_w, gBoundKey.tile_h,
+               (unsigned)gBoundKey.variant,
                sBatchState.cc0, sBatchState.cc1, sBatchState.prim, sBatchState.env, sBatchState.gm, sBatchState.oml,
                sBatchState.omh, gGu.depth_test, gGu.depth_mask, gGu.blend, gGu.alpha_test ? gGu.alpha_ref : -1,
                sFogPass ? 2 : gGu.fog, normal->fog_max);
@@ -1400,17 +1319,58 @@ void gfx_flush_batch(void) {
     }
 }
 
-static void prepare_3d_state(void) {
+/*
+ * gFit follows the combiner and its constants; the 3D draws classify again only
+ * when one of them moved since the last time (and the fit depended on nothing
+ * else: a combiner that reads both texture tiles is fitted per triangle).
+ */
+static struct {
+    bool valid;
+    CombinerState state;
+    uint32_t cycle;
+} sClassified;
+
+void gfx_fit_replaced(void) {
+    sClassified.valid = false;
+}
+
+/* Classifies into `fit`, or reuses gFit if the combiner and its constants are the ones it was made for. */
+RT_SPRAM void gfx_classify_cached(CombinerFit* fit) {
+    CombinerState state = rdp_combiner_state();
+    uint32_t cycle = rdp_cycle_type();
+    if (sClassified.valid && combiner_state_equal(&sClassified.state, &state) && sClassified.cycle == cycle) {
+        if (fit != &gFit) {
+            *fit = gFit;
+        }
+        return;
+    }
+    gfx_classify_combiner(fit);
+    if (fit != &gFit) {
+        gFit = *fit;
+    }
+    sClassified.valid = !gfx_combiner_reads_two_textures();
+    sClassified.state = state;
+    sClassified.cycle = cycle;
+}
+
+static bool sColorIdentity = false; /* the fit leaves the shade colour as it is (so vertex_color has nothing to do) */
+
+RT_SPRAM static void prepare_3d_state(void) {
     if (!gRdp.state_dirty) {
         return;
     }
     gfx_flush_batch();
     gfx_open_frame();
-    gfx_classify_combiner(&gFit);
+    gfx_classify_cached(&gFit);
     gfx_apply_render_state(true);
     apply_texture_state();
     gfx_apply_aa_edge(gBatchTex, &gFit);
     gRdp.state_dirty = false;
+    sColorIdentity = true;
+    for (int ch = 0; ch < 3; ch++) {
+        sColorIdentity = sColorIdentity && gFit.base[ch] == 0.0f && gFit.s[ch] == 1.0f && gFit.sa[ch] == 0.0f;
+    }
+    sColorIdentity = sColorIdentity && gFit.abase == 0.0f && gFit.as == 1.0f;
     sBatchGen++;   /* packed vertices were made with the old state */
     if (sBatchGen == 0) {
         sBatchGen = 1;
@@ -1438,6 +1398,16 @@ typedef struct {
     float r, g, b, a;
 } ClipVertex;
 
+/* Room for a triangle's three indices in the batch: upright ones fill idx from the end (see sClassify). */
+static inline uint16_t* batch_tri_indices(Batch* b, bool upright) {
+    if (upright) {
+        b->nidx_up += 3;
+        return &b->idx[BATCH_MAX_INDICES - b->nidx_up];
+    }
+    b->nidx += 3;
+    return &b->idx[b->nidx - 3];
+}
+
 static void pack_vertex(const RspVertex* v, int index) {
     GuVertex* o = &sPacked[index];
     o->x = v->wx;
@@ -1447,21 +1417,28 @@ static void pack_vertex(const RspVertex* v, int index) {
         o->x = sSnapX[index];
         o->y = sSnapY[index];
     } else {
-        snap_vertex(v->nx, v->ny, v->cw, &o->x, &o->y);
+        snap_vertex_pre(v, index, &o->x, &o->y);
         sSnapX[index] = o->x;
         sSnapY[index] = o->y;
         sSnapStamp[index] = sSnapGen;
     }
-    o->color = vertex_color(&gFit, v->r, v->g, v->b, v->a);
+    if (sColorIdentity) {
+        /* the shade as it is: already within 0..1 */
+        o->color = (uint32_t)(int)(v->r * 255.0f + 0.5f) | (uint32_t)(int)(v->g * 255.0f + 0.5f) << 8 |
+                   (uint32_t)(int)(v->b * 255.0f + 0.5f) << 16 | (uint32_t)(int)(v->a * 255.0f + 0.5f) << 24;
+    } else {
+        o->color = vertex_color(&gFit, v->r, v->g, v->b, v->a);
+    }
     if (gBatchTex != NULL) {
-        o->u = v->u * sTexScaleU - sTexOffU;
-        o->v = v->v * sTexScaleV - sTexOffV;
+        o->u = v->u * gTexTransform.scale_u - gTexTransform.off_u;
+        o->v = v->v * gTexTransform.scale_v - gTexTransform.off_v;
     } else {
         o->u = 0;
         o->v = 0;
     }
-    int f = (int)(v->a * 255.0f + 0.5f);
-    sPackedFog[index] = (uint8_t)(f < 0 ? 0 : f > 255 ? 255 : f);
+    if (sFogPass) {
+        sPackedFog[index] = (uint8_t)unit_to_byte(v->a);
+    }
     sPackedStamp[index] = sBatchGen;
 }
 
@@ -1473,13 +1450,7 @@ static void pack_vertex(const RspVertex* v, int index) {
 static void emit_plain_tri(int i0, int i1, int i2, bool upright) {
     const int idx[3] = { i0, i1, i2 };
     Batch* b = BATCH;
-    uint16_t* out = b->idx + b->nidx;
-    if (upright) {
-        b->nidx_up += 3;
-        out = &b->idx[BATCH_MAX_INDICES - b->nidx_up];
-    } else {
-        b->nidx += 3;
-    }
+    uint16_t* out = batch_tri_indices(b, upright);
     for (int k = 0; k < 3; k++) {
         int i = idx[k];
         if (sPackedBatch[i] != sVertGen) {
@@ -1521,17 +1492,16 @@ static inline uint16_t emit_vertex(Batch* b, const ClipVertex* v) {
     }
     o.color = vertex_color(&gFit, v->r, v->g, v->b, v->a);
     if (gBatchTex != NULL) {
-        o.u = v->u * sTexScaleU - sTexOffU;
-        o.v = v->v * sTexScaleV - sTexOffV;
+        o.u = v->u * gTexTransform.scale_u - gTexTransform.off_u;
+        o.v = v->v * gTexTransform.scale_v - gTexTransform.off_v;
     } else {
         o.u = 0;
         o.v = 0;
     }
     b->verts[at] = o;
     if (sFogPass) {
-        int f = (int)(v->a * 255.0f + 0.5f);
-        f = f < 0 ? 0 : f > 255 ? 255 : f;
-        o.color = sFogColor | ((uint32_t)f << 24);
+        uint32_t f = unit_to_byte(v->a);
+        o.color = sFogColor | f << 24;
         b->fogv[at] = o;
         if (f > b->fog_max) {
             b->fog_max = (uint8_t)f;
@@ -1620,103 +1590,40 @@ static void emit_poly(const ClipVertex* poly, int n, int depth, bool upright) {
     }
     Batch* b = &sBatches[depth];
     for (int i = 1; i + 1 < n; i++) {
-        uint16_t* out = b->idx + b->nidx;
-        if (upright) {
-            b->nidx_up += 3;
-            out = &b->idx[BATCH_MAX_INDICES - b->nidx_up];
-        } else {
-            b->nidx += 3;
-        }
+        uint16_t* out = batch_tri_indices(b, upright);
         out[0] = emit_vertex(b, &poly[0]);
         out[1] = emit_vertex(b, &poly[i]);
         out[2] = emit_vertex(b, &poly[i + 1]);
     }
 }
 
-void gfx_draw_triangle(int i0, int i1, int i2) {
-    const RspVertex* v0 = &gRsp.verts[i0 & 0x3F];
-    const RspVertex* v1 = &gRsp.verts[i1 & 0x3F];
-    const RspVertex* v2 = &gRsp.verts[i2 & 0x3F];
+/* The trace line of a triangle about to be drawn. */
+static __attribute__((noinline)) void trace_tri(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2) {
+    const RspVertex* vs[3] = { v0, v1, v2 };
+    char line[256];
+    int len = 0;
+    for (int k = 0; k < 3; k++) {
+        float w = vs[k]->cw;
+        len += snprintf(line + len, sizeof(line) - len, " (%.3f,%.3f z%.6f w%.2f uv %.0f,%.0f a%.2f)",
+                        w != 0 ? (vs[k]->cx / w + 1) * 160 : 0, w != 0 ? (1 - vs[k]->cy / w) * 120 : 0,
+                        w != 0 ? vs[k]->cz / w : 0, w, vs[k]->u / 32, vs[k]->v / 32, vs[k]->a);
+    }
+    rt_log("    tri%s%s", line, sClassify && tri_upright(v0, v1, v2) ? " upright" : "");
+}
 
-    gStats.tri_in++;
-    if (!gfx_select_target() || gfx_blender_keeps_memory()) {
-        return;
-    }
-    /* Trivial reject: all vertices outside the same frustum side. */
-    if (v0->clip & v1->clip & v2->clip & CLIP_OUTSIDE) {
-        gStats.tri_trivial++;
-        return;
-    }
+/* A whole triangle drawn through emit_poly, which logs its pieces. */
+static __attribute__((noinline)) void emit_traced_tri(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2,
+                                                      bool upright) {
+    ClipVertex tri[3];
+    to_clip_vertex(&tri[0], v0);
+    to_clip_vertex(&tri[1], v1);
+    to_clip_vertex(&tri[2], v2);
+    emit_poly(tri, 3, DEPTH_NORMAL, upright);
+}
 
-    /* Back/front face culling in NDC when all vertices are in front of the camera. */
-    uint32_t cull = gRsp.geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
-    if (cull && v0->cw > 0 && v1->cw > 0 && v2->cw > 0) {
-        float area = (v1->nx - v0->nx) * (v2->ny - v0->ny) - (v2->nx - v0->nx) * (v1->ny - v0->ny);
-        if ((cull & G_CULL_BACK) && area < 0) { gStats.tri_culled++; return; }
-        if ((cull & G_CULL_FRONT) && area > 0) { gStats.tri_culled++; return; }
-    }
-
-    /* Only the corners of big triangles are welded (see the weld table). */
-    {
-        float ex = fabsf(v1->nx - v0->nx) + fabsf(v2->nx - v0->nx) + fabsf(v2->nx - v1->nx);
-        float ey = fabsf(v1->ny - v0->ny) + fabsf(v2->ny - v0->ny) + fabsf(v2->ny - v1->ny);
-        sWeldTri = v0->cw <= 0 || v1->cw <= 0 || v2->cw <= 0 || ex + ey > WELD_MIN_EXTENT;
-    }
-    gHintTri[0] = v0;
-    gHintTri[1] = v1;
-    gHintTri[2] = v2;
-    if (!gRdp.state_dirty && gFit.pin_sig >= 0 && gfx_pin_signature() != gFit.pin_sig) {
-        gRdp.state_dirty = true;
-    }
-    prepare_3d_state();
-    if (gTracing) {
-        const RspVertex* vs[3] = { v0, v1, v2 };
-        char line[256];
-        int len = 0;
-        for (int k = 0; k < 3; k++) {
-            float w = vs[k]->cw;
-            len += snprintf(line + len, sizeof(line) - len, " (%.3f,%.3f z%.6f w%.2f uv %.0f,%.0f a%.2f)",
-                            w != 0 ? (vs[k]->cx / w + 1) * 160 : 0, w != 0 ? (1 - vs[k]->cy / w) * 120 : 0,
-                            w != 0 ? vs[k]->cz / w : 0, w, vs[k]->u / 32, vs[k]->v / 32, vs[k]->a);
-        }
-        rt_log("    tri%s%s", line, sClassify && tri_upright(v0, v1, v2) ? " upright" : "");
-    }
-    bool upright = false;
-    if (sClassify) {
-        upright = tri_upright(v0, v1, v2);
-    } else if (sDecal) {
-        int tolerance = decal_tolerance(v0, v1, v2);
-        if (tolerance > sDecalOffset) {
-            sDecalOffset = tolerance;
-        }
-        if (sDecalFlat && tri_upright(v0, v1, v2)) {
-            sDecalFlat = false;
-        }
-    }
-    uint16_t flags = v0->clip | v1->clip | v2->clip;
-    /* The PSP drops a whole triangle if any vertex lies outside the depth
-     * range, while the RDP clamps depth per pixel. Pieces in front of the
-     * near plane or beyond the far plane are drawn with their depth pinned
-     * to that plane instead (not needed when depth is ignored). */
-    bool split_depth = (flags & (CLIP_Z_NEAR | CLIP_Z_FAR)) && gProjVariant != PROJ_FLAT_Z;
-    if (!(flags & (CLIP_NEAR | CLIP_GUARD)) && !split_depth) {
-        /* Whole triangle, three corners: the only batch that can fill up. */
-        Batch* b = BATCH;
-        if (b->nverts + 3 > BATCH_MAX_VERTS || b->nidx + b->nidx_up + 3 > BATCH_MAX_INDICES) {
-            gfx_flush_batch();
-        }
-        if (gTracing) {
-            ClipVertex tri[3];
-            to_clip_vertex(&tri[0], v0);
-            to_clip_vertex(&tri[1], v1);
-            to_clip_vertex(&tri[2], v2);
-            emit_poly(tri, 3, DEPTH_NORMAL, upright);
-        } else {
-            emit_plain_tri(i0 & 0x3F, i1 & 0x3F, i2 & 0x3F, upright);
-        }
-        return;
-    }
-
+/* A triangle that has to be cut (or split at the depth planes) first: the rare case. */
+static __attribute__((noinline)) void draw_triangle_clipped(const RspVertex* v0, const RspVertex* v1, const RspVertex* v2,
+                                                            uint16_t flags, bool split_depth, bool upright) {
     /* Clipping can turn one triangle into a fan in each of the three batches. */
     for (int i = 0; i < 3; i++) {
         if (sBatches[i].nverts + 3 * MAX_POLY > BATCH_MAX_VERTS ||
@@ -1764,3 +1671,101 @@ void gfx_draw_triangle(int i0, int i1, int i2) {
     }
 }
 
+void gfx_draw_triangle(int i0, int i1, int i2) {
+    const RspVertex* v0 = &gRsp.verts[i0 & 0x3F];
+    const RspVertex* v1 = &gRsp.verts[i1 & 0x3F];
+    const RspVertex* v2 = &gRsp.verts[i2 & 0x3F];
+
+    gStats.tri_in++;
+    if (!gfx_select_target() || gfx_blender_keeps_memory()) {
+        return;
+    }
+    /* Trivial reject: all vertices outside the same frustum side. */
+    if (v0->clip & v1->clip & v2->clip & CLIP_OUTSIDE) {
+        gStats.tri_trivial++;
+        return;
+    }
+
+    /* Back/front face culling in NDC when all vertices are in front of the camera. */
+    uint32_t cull = gRsp.geometry_mode & (G_CULL_FRONT | G_CULL_BACK);
+    if (cull && v0->cw > 0 && v1->cw > 0 && v2->cw > 0) {
+        float area = (v1->nx - v0->nx) * (v2->ny - v0->ny) - (v2->nx - v0->nx) * (v1->ny - v0->ny);
+        if ((cull & G_CULL_BACK) && area < 0) { gStats.tri_culled++; return; }
+        if ((cull & G_CULL_FRONT) && area > 0) { gStats.tri_culled++; return; }
+    }
+
+    /* Only the corners of big triangles are welded (see the weld table). */
+    {
+        float ex = fabsf(v1->nx - v0->nx) + fabsf(v2->nx - v0->nx) + fabsf(v2->nx - v1->nx);
+        float ey = fabsf(v1->ny - v0->ny) + fabsf(v2->ny - v0->ny) + fabsf(v2->ny - v1->ny);
+        sWeldTri = v0->cw <= 0 || v1->cw <= 0 || v2->cw <= 0 || ex + ey > WELD_MIN_EXTENT;
+    }
+    gHintTri[0] = v0;
+    gHintTri[1] = v1;
+    gHintTri[2] = v2;
+    if (!gRdp.state_dirty && gFit.pin_sig >= 0 && gfx_pin_signature() != gFit.pin_sig) {
+        gRdp.state_dirty = true;
+    }
+    if (gBakeWindow != 0 && !gRdp.state_dirty && gfx_bake_window_left()) {
+        gRdp.state_dirty = true;
+    }
+    prepare_3d_state();
+    if (gTracing) {
+        trace_tri(v0, v1, v2);
+    }
+    bool upright = false;
+    if (sClassify) {
+        upright = tri_upright(v0, v1, v2);
+    } else if (sDecal) {
+        int tolerance = decal_tolerance(v0, v1, v2);
+        if (tolerance > sDecalOffset) {
+            sDecalOffset = tolerance;
+        }
+        if (sDecalFlat && tri_upright(v0, v1, v2)) {
+            sDecalFlat = false;
+        }
+    }
+    uint16_t flags = v0->clip | v1->clip | v2->clip;
+    /* The PSP drops a whole triangle if any vertex lies outside the depth
+     * range, while the RDP clamps depth per pixel. Pieces in front of the
+     * near plane or beyond the far plane are drawn with their depth pinned
+     * to that plane instead (not needed when depth is ignored). */
+    bool split_depth = (flags & (CLIP_Z_NEAR | CLIP_Z_FAR)) && gProjVariant != PROJ_FLAT_Z;
+    if (!(flags & (CLIP_NEAR | CLIP_GUARD)) && !split_depth) {
+        /* Whole triangle, three corners: the only batch that can fill up. */
+        Batch* b = BATCH;
+        if (b->nverts + 3 > BATCH_MAX_VERTS || b->nidx + b->nidx_up + 3 > BATCH_MAX_INDICES) {
+            gfx_flush_batch();
+        }
+        if (gTracing) {
+            emit_traced_tri(v0, v1, v2, upright);
+        } else {
+            emit_plain_tri(i0 & 0x3F, i1 & 0x3F, i2 & 0x3F, upright);
+        }
+        return;
+    }
+
+    draw_triangle_clipped(v0, v1, v2, flags, split_depth, upright);
+}
+
+/*
+ * Code that runs from the scratchpad (spram.c): the state path -- everything a change of draw state
+ * runs through, which is cold by the next time it is needed -- and the snapping the vertices use.
+ */
+RT_SPRAM_ENTRY(snap_vertex);
+RT_SPRAM_ENTRY(weld_search);
+RT_SPRAM_ENTRY(tri_upright);
+RT_SPRAM_ENTRY(gfx_snap_precompute);
+RT_SPRAM_ENTRY(gfx_forget_packed);
+RT_SPRAM_ENTRY(gfx_apply_render_state);
+RT_SPRAM_ENTRY(gfx_aa_edge_mode);
+RT_SPRAM_ENTRY(apply_texture_state);
+RT_SPRAM_ENTRY(gfx_classify_cached);
+RT_SPRAM_ENTRY(prepare_3d_state);
+RT_SPRAM_ENTRY(gfx_flush_batch);
+RT_SPRAM_ENTRY(draw_batch);
+RT_SPRAM_ENTRY(draw_classes);
+RT_SPRAM_ENTRY(gu_stencil);
+RT_SPRAM_ENTRY(gfx_gu_texture_image);
+RT_SPRAM_ENTRY(gfx_gu_tex_func);
+RT_SPRAM_ENTRY(gfx_apply_aa_edge);

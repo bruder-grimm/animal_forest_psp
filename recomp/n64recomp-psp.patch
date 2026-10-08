@@ -12,11 +12,63 @@ index e7b4431..9cedd25 100644
      };
      
      struct DataSymbol {
+diff --git a/include/recompiler/generator.h b/include/recompiler/generator.h
+index 145bcd0..c7f32dc 100644
+--- a/include/recompiler/generator.h
++++ b/include/recompiler/generator.h
+@@ -5,6 +5,10 @@
+ #include "operations.h"
+ 
+ namespace N64Recomp {
++    // PSP fork: GPRs as C locals (cgenerator.cpp).
++    extern bool register_locals;
++    std::string wrap_hook_text(const std::string& text);
++
+     struct InstructionContext {
+         int rd;
+         int rs;
 diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
-index 94f85c5..f008ed4 100644
+index 94f85c5..29ef1e2 100644
 --- a/src/cgenerator.cpp
 +++ b/src/cgenerator.cpp
-@@ -395,9 +395,10 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
+@@ -78,13 +78,36 @@ static std::vector<BinaryOpFields> c_op_fields = []() {
+     return ret;
+ }();
+ 
++// PSP fork: with register_locals, every function keeps the GPRs in C locals and
++// trusts the MIPS calling convention: before a call only a0-a3 and sp are written
++// back to the context, after it only v0/v1 are read back, and a return writes
++// back v0/v1. The saved registers never go through the context at all (the
++// callee restores them). Hooks, syscalls and events see the whole register file.
++bool N64Recomp::register_locals = false;
++
+ static std::string gpr_to_string(int gpr_index) {
+     if (gpr_index == 0) {
+         return "0";
+     }
++    if (N64Recomp::register_locals) {
++        return fmt::format("r{}", gpr_index);
++    }
+     return fmt::format("ctx->r{}", gpr_index);
+ }
+ 
++// Text around a call of another function (pre, post), and around code that may read or write any register.
++static const char* call_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ARGS(); " : ""; }
++static const char* call_post() { return N64Recomp::register_locals ? " RL_RELOAD_RET();" : ""; }
++static const char* all_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ALL(); " : ""; }
++static const char* all_post() { return N64Recomp::register_locals ? " RL_RELOAD_ALL();" : ""; }
++
++std::string N64Recomp::wrap_hook_text(const std::string& text) {
++    if (!register_locals) {
++        return text;
++    }
++    return fmt::format("{{ RL_FLUSH_ALL(); {} RL_RELOAD_ALL(); }}", text);
++}
++
+ static std::string fpr_to_string(int fpr_index) {
+     return fmt::format("ctx->f{}.fl", fpr_index);
+ }
+@@ -395,11 +418,15 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
  void N64Recomp::CGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
      (void)func_index;
      fmt::print(output_file,
@@ -28,8 +80,53 @@ index 94f85c5..f008ed4 100644
 +        "    gpr hi = 0, lo = 0; uint64_t result = 0;\n"
          "    int c1cs = 0;\n", // cop1 conditional signal
          function_name);
++    if (register_locals) {
++        fmt::print(output_file, "    RL_DECLARE();\n");
++    }
  }
-@@ -525,7 +526,8 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
+ 
+ void N64Recomp::CGenerator::emit_function_end() const {
+@@ -407,25 +434,25 @@ void N64Recomp::CGenerator::emit_function_end() const {
+ }
+ 
+ void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
+-    fmt::print(output_file, "LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
++    fmt::print(output_file, "{}LOOKUP_FUNC(0x{:08X})(rdram, ctx);{}\n", call_pre(), addr, call_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
+-    fmt::print(output_file, "LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
++    fmt::print(output_file, "{}LOOKUP_FUNC({})(rdram, ctx);{}\n", call_pre(), gpr_to_string(reg), call_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
+     (void)target_section_offset;
+     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
+-    fmt::print(output_file, "{}(rdram, ctx);\n", sym.name);
++    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", call_pre(), sym.name, call_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
+-    fmt::print(output_file, "{}(rdram, ctx);\n", context.functions[function_index].name);
++    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", call_pre(), context.functions[function_index].name, call_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name) const {
+-    fmt::print(output_file, "{}(rdram, ctx);\n", function_name);
++    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", call_pre(), function_name, call_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_goto(const std::string& target) const {
+@@ -482,7 +509,7 @@ void N64Recomp::CGenerator::emit_return(const Context& context, size_t func_inde
+     if (context.trace_mode) {
+         fmt::print(output_file, "TRACE_RETURN()\n    ");
+     }
+-    fmt::print(output_file, "return;\n");
++    fmt::print(output_file, "{}return;\n", register_locals ? "RL_WRITE_RET(); " : "");
+ }
+ 
+ void N64Recomp::CGenerator::emit_check_fr(int fpr) const {
+@@ -525,7 +552,8 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
              break;
          case InstrId::cpu_div:
              // Cast to 64-bits before division to prevent artihmetic exception for s32(0x80000000) / -1
@@ -39,17 +136,54 @@ index 94f85c5..f008ed4 100644
              break;
          case InstrId::cpu_ddiv:
              fmt::print(output_file, "DDIV(S64({}), S64({}), &lo, &hi);\n", gpr_to_string(reg1), gpr_to_string(reg2));
+@@ -543,7 +571,7 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
+ }
+ 
+ void N64Recomp::CGenerator::emit_syscall(uint32_t instr_vram) const {
+-    fmt::print(output_file, "recomp_syscall_handler(rdram, ctx, 0x{:08X});\n", instr_vram);
++    fmt::print(output_file, "{}recomp_syscall_handler(rdram, ctx, 0x{:08X});{}\n", all_pre(), instr_vram, all_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_do_break(uint32_t instr_vram) const {
+@@ -555,7 +583,7 @@ void N64Recomp::CGenerator::emit_pause_self() const {
+ }
+ 
+ void N64Recomp::CGenerator::emit_trigger_event(uint32_t event_index) const {
+-    fmt::print(output_file, "recomp_trigger_event(rdram, ctx, base_event_index + {});\n", event_index);
++    fmt::print(output_file, "{}recomp_trigger_event(rdram, ctx, base_event_index + {});{}\n", all_pre(), event_index, all_post());
+ }
+ 
+ void N64Recomp::CGenerator::emit_comment(const std::string& comment) const {
 diff --git a/src/config.cpp b/src/config.cpp
-index 1066aff..4e792dd 100644
+index 1066aff..ce8bc45 100644
 --- a/src/config.cpp
 +++ b/src/config.cpp
-@@ -360,6 +360,16 @@ N64Recomp::Config::Config(const char* path) {
+@@ -81,11 +81,11 @@ std::vector<std::string> get_stubbed_funcs(const toml::table* patches_data) {
+     return stubbed_funcs;
+ }
+ 
+-std::vector<std::string> get_ignored_funcs(const toml::table* patches_data) {
++std::vector<std::string> get_ignored_funcs(const toml::table* patches_data, const char* key = "ignored") {
+     std::vector<std::string> ignored_funcs{};
+ 
+     // Check if the ignored funcs array exists.
+-    const toml::node_view ignored_funcs_data = (*patches_data)["ignored"];
++    const toml::node_view ignored_funcs_data = (*patches_data)[key];
+ 
+     if (ignored_funcs_data.is_array()) {
+         const toml::array* ignored_funcs_array = ignored_funcs_data.as_array();
+@@ -360,6 +360,21 @@ N64Recomp::Config::Config(const char* path) {
              bss_section_suffix = ".bss";
          }
  
 +        std::optional<bool> emit_section_relocs_opt = input_data["emit_section_relocs"].value<bool>();
 +        if (emit_section_relocs_opt.has_value()) {
 +            emit_section_relocs = emit_section_relocs_opt.value();
++        }
++
++        std::optional<bool> register_locals_opt = input_data["register_locals"].value<bool>();
++        if (register_locals_opt.has_value()) {
++            register_locals = register_locals_opt.value();
 +        }
 +
 +        std::optional<std::string> overlay_reloc_suffix_opt = input_data["overlay_reloc_suffix"].value<std::string>();
@@ -60,7 +194,7 @@ index 1066aff..4e792dd 100644
          std::optional<bool> single_file_output_opt = input_data["single_file_output"].value<bool>();
          if (single_file_output_opt.has_value()) {
              single_file_output = single_file_output_opt.value();
-@@ -451,6 +461,19 @@ N64Recomp::Config::Config(const char* path) {
+@@ -451,9 +466,26 @@ N64Recomp::Config::Config(const char* path) {
              // Stubs array (optional)
              stubbed_funcs = get_stubbed_funcs(table);
  
@@ -80,11 +214,18 @@ index 1066aff..4e792dd 100644
              // Ignored funcs array (optional)
              ignored_funcs = get_ignored_funcs(table);
  
++            // PSP fork: natively provided funcs array (optional), ignored as well
++            native_funcs = get_ignored_funcs(table, "native");
++            ignored_funcs.insert(ignored_funcs.end(), native_funcs.begin(), native_funcs.end());
++
+             // Renamed funcs array (optional)
+             renamed_funcs = get_renamed_funcs(table);
+ 
 diff --git a/src/config.h b/src/config.h
-index 7d6db23..2214c8d 100644
+index 7d6db23..a9ac124 100644
 --- a/src/config.h
 +++ b/src/config.h
-@@ -56,6 +56,12 @@ namespace N64Recomp {
+@@ -56,7 +56,18 @@ namespace N64Recomp {
          std::filesystem::path relocatable_sections_path;
          std::filesystem::path output_binary_path;
          std::vector<std::string> stubbed_funcs;
@@ -94,9 +235,15 @@ index 7d6db23..2214c8d 100644
 +        std::string overlay_reloc_suffix;
 +        // PSP fork: whether recomp_overlays.inl carries per-section relocation arrays.
 +        bool emit_section_relocs = true;
++        // PSP fork: GPRs as C locals, trusting the calling convention (cgenerator.cpp).
++        bool register_locals = false;
          std::vector<std::string> ignored_funcs;
++        // PSP fork: functions the runtime provides natively. Ignored like the above, but kept in the
++        // function table (pointing at the runtime's version) so indirect calls still find them.
++        std::vector<std::string> native_funcs;
          std::vector<std::string> renamed_funcs;
          std::vector<InstructionPatch> instruction_patches;
+         std::vector<FunctionTextHook> function_hooks;
 diff --git a/src/elf.cpp b/src/elf.cpp
 index 4fbd1ce..42c08c0 100644
 --- a/src/elf.cpp
@@ -255,18 +402,20 @@ index 4fbd1ce..42c08c0 100644
              // This is safe to do as the entire full_immediate in present in relocs due to the pairing that was done earlier, so the HI16 does not
              // need to directly preceed the matching LO16 anymore.
 diff --git a/src/main.cpp b/src/main.cpp
-index 669c4a1..8c471b1 100644
+index 669c4a1..fe36cc9 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -13,6 +13,7 @@
+@@ -12,7 +12,9 @@
+ 
  #include "recompiler/context.h"
  #include "config.h"
++#include "recompiler/generator.h"
  #include <set>
 +#include <sstream>
  
  void add_manual_functions(N64Recomp::Context& context, const std::vector<N64Recomp::ManualFunction>& manual_funcs) {
      auto exit_failure = [](const std::string& error_str) {
-@@ -390,6 +391,7 @@ int main(int argc, char** argv) {
+@@ -390,6 +392,7 @@ int main(int argc, char** argv) {
              .unpaired_lo16_warnings = config.unpaired_lo16_warnings,
              .all_sections_relocatable = false,
              .use_mdebug = config.use_mdebug,
@@ -274,7 +423,7 @@ index 669c4a1..8c471b1 100644
          };
  
          for (const auto& func_size : config.manual_func_sizes) {
-@@ -509,6 +511,19 @@ int main(int argc, char** argv) {
+@@ -509,6 +512,19 @@ int main(int argc, char** argv) {
  
      fmt::print("Working dir: {}\n", std::filesystem::current_path().string());
  
@@ -294,7 +443,15 @@ index 669c4a1..8c471b1 100644
      // Stub out any functions specified in the config file.
      for (const std::string& stubbed_func : config.stubbed_funcs) {
          // Check if the specified function exists.
-@@ -731,6 +746,27 @@ int main(int argc, char** argv) {
+@@ -551,6 +567,7 @@ int main(int argc, char** argv) {
+ 
+     // Propogate the trace mode parameter.
+     context.trace_mode = config.trace_mode;
++    N64Recomp::register_locals = config.register_locals;
+ 
+     // Apply any single-instruction patches.
+     for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
+@@ -731,6 +748,27 @@ int main(int argc, char** argv) {
  
      std::vector<size_t> export_function_indices{};
  
@@ -322,7 +479,7 @@ index 669c4a1..8c471b1 100644
      bool failed_strict_mode = false;
  
      //#pragma omp parallel for
-@@ -770,7 +806,7 @@ int main(int argc, char** argv) {
+@@ -770,7 +808,7 @@ int main(int argc, char** argv) {
  
              // Recompile the function.
              if (config.single_file_output || config.functions_per_output_file > 1) {
@@ -331,7 +488,7 @@ index 669c4a1..8c471b1 100644
                  if (!config.single_file_output) {
                      cur_file_function_count++;
                      if (cur_file_function_count >= config.functions_per_output_file) {
-@@ -785,7 +821,8 @@ int main(int argc, char** argv) {
+@@ -785,7 +823,8 @@ int main(int argc, char** argv) {
                  fmt::print(stderr, "Error recompiling {}\n", func.name);
                  std::exit(EXIT_FAILURE);
              }
@@ -341,7 +498,7 @@ index 669c4a1..8c471b1 100644
              fmt::print(func_header_file,
                         "void {}(uint8_t* rdram, recomp_context* ctx);\n", func.name);
          }
-@@ -860,7 +897,7 @@ int main(int argc, char** argv) {
+@@ -860,7 +899,7 @@ int main(int argc, char** argv) {
              bool result;
              size_t prev_num_statics = static_funcs_by_section[new_func.section_index].size();
              if (config.single_file_output || config.functions_per_output_file > 1) {
@@ -350,7 +507,7 @@ index 669c4a1..8c471b1 100644
                  if (!config.single_file_output) {
                      cur_file_function_count++;
                      if (cur_file_function_count >= config.functions_per_output_file) {
-@@ -892,6 +929,14 @@ int main(int argc, char** argv) {
+@@ -892,6 +931,14 @@ int main(int argc, char** argv) {
          }
      }
  
@@ -365,7 +522,7 @@ index 669c4a1..8c471b1 100644
      if (config.has_entrypoint) {
          std::ofstream lookup_file{ config.output_func_path / "lookup.cpp" };
          
-@@ -929,7 +974,8 @@ int main(int argc, char** argv) {
+@@ -929,7 +976,8 @@ int main(int argc, char** argv) {
          for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
              const auto& section = context.sections[section_index];
              const auto& section_funcs = context.section_functions[section_index];
@@ -375,3 +532,171 @@ index 669c4a1..8c471b1 100644
  
              if (section.has_mips32_relocs || !section_funcs.empty()) {
                  std::string_view section_name_trimmed{ section.name };
+@@ -957,8 +1005,12 @@ int main(int argc, char** argv) {
+                 for (size_t func_index : section_funcs) {
+                     const auto& func = context.functions[func_index];
+                     size_t func_size = func.reimplemented ? 0 : func.words.size() * sizeof(func.words[0]);
++                    // PSP fork: a function the runtime provides natively under its own name ("native" in the
++                    // config) keeps its entry, so indirect calls (function pointers) still find it.
++                    bool runtime_provided = func.ignored && !func.name.empty() &&
++                        std::find(config.native_funcs.begin(), config.native_funcs.end(), func.name) != config.native_funcs.end();
+ 
+-                    if (func.reimplemented || (!func.name.empty() && !func.ignored && func.words.size() != 0)) {
++                    if (func.reimplemented || runtime_provided || (!func.name.empty() && !func.ignored && func.words.size() != 0)) {
+                         fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08X}, .rom_size = 0x{:08X} }},\n",
+                             func.name, func.rom - section.rom_addr, func_size);
+                     }
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..37882d0 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -128,7 +128,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+ 
+     auto hook_find = func.function_hooks.find(instr_index);
+     if (hook_find != func.function_hooks.end()) {
+-        fmt::print(output_file, "    {}\n", hook_find->second);
++        fmt::print(output_file, "    {}\n", N64Recomp::wrap_hook_text(hook_find->second));
+         if (indent) {
+             print_indent();
+         }
+@@ -759,6 +759,120 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     return true;
+ }
+ 
++// PSP fork: with register_locals the generated code trusts the calling
++// convention. This flags the places in a function where it is not followed:
++// a read of a temporary (at, v0-v1, t0-t9) that nothing in the function wrote
++// first -- an input the caller left in a register the convention doesn't pass
++// -- and a read of a temporary or an argument register after a call that
++// nothing wrote since, other than the v0/v1 the callee returns. Must-written
++// dataflow over the function's instructions; delay slots run before their
++// branch takes effect, a likely branch's slot only on the taken path.
++static void check_calling_convention(const N64Recomp::Context& context, const N64Recomp::Function& func,
++                                     const std::vector<rabbitizer::InstructionCpu>& instructions,
++                                     const N64Recomp::FunctionStats& stats) {
++    using InstrId = rabbitizer::InstrId::UniqueId;
++    const uint32_t TEMPS = (1u << 1) | (1u << 2) | (1u << 3) | (0xFFu << 8) | (1u << 24) | (1u << 25);
++    const uint32_t ARGS = 0xFu << 4;
++    const uint32_t ALL = 0xFFFFFFFFu;
++    size_t n = instructions.size();
++    if (n == 0) {
++        return;
++    }
++    auto index_of = [&](uint32_t vram) -> int64_t {
++        if (vram < func.vram || vram >= func.vram + 4 * n) {
++            return -1;
++        }
++        return (vram - func.vram) / 4;
++    };
++    auto writes = [](const rabbitizer::InstructionCpu& in) {
++        uint32_t w = 0;
++        if (in.modifiesRd()) w |= 1u << (int)in.GetO32_rd();
++        if (in.modifiesRt()) w |= 1u << (int)in.GetO32_rt();
++        if (in.modifiesRs()) w |= 1u << (int)in.GetO32_rs();
++        if (in.doesLink()) w |= 1u << 31;
++        return w;
++    };
++    auto reads = [](const rabbitizer::InstructionCpu& in) {
++        uint32_t r = 0;
++        if (in.readsRs()) r |= 1u << (int)in.GetO32_rs();
++        if (in.readsRt()) r |= 1u << (int)in.GetO32_rt();
++        if (in.readsRd()) r |= 1u << (int)in.GetO32_rd();
++        return r & ~1u;
++    };
++    // A branch or jump and its delay slot are one node; the slot's instruction
++    // is a node of its own too, for when something branches to it.
++    // edges[i]: (successor, registers the edge adds, whether a call returns on it).
++    struct Edge { size_t to; uint32_t add; bool call; };
++    std::vector<std::vector<Edge>> edges(n);
++    for (size_t i = 0; i < n; i++) {
++        const auto& in = instructions[i];
++        auto id = in.getUniqueId();
++        if (!in.hasDelaySlot() || i + 1 >= n) {
++            if (i + 1 < n) edges[i].push_back({i + 1, 0, false});
++            continue;
++        }
++        uint32_t slot_w = writes(instructions[i + 1]);
++        bool is_call = id == InstrId::cpu_jal || id == InstrId::cpu_jalr ||
++                       ((id == InstrId::cpu_bgezal || id == InstrId::cpu_bltzal) && index_of(in.getBranchVramGeneric()) < 0);
++        if (is_call) {
++            if (i + 2 < n) edges[i].push_back({i + 2, slot_w, true});
++        } else if (id == InstrId::cpu_jr) {
++            for (const auto& jtbl : stats.jump_tables) {
++                if (jtbl.jr_vram == in.getVram()) {
++                    for (uint32_t e : jtbl.entries) {
++                        int64_t t = index_of(e);
++                        if (t >= 0) edges[i].push_back({(size_t)t, slot_w, false});
++                    }
++                }
++            }
++        } else if (in.isBranch() || id == InstrId::cpu_j) {
++            int64_t t = index_of(in.getBranchVramGeneric());
++            if (t >= 0) edges[i].push_back({(size_t)t, slot_w, false});
++            bool unconditional = in.isUnconditionalBranch() || id == InstrId::cpu_j;
++            if (!unconditional && i + 2 < n) {
++                edges[i].push_back({i + 2, in.isBranchLikely() ? 0u : slot_w, false});
++            }
++        }
++    }
++    // in_valid[i]: registers certainly written (or passed in) on every path to i.
++    std::vector<uint32_t> in_valid(n, ALL);
++    std::vector<bool> reached(n, false);
++    in_valid[0] = ALL & ~TEMPS;
++    reached[0] = true;
++    std::vector<size_t> work{0};
++    while (!work.empty()) {
++        size_t i = work.back();
++        work.pop_back();
++        uint32_t out = in_valid[i] | writes(instructions[i]);
++        for (const Edge& e : edges[i]) {
++            uint32_t v = out | e.add;
++            if (e.call) {
++                v = (v & ~(TEMPS | ARGS)) | (1u << 2) | (1u << 3);
++            }
++            uint32_t merged = reached[e.to] ? (in_valid[e.to] & v) : v;
++            if (!reached[e.to] || merged != in_valid[e.to]) {
++                reached[e.to] = true;
++                in_valid[e.to] = merged;
++                work.push_back(e.to);
++            }
++        }
++    }
++    auto report = [&](size_t i, uint32_t valid) {
++        uint32_t bad = reads(instructions[i]) & ~valid & (TEMPS | ARGS);
++        if (bad) {
++            fmt::print(stderr, "ABI: {} 0x{:08X} reads unset {:08X}: {}\n", func.name, instructions[i].getVram(), bad,
++                       instructions[i].disassemble(0));
++        }
++    };
++    for (size_t i = 0; i < n; i++) {
++        if (!reached[i]) continue;
++        report(i, in_valid[i]);
++        if (instructions[i].hasDelaySlot() && i + 1 < n) {
++            report(i + 1, in_valid[i] | writes(instructions[i]));
++        }
++    }
++}
++
+ template <typename GeneratorType>
+ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context& context, size_t func_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
+     const N64Recomp::Function& func = context.functions[func_index];
+@@ -781,7 +895,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+ 
+         auto hook_find = func.function_hooks.find(-1);
+         if (hook_find != func.function_hooks.end()) {
+-            fmt::print(output_file, "    {}\n", hook_find->second);
++            fmt::print(output_file, "    {}\n", N64Recomp::wrap_hook_text(hook_find->second));
+         }
+ 
+         // First pass, disassemble each instruction and collect branch labels
+@@ -806,6 +920,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+             return false;
+         }
+ 
++        if (N64Recomp::register_locals) {
++            check_calling_convention(context, func, instructions, stats);
++        }
++
+         std::unordered_set<uint32_t> jtbl_lw_instructions{};
+ 
+         // Add jump table labels into function

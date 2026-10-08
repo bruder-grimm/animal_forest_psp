@@ -91,8 +91,14 @@
 RspState gRsp;
 RdpState gRdp;
 
+/* rd_w32 with RDRAM's address kept in a register through the interpreter's loop. */
 static inline uint32_t rd_w32_fast(uint8_t* rdram, uint32_t addr) {
     return (uint32_t)MEM_W(0, addr);
+}
+
+/* A triangle as G_TRI1/G_TRI2 give it: three vertex indices, times two, in the low three bytes of a word. */
+static inline void draw_tri_word(uint32_t w) {
+    gfx_draw_triangle(((w >> 16) & 0xFF) / 2, ((w >> 8) & 0xFF) / 2, (w & 0xFF) / 2);
 }
 
 /* ---- RSP state ---------------------------------------------------------- */
@@ -124,6 +130,7 @@ static void reset_rsp(void) {
     gRsp.geometry_mode = 0;
     gRsp.tex_on = false;
     gRsp.pending_branch = 0;
+    gRsp.vtx_count = 0;
     gfx_weld_reset();
     gfx_update_snap();
 }
@@ -149,23 +156,17 @@ static void handle_moveword(uint32_t w0, uint32_t w1) {
     }
 }
 
+/* An F3DEX2 Light: its colour (bytes 0-2) and direction (signed bytes 8-10). */
 static void read_light(uint32_t addr, Light* light) {
     uint8_t raw[16];
     rt_copy_from_rdram(addr, raw, 16);
     light->col[0] = raw[0] / 255.0f;
     light->col[1] = raw[1] / 255.0f;
     light->col[2] = raw[2] / 255.0f;
-    light->kc = raw[3];
-    light->point = raw[3] != 0;
     light->dir[0] = (int8_t)raw[8];
     light->dir[1] = (int8_t)raw[9];
     light->dir[2] = (int8_t)raw[10];
     normalize3(light->dir);
-    light->pos[0] = (int16_t)((raw[8] << 8) | raw[9]);
-    light->pos[1] = (int16_t)((raw[10] << 8) | raw[11]);
-    light->pos[2] = (int16_t)((raw[12] << 8) | raw[13]);
-    light->kl = raw[7];
-    light->kq = raw[14];
 }
 
 static void handle_movemem(uint32_t w0, uint32_t w1) {
@@ -271,16 +272,33 @@ static void load_unit(const TmemLoad* l, uint32_t unit, uint32_t* bits, bool* sw
     }
 }
 
-static void tmem_lookup(uint32_t unit, uint32_t* bits, bool* swapped) {
+/*
+ * Where a unit's texels came from, looked up in the recorded loads, newest
+ * first. A draw looks at a few units several times over (the combiner's
+ * classification, then each tile's key), so answers are kept until the next load.
+ */
+static uint32_t sTmemGen = 1;
+static struct { uint32_t gen, bits; bool swapped; } sTmemMemo[512];
+
+RT_SPRAM static void tmem_lookup(uint32_t unit, uint32_t* bits, bool* swapped) {
+    if (sTmemMemo[unit].gen == sTmemGen) {
+        *bits = sTmemMemo[unit].bits;
+        *swapped = sTmemMemo[unit].swapped;
+        return;
+    }
     for (int i = gRdp.num_tmem_loads - 1; i >= 0; i--) {
         const TmemLoad* l = &gRdp.tmem_loads[i];
         if (unit - l->first < l->count) {
             load_unit(l, unit, bits, swapped);
-            return;
+            goto done;
         }
     }
     *bits = gRdp.tmem_bits[unit];
     *swapped = gRdp.tmem_swap[unit] != 0;
+done:
+    sTmemMemo[unit].gen = sTmemGen;
+    sTmemMemo[unit].bits = *bits;
+    sTmemMemo[unit].swapped = *swapped;
 }
 
 uint32_t gfx_tmem_bits(uint32_t unit) {
@@ -297,14 +315,32 @@ bool gfx_tmem_swapped(uint32_t unit) {
     return swapped;
 }
 
+/* A number that changes with every different state of the loads and the tables behind them. */
+static uint32_t sTmemTables = 0;
+static void update_tmem_sig(void) {
+    uint32_t h = 2166136261u ^ sTmemTables;
+    for (int i = 0; i < gRdp.num_tmem_loads; i++) {
+        const TmemLoad* l = &gRdp.tmem_loads[i];
+        h = (h ^ ((uint32_t)l->first | (uint32_t)l->count << 16)) * 16777619u;
+        h = (h ^ l->line) * 16777619u;
+        h = (h ^ l->bits) * 16777619u;
+        h = (h ^ l->step) * 16777619u;
+    }
+    gRdp.tmem_sig = h ^ (uint32_t)gRdp.num_tmem_loads;
+}
+
 void gfx_tmem_reset(void) {
+    sTmemGen++;
     memset(gRdp.tmem_bits, 0xFF, sizeof(gRdp.tmem_bits));
     memset(gRdp.tmem_swap, 0, sizeof(gRdp.tmem_swap));
     gRdp.num_tmem_loads = 0;
+    sTmemTables++;
+    update_tmem_sig();
 }
 
 /* Notes a load of `count` units from unit `first` on (clipped to texture memory). */
-static void tmem_load(uint32_t first, uint32_t count, uint32_t line, uint32_t bits, uint32_t step) {
+RT_SPRAM static void tmem_load(uint32_t first, uint32_t count, uint32_t line, uint32_t bits, uint32_t step) {
+    sTmemGen++;
     if (count > 512 - first) {
         count = 512 - first;
     }
@@ -329,9 +365,11 @@ static void tmem_load(uint32_t first, uint32_t count, uint32_t line, uint32_t bi
         }
         memmove(&gRdp.tmem_loads[0], &gRdp.tmem_loads[1], (TMEM_LOADS - 1) * sizeof(TmemLoad));
         n--;
+        sTmemTables++;
     }
     gRdp.tmem_loads[n] = (TmemLoad){ (uint16_t)first, (uint16_t)count, (uint16_t)line, bits, step };
     gRdp.num_tmem_loads = n + 1;
+    update_tmem_sig();
 }
 
 /* ---- the interpreter ---------------------------------------------------- */
@@ -395,6 +433,7 @@ static void run_dl(uint32_t dl) {
             case G_SPECIAL_3:
             case G_DMA_IO:
             case G_RDPHALF_2:
+            case G_SETPRIMDEPTH: /* (the primitive depth, which the renderer does not use) */
                 break;
             case G_LOAD_UCODE:
                 gRsp.s2dex = (w1 & 0x1FFFFFFF) == (UCODE_S2DEX2_TEXT & 0x1FFFFFFF);
@@ -404,6 +443,8 @@ static void run_dl(uint32_t dl) {
                 int n = (w0 >> 12) & 0xFF;
                 int end = (w0 & 0xFF) >> 1;
                 gfx_process_vertices(seg_addr(w1), end - n, n);
+                gRsp.vtx_first = (uint8_t)(end - n);
+                gRsp.vtx_count = (uint8_t)n;
                 gStats.vertices += n;
                 break;
             }
@@ -450,12 +491,12 @@ static void run_dl(uint32_t dl) {
                 break;
             }
             case G_TRI1:
-                gfx_draw_triangle(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+                draw_tri_word(w0);
                 break;
             case G_TRI2:
             case G_QUAD:
-                gfx_draw_triangle(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
-                gfx_draw_triangle(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+                draw_tri_word(w0);
+                draw_tri_word(w1);
                 break;
             case G_LINE3D:
                 break;
@@ -535,9 +576,6 @@ static void run_dl(uint32_t dl) {
                     gfx_flush_batch();
                     gfx_set_scissor();
                 }
-                break;
-            case G_SETPRIMDEPTH:
-                gRdp.prim_depth = (uint16_t)(w1 >> 16);
                 break;
             case G_RDPSETOTHERMODE:
                 gRdp.other_h = w0 & 0xFFFFFF;
@@ -643,8 +681,6 @@ static void run_dl(uint32_t dl) {
                 break;
             case G_SETTIMG:
                 gRdp.timg = seg_addr(w1);
-                gRdp.timg_fmt = (w0 >> 21) & 7;
-                gRdp.timg_siz = (w0 >> 19) & 3;
                 gRdp.timg_width = (uint16_t)((w0 & 0xFFF) + 1);
                 break;
             case G_SETZIMG:
@@ -685,3 +721,7 @@ void gfx_run_task(uint32_t task) {
     gfx_target_flush(); /* the game may look at its picture, and the next task starts from RDRAM */
     gStats.render_us += sceKernelGetSystemTimeWide() - t0;
 }
+
+/* (run from the scratchpad: see spram.c) */
+RT_SPRAM_ENTRY(tmem_lookup);
+RT_SPRAM_ENTRY(tmem_load);

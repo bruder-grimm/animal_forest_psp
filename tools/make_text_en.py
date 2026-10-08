@@ -58,7 +58,7 @@ DROPPABLE = {8, 10, 11, 12}
 TAG_TABLE = os.path.join(os.path.dirname(__file__), "text_en_tags.json")
 MANUAL = os.path.join(os.path.dirname(__file__), "text_en_manual.txt")
 
-# The font's ASCII widths (runtime/src/text_en.c kAsciiWidth), for checking
+# The font's ASCII widths (runtime/src/english/dialogue.c kAsciiWidth), for checking
 # that hand-written lines fit the window; codes the font draws as kana count 12.
 ASCII_WIDTH = [5, 4, 6, 12, 12, 11, 9, 5, 5, 5, 12, 12, 5, 9, 5, 12, 9, 6, 9, 9, 9, 9, 9, 9, 9, 9, 4, 12, 8, 9, 8, 8,
                11, 9, 8, 9, 8, 7, 7, 9, 8, 4, 6, 8, 7, 10, 8, 9, 8, 9, 8, 8, 7, 8, 9, 11, 8, 9, 8, 12, 12, 12, 12, 9,

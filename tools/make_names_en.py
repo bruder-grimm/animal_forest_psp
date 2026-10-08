@@ -28,7 +28,7 @@ the GameCube kept nearly the same numbering:
     are built from.
 
 Most English names are longer than the N64 buffers (1104 of the item names
-are over 10 bytes). The runtime (runtime/src/names_en.c) writes a string that
+are over 10 bytes). The runtime (runtime/src/english/names.c) writes a string that
 fits as it is; a longer one becomes its first bytes plus a token the font and
 message code expand again. Entry numbers therefore stay fixed: villagers 0,
 choices 256, strings 768, items 2400 + item_index(offset in file 2225): the
@@ -97,7 +97,7 @@ HBZ_GC = ["superz.bin", "maila.bin", "mailb.bin", "mailc.bin", "psz.bin"]
 # free strings mNpc_SetRemailFreeString always sets for villagers' letters (0-15)
 HBZ_FREE = set(range(0x24, 0x2E)) | set(range(0x36, 0x3C))
 TOKEN_LEN = 3
-TAIL_RANGES = [(569, 668), (16, 155)]  # the catchphrases in the string bank (names_en.c too)
+TAIL_RANGES = [(569, 668), (16, 155)]  # the catchphrases in the string bank (english/names.c too)
 TAILS = [i for a, b in TAIL_RANGES for i in range(a, b + 1)]
 CALENDAR = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
             "November", "December", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
@@ -136,6 +136,17 @@ EXTRA_STRINGS = {
     55: "so be it", 58: "nyan", 64: "oh my", 79: "dearie", 80: "sah", 83: "gansu", 90: "pooh", 93: "mew mew",
     96: "par", 99: "pssh", 101: "cho", 109: "zeh", 128: "matey", 610: "yeah man", 617: "y'know",
 }
+# Item names the GC left as Japanese placeholders (category, index): the errand
+# items' stand-ins, the fortune and the town map; and the errand's bag of money,
+# which the GC calls "money1000Bell", named like the bag in category 1.
+ITEM_EXTRA = {(5, 0): "letter", (5, 1): "cloth", (5, 2): "money", (5, 13): "1.000 Bells", (5, 19): "fortune",
+              (5, 29): "town map"}
+# Choices the GC writes with a character the N64 font lacks ("w/o": "/" is a note there).
+CHOICE_EXTRA = {96: "Quit without saving."}
+# The GC font draws a few codes as other letters: "|" is e acute ("Pok|mon",
+# "caf|"), 0x87 n tilde ("Se\x87or K.K."). The N64 font has neither, and kana
+# where they are, so they lose their accents.
+GC_CHARS = {ord("|"): b"e", 0x87: b"n"}
 # Resetti's apologies (1160-1171) are typed back on the keyboard, so they may
 # only use what it has: the GC's "Me = bad" has no "=", and 1166/1169 use GC
 # symbols. Raw N64 bytes: "+" is the font's heart, which the keyboard also has.
@@ -324,7 +335,7 @@ def main():
             s = s.encode("latin1")
         out = bytearray()
         for b in s:
-            r = conv.text(b)
+            r = GC_CHARS.get(b) or conv.text(b)
             if r is None:
                 return None
             out += r
@@ -355,6 +366,8 @@ def main():
     sel = msgfmt.gc_messages(os.path.join(gc_dir, "select.bin"))
     for i in range(N_CHOICE):
         put(BASE_CHOICE + i, sel[i], f"choice {i}")
+    for i, en in CHOICE_EXTRA.items():
+        put(BASE_CHOICE + i, en, f"choice {i}")
 
     # strings
     st = msgfmt.gc_messages(os.path.join(gc_dir, "string.bin"))
@@ -425,6 +438,8 @@ def main():
     pairs = align(J, F, known)
     for off, name in cat_pairs:
         put(BASE_ITEM + item_index(off), name, f"item {off:#x}")
+    for (c, k), name in ITEM_EXTRA.items():
+        put(BASE_ITEM + item_index(ITEM1_TABLES[c] + 10 * k), name, f"item {c}/{k}")
     missing = 0
     for k, j in enumerate(J):
         name = F[pairs[k]] if k in pairs else known.get(j)

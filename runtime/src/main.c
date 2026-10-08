@@ -4,10 +4,8 @@
  * Also the PSP-side lifecycle: the HOME-button exit, standby and resume.
  */
 #include <pspkernel.h>
-#include <pspiofilemgr.h>
 #include <psppower.h>
-#include <malloc.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "audio/me_audio.h"
@@ -17,12 +15,18 @@ PSP_MODULE_INFO("AnimalForestPSP", PSP_MODULE_USER, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 PSP_MAIN_THREAD_STACK_SIZE_KB(256);
 /* Leave room outside the newlib heap for thread stacks and kernel objects
- * (the PSP-1000 has 24MB for everything). */
-PSP_HEAP_THRESHOLD_SIZE_KB(2048);
+ * (the PSP-1000 has 24MB for everything). The game threads' stacks are the
+ * runtime's own (sched.c), so this is for the helper threads. */
+PSP_HEAP_THRESHOLD_SIZE_KB(1024);
 
-uint8_t* g_rdram = NULL;
-
-static char sBaseDir[192] = "ms0:/PSP/GAME/AFPSP";
+/*
+ * RDRAM, with zeros on both sides for generated code that steps just outside
+ * it (MEM_PTR). Static, so it is at the same address in every run of a build:
+ * the game threads' stacks hold pointers into it, and a capture keeps those
+ * (capture.c).
+ */
+static uint8_t sRdramBlock[RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD] __attribute__((aligned(64)));
+uint8_t* g_rdram = sRdramBlock + RDRAM_GUARD;
 
 /* ROM layout facts (makerom entry code: bss clear + stack setup). */
 #define IPL3_LOAD_SIZE 0x100000u
@@ -74,6 +78,16 @@ uint32_t rt_idle_percent(uint32_t span_us) {
     return idle_us >= span_us ? 100 : (uint32_t)(idle_us * 100 / span_us);
 }
 
+uint64_t rt_thread_cpu_us(int thid) {
+    SceKernelThreadRunStatus st;
+    memset(&st, 0, sizeof(st));
+    st.size = sizeof(st);
+    if (sceKernelReferThreadRunStatus(thid, &st) < 0) {
+        return 0;
+    }
+    return rt_u64(st.runClocks.hi, st.runClocks.low);
+}
+
 static void start_idle_counter(void) {
     SceUID thid = sceKernelCreateThread("rt_idle", idle_counter, 0x6F, 2048, PSP_THREAD_ATTR_USER, NULL);
     sceKernelStartThread(thid, 0, NULL);
@@ -103,11 +117,6 @@ static uint32_t probe_free_memory(void) {
     return (uint32_t)n * CHUNK;
 }
 
-const char* rt_data_path(const char* name, char* out, size_t out_size) {
-    snprintf(out, out_size, "%s/%s", sBaseDir, name);
-    return out;
-}
-
 static int exit_callback(int arg1, int arg2, void* common) {
     rt_log("exit requested");
     /* The ME first: it runs code from, and writes into, memory the exit frees. */
@@ -121,6 +130,7 @@ static int exit_callback(int arg1, int arg2, void* common) {
 
 /* After a resume, on a thread of its own: starts the ME again. */
 static int resume_thread(SceSize args, void* argp) {
+    rt_spram_check();
     rt_me_audio_resume();
     rt_log("power: resumed");
     sceKernelExitDeleteThread(0);
@@ -161,22 +171,6 @@ static void setup_callbacks(void) {
     }
 }
 
-static void set_base_dir(const char* argv0) {
-    if (argv0 == NULL) {
-        return;
-    }
-    const char* slash = strrchr(argv0, '/');
-    if (slash == NULL) {
-        return;
-    }
-    size_t len = (size_t)(slash - argv0);
-    if (len >= sizeof(sBaseDir)) {
-        return;
-    }
-    memcpy(sBaseDir, argv0, len);
-    sBaseDir[len] = '\0';
-}
-
 static void show_error(const char* message) {
     rt_log("%s", message);
     rt_gfx_init();
@@ -207,24 +201,29 @@ static void load_boot_segment(void) {
 }
 
 int main(int argc, char* argv[]) {
-    set_base_dir(argc > 0 ? argv[0] : NULL);
+    rt_files_init(argc > 0 ? argv[0] : NULL);
     setup_callbacks();
     rt_log_init();
-    rt_log("Animal Forest PSP runtime starting (base %s)", sBaseDir);
-    scePowerSetClockFrequency(333, 333, 166);
-
-    /* RDRAM with zeros on both sides for generated code that steps just outside it (MEM_PTR). */
-    uint8_t* rdram_block = memalign(64, RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD);
-    if (rdram_block == NULL) {
-        rt_fatal("cannot allocate RDRAM");
+    char base[256];
+    rt_log("Animal Forest PSP runtime starting (in %s)", rt_data_path("", base, sizeof(base)));
+    {
+        /* cpu_mhz.txt (222 or 266) tests the slower clocks, which the bus follows at half the rate. */
+        uint32_t mhz[1] = {333};
+        rt_load_number_list("cpu_mhz.txt", mhz, 1);
+        if (mhz[0] != 222 && mhz[0] != 266) {
+            mhz[0] = 333;
+        }
+        scePowerSetClockFrequency(mhz[0], mhz[0], mhz[0] / 2);
+        rt_log("clock %u MHz", (unsigned)mhz[0]);
     }
-    memset(rdram_block, 0, RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD);
-    g_rdram = rdram_block + RDRAM_GUARD;
+    rt_spram_init();
+
     start_idle_counter();
     sFreeMemory = probe_free_memory();
     rt_log("free memory %u KB", (unsigned)(sFreeMemory / 1024));
-    rt_log("RDRAM at %p, kernel free %u KB (largest %u KB)", g_rdram,
-           (unsigned)(sceKernelTotalFreeMemSize() / 1024), (unsigned)(sceKernelMaxFreeMemSize() / 1024));
+    rt_log("build %08X, code at %p, RDRAM at %p, kernel free %u KB (largest %u KB)", (unsigned)rt_build_id,
+           (void*)main, g_rdram, (unsigned)(sceKernelTotalFreeMemSize() / 1024),
+           (unsigned)(sceKernelMaxFreeMemSize() / 1024));
 
     if (!rt_rom_open()) {
         show_error("ROM not found: place baserom.z64 next to EBOOT.PBP");
@@ -243,6 +242,7 @@ int main(int argc, char* argv[]) {
     rt_me_audio_init();
     rt_vi_init();
 
+    rt_capture_resume_if_asked(); /* debug: resume.txt, never returns if present */
     rt_sched_run_boot(BOOTPROC_VRAM, BOOT_STACK_TOP);
     return 0;
 }

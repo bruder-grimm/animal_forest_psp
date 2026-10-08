@@ -6,8 +6,8 @@
  * DP events when a task is done, as the RSP and RDP would.
  */
 #include <pspkernel.h>
+#include <psppower.h>
 #include <pspthreadman.h>
-#include <string.h>
 
 #include "gfx_internal.h"
 
@@ -60,6 +60,7 @@ static uint32_t sGfxQueueHead = 0, sGfxQueueTail = 0;
  * thread and the game's scheduler thread both change them.
  */
 static SceUID sGfxLock = -1;
+static bool sGfxBusy = false;     /* the worker has a command in hand */
 static uint32_t sGfxTaskAddr = 0; /* the task the worker holds, 0 if none */
 static bool sGfxRendering = false;
 static bool sGfxSpOwed = false;   /* this dispatch still owes an SP event */
@@ -96,14 +97,17 @@ static void post_owed_events(void) {
     }
 }
 
-static uint64_t worker_run_clock(void) {
-    SceKernelThreadRunStatus st;
-    memset(&st, 0, sizeof(st));
-    st.size = sizeof(st);
-    if (sceKernelReferThreadRunStatus(0, &st) < 0) {
-        return 0;
-    }
-    return ((uint64_t)st.runClocks.hi << 32) | st.runClocks.low;
+/* A task is rendered: the next may come, and the game gets the SP and DP events it is still owed. */
+static void task_done(void) {
+    worker_lock();
+    sGfxRendering = false;
+    worker_unlock();
+    sceKernelSignalSema(sGfxIdle, 1);
+    /*
+     * If a yield already reported this dispatch's SP, the game owes us a
+     * re-dispatch; it collects the completion there (rt_gfx_submit_task).
+     */
+    post_owed_events();
 }
 
 static int worker_thread(SceSize args, void* argp) {
@@ -112,24 +116,29 @@ static int worker_thread(SceSize args, void* argp) {
         worker_lock();
         GfxCmd cmd = sGfxQueue[sGfxQueueHead];
         sGfxQueueHead = (sGfxQueueHead + 1) % GFX_QUEUE_SIZE;
+        sGfxBusy = true;
         worker_unlock();
         sceKernelSignalSema(sGfxFree, 1);
+        /*
+         * Code runs from the scratchpad while a command does, which a standby may clear: the
+         * power lock keeps a standby from starting in the middle of one, and the code is put
+         * back if it has gone (spram.c) before the next starts.
+         */
+        scePowerLock(0);
+        rt_spram_check();
         if (cmd.kind == GFX_CMD_PRESENT) {
             gfx_present_frame(cmd.arg);
-            continue;
+            scePowerUnlock(0);
+        } else {
+            uint64_t c0 = rt_thread_cpu_us(0);
+            gfx_run_task(cmd.arg);
+            gStats.render_cpu_us += rt_thread_cpu_us(0) - c0;
+            scePowerUnlock(0);
+            task_done();
         }
-        uint64_t c0 = worker_run_clock();
-        gfx_run_task(cmd.arg);
-        gStats.render_cpu_us += worker_run_clock() - c0;
         worker_lock();
-        sGfxRendering = false;
+        sGfxBusy = false;
         worker_unlock();
-        sceKernelSignalSema(sGfxIdle, 1);
-        /*
-         * If a yield already reported this dispatch's SP, the game owes us a
-         * re-dispatch; it collects the completion there (rt_gfx_submit_task).
-         */
-        post_owed_events();
     }
     return 0;
 }
@@ -166,13 +175,14 @@ bool rt_gfx_yielded(void) {
     return rendering;
 }
 
-static void start_worker(void) {
+/* idle and free: the counts its semaphores start with (other than at boot, those of a capture). */
+static void start_worker_with(int idle, int free) {
     if (sGfxIdle >= 0) {
         return;
     }
-    sGfxIdle = sceKernelCreateSema("rt_gfx_idle", 0, 1, 1, NULL);
+    sGfxIdle = sceKernelCreateSema("rt_gfx_idle", 0, idle, 1, NULL);
     sGfxSignal = sceKernelCreateSema("rt_gfx", 0, 0, GFX_QUEUE_SIZE, NULL);
-    sGfxFree = sceKernelCreateSema("rt_gfx_free", 0, GFX_QUEUE_SIZE, GFX_QUEUE_SIZE, NULL);
+    sGfxFree = sceKernelCreateSema("rt_gfx_free", 0, free, GFX_QUEUE_SIZE, NULL);
     sGfxLock = sceKernelCreateSema("rt_gfx_lock", 0, 1, 1, NULL);
     if (rt_data_file_exists("no_yield.txt")) {
         sGfxYieldEnabled = false;
@@ -187,6 +197,10 @@ static void start_worker(void) {
     SceUID thid = sceKernelCreateThread("rt_gfx", worker_thread, RT_GAME_THREAD_PRIORITY + 1, 32 * 1024,
                                         PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU, NULL);
     sceKernelStartThread(thid, 0, NULL);
+}
+
+static void start_worker(void) {
+    start_worker_with(1, GFX_QUEUE_SIZE);
 }
 
 static void take_idle(void* arg) {
@@ -250,6 +264,9 @@ void rt_gfx_submit_task(uint32_t task) {
         return;
     }
 
+    /* SELECT + R: a capture holds the RDRAM this task is rendered from. */
+    rt_capture_at_submit(task);
+
     uint64_t t0 = sceKernelGetSystemTimeWide();
     rt_sched_native_wait(take_idle, NULL);
     uint32_t d = (uint32_t)(sceKernelGetSystemTimeWide() - t0);
@@ -275,4 +292,54 @@ void rt_gfx_present(uint32_t framebuffer) {
         return;
     }
     enqueue(GFX_CMD_PRESENT, framebuffer);
+}
+
+/* ---- captures (capture.c) ----------------------------------------------- */
+
+bool rt_gfx_idle(void) {
+    if (sGfxIdle < 0) {
+        return true;
+    }
+    worker_lock();
+    bool idle = sGfxQueueHead == sGfxQueueTail && !sGfxBusy;
+    worker_unlock();
+    return idle;
+}
+
+/*
+ * What the game's dispatches are owed, with the worker idle (capture.c waits
+ * for that). A game thread may hold the worker's idle token or a queue slot
+ * it has waited for and not used yet; the semaphores are started again with
+ * the counts they had.
+ */
+void rt_gfx_capture(RtCapture* c) {
+    struct {
+        bool started;
+        bool sp_owed, dp_owed;
+        uint32_t task;
+        int32_t idle, free;
+    } s = { sGfxIdle >= 0, sGfxSpOwed, sGfxDpOwed, sGfxTaskAddr, 1, GFX_QUEUE_SIZE };
+    if (rt_cap_saving(c) && s.started) {
+        SceKernelSemaInfo info;
+        info.size = sizeof(info);
+        if (sceKernelReferSemaStatus(sGfxIdle, &info) == 0) {
+            s.idle = info.currentCount;
+        }
+        info.size = sizeof(info);
+        if (sceKernelReferSemaStatus(sGfxFree, &info) == 0) {
+            s.free = info.currentCount;
+        }
+    }
+    rt_cap_io(c, "GFXW", &s, sizeof(s));
+    gfx_frame_capture(c);
+    if (rt_cap_saving(c)) {
+        return;
+    }
+    sGfxSpOwed = s.sp_owed;
+    sGfxDpOwed = s.dp_owed;
+    sGfxTaskAddr = s.task;
+    sGfxRendering = false;
+    if (s.started) {
+        start_worker_with(s.idle, s.free);
+    }
 }

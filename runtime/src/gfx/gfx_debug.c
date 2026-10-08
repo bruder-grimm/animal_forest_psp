@@ -3,7 +3,7 @@
  * to the EBOOT (runtime/README.md lists them):
  *
  *   shot_frames.txt   save these frames as shot_NNNNN.bmp
- *   SELECT + R        save the next task's RDRAM (capture_N_<task>.bin) and its frame (capture_N.bmp)
+ *   SELECT + R        save the frame of the task a capture was taken at as capture_N.bmp (capture.c)
  *   dump_frames.txt   save the RDRAM of these graphics tasks (dump_task<N>_<task>.bin)
  *   trace_tasks.txt   log every draw of these graphics tasks
  *   skip_draws.txt    leave these draws (1-based, per frame) out
@@ -22,62 +22,37 @@
 bool gTracing = false;
 static int sDrawLimit = -1; /* replay step mode: draws per frame that reach the GE (-1: all) */
 
-static uint32_t sTraceTasks[32];
-static int sNumTraceTasks = -1;
-
 /* Draw numbers listed in skip_draws.txt never reach the GE. */
-static uint32_t sSkipDraws[32];
-static int sNumSkipDraws = -1;
-
 bool gfx_draw_enabled(void) {
+    static RtNumbers sSkipDraws = RT_NUMBERS("skip_draws.txt");
     if (sDrawLimit >= 0 && (int)gStats.draw_calls >= sDrawLimit) {
         return false;
     }
-    if (sNumSkipDraws < 0) {
-        sNumSkipDraws = rt_load_number_list("skip_draws.txt", sSkipDraws, 32);
-    }
-    for (int i = 0; i < sNumSkipDraws; i++) {
-        /* the list is 1-based so that draw 0 can be named */
-        if (sSkipDraws[i] == gStats.draw_calls + 1) {
-            return false;
-        }
-    }
-    return true;
+    /* the list is 1-based so that draw 0 can be named */
+    return !rt_numbers_have(&sSkipDraws, gStats.draw_calls + 1);
 }
 
 /* ---- screenshots -------------------------------------------------------- */
 
 /* Debug aid: frames listed in shot_frames.txt are copied back from VRAM and saved as BMP. */
-static uint32_t sShotFrames[64];
-static int sNumShotFrames = -1;
+static RtNumbers sShotFrames = RT_NUMBERS("shot_frames.txt");
 static bool sShotDue;          /* a listed frame came by with no picture drawn: the next one drawn is saved */
 static uint32_t* sShotPixels = NULL; /* allocated on the first screenshot */
 
-static bool sCaptureShot;      /* see maybe_capture */
-static uint32_t sCaptureCount;
-
-static bool shot_wanted(uint32_t frame) {
-    if (sNumShotFrames < 0) {
-        sNumShotFrames = rt_load_number_list("shot_frames.txt", sShotFrames, 64);
-    }
-    for (int i = 0; i < sNumShotFrames; i++) {
-        if (sShotFrames[i] == frame) {
-            return true;
-        }
-    }
-    return false;
-}
+static bool sCaptureShot;      /* the frame being drawn goes to capture_<sCaptureNumber>.bmp */
+static uint32_t sCaptureNumber;
+static volatile uint32_t sCaptureNext; /* ... that of the next task (rt_gfx_capture_frame), 0 if none */
 
 static void write_bmp(uint32_t frame) {
     char name[64];
     char path[256];
     if (sCaptureShot) {
-        snprintf(name, sizeof(name), "capture_%u.bmp", (unsigned)sCaptureCount);
+        snprintf(name, sizeof(name), "capture_%u.bmp", (unsigned)sCaptureNumber);
         sCaptureShot = false;
     } else {
         snprintf(name, sizeof(name), "shot_%05u.bmp", (unsigned)frame);
     }
-    SceUID fd = sceIoOpen(rt_data_path(name, path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    SceUID fd = rt_data_create(name, path, sizeof(path));
     if (fd < 0) {
         return;
     }
@@ -112,7 +87,7 @@ static void write_bmp(uint32_t frame) {
 }
 
 uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn) {
-    sShotDue = sShotDue || shot_wanted(frame);
+    sShotDue = sShotDue || rt_numbers_have(&sShotFrames, frame);
     /* A present with nothing drawn since the last one shows no new picture:
      * the buffer it would be read from holds an old frame. */
     if (!drawn || (!sShotDue && !sCaptureShot)) {
@@ -133,67 +108,32 @@ void gfx_debug_save_shot(uint32_t frame) {
 
 /* ---- RDRAM dumps and captures ------------------------------------------- */
 
-static uint32_t sDumpTasks[16];
-static int sNumDumpTasks = -1;
-
 /*
- * SELECT + R (si.c): the next graphics task is dumped as capture_N.bin -- the
- * RDRAM it is rendered from, loadable with the replay mode
- * (replay.txt) -- and the frame it ends up in is saved as
- * capture_N.bmp. For bugs that only show up in moments no script reaches.
+ * SELECT + R (capture.c): the frame drawn from the task a capture was taken
+ * at -- the next one the worker starts -- is saved as capture_N.bmp.
  */
-static volatile bool sCaptureRequested = false;
-
-void rt_gfx_request_capture(void) {
-    sCaptureRequested = true;
-}
-
-static void maybe_capture(uint32_t task) {
-    if (!sCaptureRequested) {
-        return;
-    }
-    sCaptureRequested = false;
-    char name[64];
-    char path[256];
-    snprintf(name, sizeof(name), "capture_%u_%08X.bin", (unsigned)++sCaptureCount, (unsigned)task);
-    SceUID fd = sceIoOpen(rt_data_path(name, path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, g_rdram, RDRAM_SIZE);
-        sceIoClose(fd);
-        rt_log("capture %u: RDRAM for task %08X (frame %u) in %s", (unsigned)sCaptureCount, (unsigned)task,
-               (unsigned)gStats.frames + 1, path);
-    }
-    sCaptureShot = true;
+void rt_gfx_capture_frame(uint32_t n) {
+    sCaptureNext = n;
 }
 
 void gfx_debug_task_start(uint32_t task_number, uint32_t task) {
-    maybe_capture(task);
-    if (sNumDumpTasks < 0) {
-        sNumDumpTasks = rt_load_number_list("dump_frames.txt", sDumpTasks, 16);
+    static RtNumbers sDumpTasks = RT_NUMBERS("dump_frames.txt");
+    static RtNumbers sTraceTasks = RT_NUMBERS("trace_tasks.txt");
+    if (sCaptureNext != 0) {
+        sCaptureNumber = sCaptureNext;
+        sCaptureNext = 0;
+        sCaptureShot = true;
     }
-    for (int i = 0; i < sNumDumpTasks; i++) {
-        if (sDumpTasks[i] != task_number) {
-            continue;
-        }
+    if (rt_numbers_have(&sDumpTasks, task_number)) {
         char name[64];
-        char path[256];
         snprintf(name, sizeof(name), "dump_task%u_%08X.bin", (unsigned)task_number, (unsigned)task);
-        SceUID fd = sceIoOpen(rt_data_path(name, path, sizeof(path)), PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-        if (fd >= 0) {
-            sceIoWrite(fd, g_rdram, RDRAM_SIZE);
-            sceIoClose(fd);
-            rt_log("dumped RDRAM to %s", path);
+        if (rt_data_write(name, g_rdram, RDRAM_SIZE)) {
+            rt_log("dumped RDRAM to %s", name);
         }
     }
-    if (sNumTraceTasks < 0) {
-        sNumTraceTasks = rt_load_number_list("trace_tasks.txt", sTraceTasks, 32);
-    }
-    gTracing = false;
-    for (int i = 0; i < sNumTraceTasks; i++) {
-        if (sTraceTasks[i] == task_number) {
-            gTracing = true;
-            rt_log("trace of gfx task %u", task_number);
-        }
+    gTracing = rt_numbers_have(&sTraceTasks, task_number);
+    if (gTracing) {
+        rt_log("trace of gfx task %u", task_number);
     }
 }
 
@@ -204,36 +144,32 @@ void gfx_debug_task_start(uint32_t task_number, uint32_t task) {
  * over and over instead of booting the game, so renderer changes can be
  * checked without playing to the scene again. The task's last colour image is
  * taken as the displayed framebuffer. In step mode frame N shows only the
- * first N draws.
+ * first N draws. The dump can also be a capture (capture_N.state), whose task
+ * is used if none is given ("capture_3.state - step").
  */
 bool rt_gfx_replay(void) {
-    char path[256];
     char text[256];
-    SceUID fd = sceIoOpen(rt_data_path("replay.txt", path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd < 0) {
+    if (rt_data_read_text("replay.txt", text, sizeof(text)) <= 0) {
         return false;
     }
-    int len = sceIoRead(fd, text, sizeof(text) - 1);
-    sceIoClose(fd);
-    if (len <= 0) {
-        return false;
-    }
-    text[len] = 0;
-    char* p = strtok(text, " \t\r\n");
+    char* dump = strtok(text, " \t\r\n");
     char* task_str = strtok(NULL, " \t\r\n");
     char* mode = strtok(NULL, " \t\r\n");
     bool step = mode != NULL && strcmp(mode, "step") == 0;
-    if (p == NULL || task_str == NULL) {
+    if (dump == NULL || task_str == NULL) {
         return false;
     }
     uint32_t task = (uint32_t)strtoul(task_str, NULL, 16);
-    fd = sceIoOpen(rt_data_path(p, path, sizeof(path)), PSP_O_RDONLY, 0);
-    if (fd < 0) {
+    char path[256];
+    uint32_t capture_task;
+    if (rt_capture_read_rdram(rt_data_path(dump, path, sizeof(path)), &capture_task)) {
+        if (task == 0) {
+            task = capture_task;
+        }
+    } else if (rt_data_read(dump, g_rdram, RDRAM_SIZE) < 0) {
         rt_log("replay: cannot open %s", path);
         return false;
     }
-    sceIoRead(fd, g_rdram, RDRAM_SIZE);
-    sceIoClose(fd);
     gfx_run_task(task);
     uint32_t fb = gRdp.cimg | 0x80000000u;
     rt_log("replay: task %08X from %s, framebuffer %08X", task, path, fb);
