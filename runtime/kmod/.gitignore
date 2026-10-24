@@ -1,0 +1,6 @@
+# build output (gmake -C runtime/kmod)
+*.o
+*.elf
+*.prx
+PARAM.SFO
+exports.c

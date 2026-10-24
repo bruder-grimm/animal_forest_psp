@@ -955,26 +955,116 @@ static void build_impl(const TexKey* k, const Axis* ax, const Axis* ay, GuTextur
  * the GE really does run behind; emulators hide it.
  */
 #define MAX_RETIRED 256
-static void* sRetired[2][MAX_RETIRED];
+typedef struct {
+    void* pixels;
+    uint32_t bytes;
+} Retired;
+static Retired sRetired[2][MAX_RETIRED];
 static int sNumRetired[2];
 
-static void retire(void* pixels) {
+/*
+ * Texels live in VRAM while it has room (TEX_VRAM up to its end, in 64-byte
+ * lines so that no two textures share a cache line), in RAM otherwise: the GE
+ * reads VRAM faster, and its reads there leave the CPU's bus alone. They are
+ * written through the cached mirror and written back, as in RAM.
+ * no_vram_tex.txt: RAM only.
+ */
+#define VRAM_LINE 64
+#define MAX_VRAM_HOLES 512
+typedef struct {
+    uint32_t start, end;
+} Hole;
+static Hole sHoles[MAX_VRAM_HOLES]; /* the free VRAM, by address */
+static int sNumHoles = 0;
+static uint32_t sVramUsed = 0;
+static int8_t sVramOff = -1;
+
+static bool in_vram(const void* p) {
+    uintptr_t a = (uintptr_t)p;
+    return a >= (uintptr_t)VRAM_ADDR(TEX_VRAM) && a < (uintptr_t)VRAM_ADDR(VRAM_END);
+}
+
+static void* vram_alloc(uint32_t bytes) {
+    if (sVramOff < 0) {
+        sVramOff = RT_SWITCH("no_vram_tex.txt");
+        sHoles[0] = (Hole){ TEX_VRAM, VRAM_END };
+        sNumHoles = sVramOff ? 0 : 1;
+    }
+    bytes = (bytes + VRAM_LINE - 1) & ~(VRAM_LINE - 1);
+    for (int i = 0; i < sNumHoles; i++) {
+        if (sHoles[i].end - sHoles[i].start >= bytes) {
+            uint32_t at = sHoles[i].start;
+            sHoles[i].start += bytes;
+            if (sHoles[i].start == sHoles[i].end) {
+                memmove(&sHoles[i], &sHoles[i + 1], (size_t)(sNumHoles - i - 1) * sizeof(Hole));
+                sNumHoles--;
+            }
+            sVramUsed += bytes;
+            return VRAM_ADDR(at);
+        }
+    }
+    return NULL;
+}
+
+static void vram_free(void* p, uint32_t bytes) {
+    uint32_t start = (uint32_t)((uintptr_t)p - (uintptr_t)VRAM_ADDR(0));
+    uint32_t end = start + ((bytes + VRAM_LINE - 1) & ~(VRAM_LINE - 1));
+    sVramUsed -= end - start;
+    int i = 0;
+    while (i < sNumHoles && sHoles[i].start < start) {
+        i++;
+    }
+    bool join_prev = i > 0 && sHoles[i - 1].end == start;
+    bool join_next = i < sNumHoles && sHoles[i].start == end;
+    if (join_prev && join_next) {
+        sHoles[i - 1].end = sHoles[i].end;
+        memmove(&sHoles[i], &sHoles[i + 1], (size_t)(sNumHoles - i - 1) * sizeof(Hole));
+        sNumHoles--;
+    } else if (join_prev) {
+        sHoles[i - 1].end = end;
+    } else if (join_next) {
+        sHoles[i].start = start;
+    } else if (sNumHoles < MAX_VRAM_HOLES) {
+        memmove(&sHoles[i + 1], &sHoles[i], (size_t)(sNumHoles - i) * sizeof(Hole));
+        sHoles[i] = (Hole){ start, end };
+        sNumHoles++;
+    } /* else that piece of VRAM is lost to textures: too fragmented to track */
+}
+
+static void* tex_alloc(uint32_t bytes) {
+    void* p = vram_alloc(bytes);
+    return p != NULL ? p : memalign(16, bytes);
+}
+
+static void tex_free(void* p, uint32_t bytes) {
+    if (in_vram(p)) {
+        vram_free(p, bytes);
+    } else {
+        free(p);
+    }
+}
+
+uint32_t gfx_tex_vram_used(void) {
+    return sVramUsed;
+}
+
+static void retire(void* pixels, uint32_t bytes) {
     if (pixels == NULL) {
         return;
     }
     if (sNumRetired[1] < MAX_RETIRED) {
-        sRetired[1][sNumRetired[1]++] = pixels;
+        sRetired[1][sNumRetired[1]++] = (Retired){ pixels, bytes };
     } else {
-        free(pixels); /* nothing sensible left to do; a sync is overdue */
+        tex_free(pixels, bytes); /* nothing sensible left to do; a sync is overdue */
     }
 }
 
 /* Called after the GE has finished the frame (see rt_gfx_present). */
 void gfx_tex_flush_retired(void) {
     for (int i = 0; i < sNumRetired[0]; i++) {
-        free(sRetired[0][i]);
+        tex_free(sRetired[0][i].pixels, sRetired[0][i].bytes);
     }
-    memcpy(sRetired[0], sRetired[1], (size_t)sNumRetired[1] * sizeof(void*));
+    memcpy(sRetired[0], sRetired[1], (size_t)sNumRetired[1] * sizeof(Retired));
     sNumRetired[0] = sNumRetired[1];
     sNumRetired[1] = 0;
 }
@@ -1015,7 +1105,7 @@ static uint32_t sStructGen = 1; /* changes whenever a cache entry is freed (entr
 static void free_entry(CacheEntry* e) {
     sStructGen++;
     if (e->tex.pixels != NULL) {
-        retire(e->tex.pixels);
+        retire(e->tex.pixels, e->bytes);
         e->tex.pixels = NULL;
     }
     sBytesUsed -= e->bytes;
@@ -1035,6 +1125,35 @@ static void rebuild_slots(void) {
         }
         sSlots[slot] = (int16_t)i;
     }
+}
+
+/*
+ * A new texture's buffer. When VRAM is full, textures there that haven't been
+ * drawn for a while move to RAM (a copy, cheaper than decoding them again when
+ * they come back), so that what is drawn now gets the VRAM as it comes free.
+ */
+#define VRAM_IDLE_FRAMES 30
+static void* new_pixels(uint32_t bytes) {
+    void* p = vram_alloc(bytes);
+    if (p != NULL || sVramOff) {
+        return p != NULL ? p : memalign(16, bytes);
+    }
+    uint32_t moved = 0;
+    for (int i = 0; i < sEntriesTop && moved < bytes; i++) {
+        CacheEntry* e = &sEntries[i];
+        if (e->used && e->last_used + VRAM_IDLE_FRAMES < sFrame && in_vram(e->tex.pixels)) {
+            void* ram = memalign(16, e->bytes);
+            if (ram == NULL) {
+                break;
+            }
+            memcpy(ram, e->tex.pixels, e->bytes);
+            sceKernelDcacheWritebackRange(ram, e->bytes);
+            retire(e->tex.pixels, e->bytes); /* free once the GE is surely done with it */
+            e->tex.pixels = ram;
+            moved += e->bytes;
+        }
+    }
+    return memalign(16, bytes);
 }
 
 static void evict_until(uint32_t needed_bytes) {
@@ -1316,9 +1435,9 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
             e->last_used = sFrame;
             if ((e->checked_frame != sFrame || e->stale) && !sources_unchanged(e, sSlots[slot], true)) {
                 /* Build into a new buffer: the GE may still be reading the old one. */
-                void* fresh = memalign(16, e->bytes);
+                void* fresh = tex_alloc(e->bytes);
                 if (fresh != NULL) {
-                    retire(e->tex.pixels);
+                    retire(e->tex.pixels, e->bytes);
                     e->tex.pixels = fresh;
                     build(key, &ax, &ay, &e->tex);
                 }
@@ -1358,7 +1477,7 @@ static const GuTexture* tex_get(const TexKey* key_in, bool to_draw) {
     int index = alloc_entry();
     CacheEntry* e = &sEntries[index];
     memset(e, 0, sizeof(*e));
-    e->tex.pixels = memalign(16, bytes);
+    e->tex.pixels = new_pixels(bytes);
     if (e->tex.pixels == NULL) {
         rt_log("texture cache: out of memory (%u bytes, %u used)", bytes, sBytesUsed);
         return NULL;

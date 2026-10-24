@@ -415,7 +415,9 @@ static inline void load_vfpu_state(const float (*mvp)[4], const float (*mv)[4]) 
         : "r"(mvp), "r"(mv), "r"(kClipConstants));
 }
 
-void gfx_process_vertices(uint32_t addr, int start, int count) {
+/* gfx_process_vertices for what it rarely sees: vertices at an address that isn't a word's, or lit ones the
+ * VFPU sequence can't do (texture generation, more than four lights). All modes, as it was. */
+static __attribute__((noinline, cold)) void process_vertices_general(uint32_t addr, int start, int count) {
     if (start < 0 || start + count > MAX_VERTICES) {
         RT_LOG_ONCE("G_VTX out of range: start %d count %d", start, count);
         return;
@@ -481,6 +483,50 @@ void gfx_process_vertices(uint32_t addr, int start, int count) {
         RspVertex* v = &gRsp.verts[start + i];
         transform_one(v, src);
         finish_lit_vertex(v, src, texgen, fog, scale_s, scale_t, fog_mul, fog_ofs);
+    }
+    gfx_snap_precompute(gRsp.verts, start, count);
+}
+
+void gfx_process_vertices(uint32_t addr, int start, int count) {
+    bool lighting = (gRsp.geometry_mode & G_LIGHTING) != 0;
+    bool texgen = (gRsp.geometry_mode & G_TEXTURE_GEN) != 0;
+    /* Unlit vertices, and lit ones without texture generation by up to four lights, are all VFPU work. */
+    bool light_later = lighting && !texgen && gRsp.num_lights <= 4;
+    if ((addr & 3) || (lighting && !light_later) || start < 0 || start + count > MAX_VERTICES) {
+        process_vertices_general(addr, start, count);
+        return;
+    }
+    update_mvp();
+    const float (*mv)[4] = (const float (*)[4])gRsp.mv_stack[gRsp.mv_depth];
+    const float (*mvp)[4] = (const float (*)[4])gRsp.mvp;
+    if (lighting) {
+        update_light_dirs();
+    }
+    /* Vtx is 4 big-endian words; RDRAM keeps words in host order. */
+    const uint32_t* src = (const uint32_t*)(void*)(g_rdram + (addr & RDRAM_MASK));
+    load_vfpu_state(mvp, mv);
+    gfx_forget_packed(start, count); /* these slots hold different vertices now */
+    static float consts[8] __attribute__((aligned(16)));
+    consts[0] = gRsp.tex_scale_s / 65536.0f;
+    consts[1] = gRsp.tex_scale_t / 65536.0f;
+    consts[2] = gRsp.fog_mul / 255.0f;
+    consts[3] = gRsp.fog_ofs / 255.0f;
+    consts[4] = 0.0f;
+    consts[5] = 128.0f;
+    consts[6] = 1.0f / 255.0f;
+    consts[7] = 0.0f;
+    __asm__ volatile("lv.q C720, 0(%0)\nlv.q C730, 16(%0)\n" : : "r"(consts) : "memory");
+    if (gRsp.geometry_mode & G_FOG) {
+        for (int i = 0; i < count; i++) {
+            fused_one_fog(&gRsp.verts[start + i], src + 4 * i);
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            fused_one(&gRsp.verts[start + i], src + 4 * i);
+        }
+    }
+    if (lighting) {
+        light_vertices_vfpu(&gRsp.verts[start], src, count);
     }
     gfx_snap_precompute(gRsp.verts, start, count);
 }

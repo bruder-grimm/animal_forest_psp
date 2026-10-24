@@ -28,6 +28,14 @@ extern char __start_spram_text[] __attribute__((weak));
 extern char __stop_spram_text[] __attribute__((weak));
 extern void* const __start_spram_ptrs[] __attribute__((weak));
 extern void* const __stop_spram_ptrs[] __attribute__((weak));
+/* A renderer A/B build (scripts/gfx_ab.sh) carries a second renderer whose block is these. */
+extern char __start_spram_text_b[] __attribute__((weak));
+extern char __stop_spram_text_b[] __attribute__((weak));
+extern void* const __start_spram_ptrs_b[] __attribute__((weak));
+extern void* const __stop_spram_ptrs_b[] __attribute__((weak));
+
+/* Which renderer an A/B build runs: 1 for the second (gfx_b.txt), read by its call stubs. */
+int rt_gfx_variant = 0;
 
 static uint32_t sBlockStart = 0, sBlockSize = 0;
 
@@ -67,11 +75,23 @@ void rt_spram_restore(void) {
 }
 
 void rt_spram_init(void) {
-    if (__start_spram_text == NULL || __stop_spram_text == NULL) {
+    char* text = __start_spram_text;
+    char* text_end = __stop_spram_text;
+    void* const* ptrs = __start_spram_ptrs;
+    void* const* ptrs_end = __stop_spram_ptrs;
+    if (__start_spram_text_b != NULL && rt_data_file_exists("gfx_b.txt")) {
+        rt_gfx_variant = 1;
+        text = __start_spram_text_b;
+        text_end = __stop_spram_text_b;
+        ptrs = __start_spram_ptrs_b;
+        ptrs_end = __stop_spram_ptrs_b;
+        rt_log("gfx: renderer B (gfx_b.txt)");
+    }
+    if (text == NULL || text_end == NULL) {
         return;
     }
-    uint32_t start = (uint32_t)(uintptr_t)__start_spram_text;
-    uint32_t size = (uint32_t)(uintptr_t)(__stop_spram_text - __start_spram_text);
+    uint32_t start = (uint32_t)(uintptr_t)text;
+    uint32_t size = (uint32_t)(uintptr_t)(text_end - text);
     if (size == 0 || rt_data_file_exists("no_spram.txt")) {
         return;
     }
@@ -84,7 +104,7 @@ void rt_spram_init(void) {
     spram_install();
     uint32_t delta = SPRAM_BASE - start;
     uint32_t entries = 0;
-    for (void* const* e = __start_spram_ptrs; e < __stop_spram_ptrs; e++) {
+    for (void* const* e = ptrs; e < ptrs_end; e++) {
         uint32_t* orig = (uint32_t*)*e;
         uint32_t to = (uint32_t)(uintptr_t)orig + delta;
         orig[0] = (2u << 26) | ((to >> 2) & 0x03FFFFFFu); /* j to the copy */

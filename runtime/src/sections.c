@@ -88,9 +88,13 @@ void rt_sections_init(void) {
     }
 
     size_t static_count = 0;
+    rt_game_b_init(); /* an A/B build with game_b.txt: the second copy of the game (game_ab.c) */
     for (size_t i = 0; i < num_entries; i++) {
         SectionTableEntry* entry = &section_table[i];
         section_addresses[entry->index] = (int32_t)entry->ram_addr;
+        for (size_t f = 0; f < entry->num_funcs; f++) {
+            entry->funcs[f].func = rt_game_b_func(entry->funcs[f].func);
+        }
         qsort(entry->funcs, entry->num_funcs, sizeof(FuncEntry), compare_func_entries);
 
         if (!sIsRelocatable[i]) {

@@ -23,8 +23,10 @@ bool gTracing = false;
 static int sDrawLimit = -1; /* replay step mode: draws per frame that reach the GE (-1: all) */
 
 /* Draw numbers listed in skip_draws.txt never reach the GE. */
-bool gfx_draw_enabled(void) {
-    static RtNumbers sSkipDraws = RT_NUMBERS("skip_draws.txt");
+static RtNumbers sSkipDraws = RT_NUMBERS("skip_draws.txt");
+bool gDrawFilter = false; /* skip_draws.txt lists draws, or the replay steps: gfx_draw_filtered decides */
+
+bool gfx_draw_filtered(void) {
     if (sDrawLimit >= 0 && (int)gStats.draw_calls >= sDrawLimit) {
         return false;
     }
@@ -37,7 +39,7 @@ bool gfx_draw_enabled(void) {
 /* Debug aid: frames listed in shot_frames.txt are copied back from VRAM and saved as BMP. */
 static RtNumbers sShotFrames = RT_NUMBERS("shot_frames.txt");
 static bool sShotDue;          /* a listed frame came by with no picture drawn: the next one drawn is saved */
-static uint32_t* sShotPixels = NULL; /* allocated on the first screenshot */
+static uint16_t* sShotPixels = NULL; /* allocated on the first screenshot */
 
 static bool sCaptureShot;      /* the frame being drawn goes to capture_<sCaptureNumber>.bmp */
 static uint32_t sCaptureNumber;
@@ -74,10 +76,10 @@ static void write_bmp(uint32_t frame) {
     static uint8_t row[BUF_WIDTH * 3 + 4];
     for (int y = (int)h - 1; y >= 0; y--) {
         for (uint32_t x = 0; x < w; x++) {
-            uint32_t c = sShotPixels[y * BUF_WIDTH + x];
-            row[x * 3] = (c >> 16) & 0xFF;
-            row[x * 3 + 1] = (c >> 8) & 0xFF;
-            row[x * 3 + 2] = c & 0xFF;
+            uint32_t c = sShotPixels[y * BUF_WIDTH + x], r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31;
+            row[x * 3] = (uint8_t)(b << 3 | b >> 2);
+            row[x * 3 + 1] = (uint8_t)(g << 3 | g >> 2);
+            row[x * 3 + 2] = (uint8_t)(r << 3 | r >> 2);
         }
         memset(row + row_bytes, 0, pad);
         sceIoWrite(fd, row, row_bytes + pad);
@@ -86,7 +88,7 @@ static void write_bmp(uint32_t frame) {
     rt_log("screenshot %s", path);
 }
 
-uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn) {
+uint16_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn) {
     sShotDue = sShotDue || rt_numbers_have(&sShotFrames, frame);
     /* A present with nothing drawn since the last one shows no new picture:
      * the buffer it would be read from holds an old frame. */
@@ -96,13 +98,13 @@ uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn) {
     sShotDue = false;
     if (sShotPixels == NULL) {
         /* Whole cache lines: the invalidate after the copy must not drop a neighbour's. */
-        sShotPixels = memalign(64, BUF_WIDTH * PSP_SCREEN_H * 4);
+        sShotPixels = memalign(64, SCREEN_BUF_BYTES);
     }
     return sShotPixels;
 }
 
 void gfx_debug_save_shot(uint32_t frame) {
-    sceKernelDcacheInvalidateRange(sShotPixels, BUF_WIDTH * PSP_SCREEN_H * 4);
+    sceKernelDcacheInvalidateRange(sShotPixels, SCREEN_BUF_BYTES);
     write_bmp(frame);
 }
 
@@ -119,6 +121,8 @@ void rt_gfx_capture_frame(uint32_t n) {
 void gfx_debug_task_start(uint32_t task_number, uint32_t task) {
     static RtNumbers sDumpTasks = RT_NUMBERS("dump_frames.txt");
     static RtNumbers sTraceTasks = RT_NUMBERS("trace_tasks.txt");
+    rt_numbers_have(&sSkipDraws, 0); /* (read the list) */
+    gDrawFilter = sDrawLimit >= 0 || sSkipDraws.count > 0;
     if (sCaptureNext != 0) {
         sCaptureNumber = sCaptureNext;
         sCaptureNext = 0;
@@ -177,8 +181,12 @@ bool rt_gfx_replay(void) {
     for (;;) {
         if (step) {
             sDrawLimit = (int)gStats.frames;
+            gDrawFilter = true;
         }
         gfx_run_task(task);
+#ifdef RT_PGO_GEN
+        gfx_pgo_dump();
+#endif
         rt_gfx_present(fb);
         sceDisplayWaitVblankStart();
     }

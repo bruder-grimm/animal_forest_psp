@@ -10,6 +10,7 @@
 #include <pspthreadman.h>
 
 #include "gfx_internal.h"
+#include "hwcount.h"
 
 /*
  * On the N64 the RSP and RDP chew through a display list while the CPU runs on,
@@ -110,6 +111,24 @@ static void task_done(void) {
     post_owed_events();
 }
 
+#ifdef RT_PGO_GEN
+/* scripts/gfx_ab.sh / game_ab.sh gen: the branch counts go to host0:/pgo(_game) every RT_PGO_TASKS tasks
+ * (merged with what is there). */
+#ifndef RT_PGO_TASKS
+#define RT_PGO_TASKS 200
+#endif
+void __gcov_dump(void);
+void __gcov_reset(void);
+void gfx_pgo_dump(void) {
+    static unsigned tasks = 0;
+    if (++tasks % RT_PGO_TASKS == 0) {
+        __gcov_dump();
+        __gcov_reset();
+        rt_log("pgo: profile written after %u tasks", tasks);
+    }
+}
+#endif
+
 static int worker_thread(SceSize args, void* argp) {
     for (;;) {
         sceKernelWaitSema(sGfxSignal, 1, NULL);
@@ -126,6 +145,8 @@ static int worker_thread(SceSize args, void* argp) {
          */
         scePowerLock(0);
         rt_spram_check();
+        gHwcRenderActive = true;
+        rt_hwc_owner(HWC_RENDER);
         if (cmd.kind == GFX_CMD_PRESENT) {
             gfx_present_frame(cmd.arg);
             scePowerUnlock(0);
@@ -135,7 +156,12 @@ static int worker_thread(SceSize args, void* argp) {
             gStats.render_cpu_us += rt_thread_cpu_us(0) - c0;
             scePowerUnlock(0);
             task_done();
+#ifdef RT_PGO_GEN
+            gfx_pgo_dump();
+#endif
         }
+        gHwcRenderActive = false;
+        rt_hwc_owner(rt_sched_hwc_owner());
         worker_lock();
         sGfxBusy = false;
         worker_unlock();

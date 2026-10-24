@@ -11,7 +11,7 @@
  *   gfx_bind.c     texture binding: tile -> texture key -> GE texture
  *   gfx_draw.c     GE render state, batching, vertex snapping, triangle clipping
  *   gfx_rect.c     rectangles: fills, texture rectangles, S2DEX2 backgrounds
- *   gfx_frame.c    frames: colour buffers, projection, copies of the screen, softening, present
+ *   gfx_frame.c    frames: colour buffers, projection, copies of the screen, present
  *   gfx_target.c   render targets: the game's small pictures, drawn on the GE
  *   gfx_tex.c      texture decoding and the texture cache
  *   gfx_debug.c    screenshots, RDRAM dumps, replay, traces
@@ -38,6 +38,7 @@
 #define BUF_WIDTH 512  /* stride of the GE's colour and depth buffers, in pixels */
 #define GU_OFFSET_X (2048 - PSP_SCREEN_W / 2)
 #define GU_OFFSET_Y (2048 - PSP_SCREEN_H / 2)
+#define TARGET_MAX 128 /* a render target's largest side */
 /*
  * Overscan: a TV never shows the outermost pixels of the N64 picture, and the
  * game relies on it -- the black iris when entering a house stops 2 pixels
@@ -69,15 +70,17 @@ typedef struct {
 extern ScreenMap gMap;
 
 /*
- * VRAM (2 MB): three colour buffers at 0, 0x88000 and 0x154000 (512x272x4
- * each) with the depth buffer at 0x110000 (gfx_frame.c), then a render
- * target's colour and depth (gfx_target.c), whose room the softening pass
- * borrows at the end of a frame.
+ * VRAM (2 MB): three 16-bit colour buffers (512x272x2 each; RGBA5551, the alpha
+ * bit being the stencil) and the depth buffer (gfx_frame.c), a render target's
+ * colour and depth (gfx_target.c), and the rest for textures (gfx_tex.c).
  */
-#define DEPTH_VRAM 0x110000
-#define TARGET_VRAM 0x1DC000       /* TARGET_MAX x TARGET_MAX x 4 */
-#define TARGET_DEPTH_VRAM 0x1EC000 /* TARGET_MAX x TARGET_MAX x 2, ends at 0x1F4000 */
-#define TARGET_MAX 128
+#define SCREEN_PSM GU_PSM_5551
+#define SCREEN_BUF_BYTES (BUF_WIDTH * PSP_SCREEN_H * 2)
+#define DEPTH_VRAM (3 * SCREEN_BUF_BYTES)
+#define TARGET_VRAM (DEPTH_VRAM + SCREEN_BUF_BYTES)        /* TARGET_MAX x TARGET_MAX x 4 */
+#define TARGET_DEPTH_VRAM (TARGET_VRAM + TARGET_MAX * TARGET_MAX * 4) /* TARGET_MAX x TARGET_MAX x 2 */
+#define TEX_VRAM (TARGET_DEPTH_VRAM + TARGET_MAX * TARGET_MAX * 2)
+#define VRAM_END 0x200000
 
 /* The VRAM address the CPU and sceGuCopyImage see for a GE buffer offset. */
 #define VRAM_ADDR(offset) ((void*)(0x04000000 + (uint32_t)(offset)))
@@ -141,6 +144,11 @@ static inline uint32_t rgba5551_to_ge(uint32_t v) {
 /* A GE pixel as RGBA5551: the alpha bit is set unless its alpha is 0. */
 static inline uint32_t ge_to_rgba5551(uint32_t c) {
     return (c & 0xF8) << 8 | (c & 0xF800) >> 5 | (c & 0xF80000) >> 18 | (c >> 24 != 0);
+}
+
+/* A pixel of the screen (the GE's 5551: red in the low bits, the alpha bit on top) as N64 RGBA5551. */
+static inline uint32_t screen_to_rgba5551(uint32_t p) {
+    return (p & 0x1F) << 11 | (p & 0x3E0) << 1 | (p & 0x7C00) >> 9 | 1;
 }
 
 /* The colour of an N64 RGBA8888 word as the GE's, with alpha 0. */
@@ -550,6 +558,7 @@ bool gfx_bake_window(TexKey* key, const float lo[2], const float hi[2]);
 void gfx_tex_take_build_stats(uint32_t* builds, uint32_t* bakes, uint32_t* us);
 /* Bakes put off by the per-frame budget since the last call (an older bake of the pair was used). */
 uint32_t gfx_tex_take_deferred(void);
+uint32_t gfx_tex_vram_used(void); /* bytes of texels in VRAM */
 /* Textures read from RDRAM [addr, addr + len) re-check their contents on next use. */
 void gfx_tex_invalidate_range(uint32_t addr, uint32_t len);
 /* Frees texture buffers retired since the previous frame's sync. */
@@ -610,7 +619,12 @@ extern TexKey gBoundKey; /* the key of the texture bound last (for traces) */
 /* Tile coordinates -> texture key; false if the tile's texture memory was never loaded. */
 bool gfx_make_tile_key(const TileDesc* tile, bool white_rgb, TexKey* key);
 /* A tile's shift as the factor it scales texture coordinates by. */
-float gfx_tile_shift(uint8_t shift);
+/* A tile's shift as a factor: 1 / 2^shift, or 2^(16 - shift) above 10 (exact; a table, no division). */
+static inline float gfx_tile_shift(uint8_t shift) {
+    static const float kShift[16] = { 1.0f, 1.0f / 2, 1.0f / 4, 1.0f / 8, 1.0f / 16, 1.0f / 32, 1.0f / 64, 1.0f / 128,
+                                      1.0f / 256, 1.0f / 512, 1.0f / 1024, 32.0f, 16.0f, 8.0f, 4.0f, 2.0f };
+    return kShift[shift & 15];
+}
 /* Binds the texture the fit samples of tile tile_index (and the next one, for two-texture fits); NULL if none. */
 const GuTexture* gfx_bind_texture(int tile_index, const CombinerFit* fit);
 /* A split combiner's second pass: its other bake (BAKE_Y), found but not bound. */
@@ -685,7 +699,10 @@ void gfx_other_mode_changed(void);
 static inline bool gfx_blender_keeps_memory(void) {
     return gRdp.keeps_memory;
 }
-void gfx_mark_dirty(void);
+/* The RDP state changed: the next draw works out its GE state again. */
+static inline void gfx_mark_dirty(void) {
+    gRdp.state_dirty = true;
+}
 void gfx_draw_triangle(int i0, int i1, int i2);
 void gfx_flush_batch(void);
 /* The vertices in gRsp.verts[first, first + count) changed. */
@@ -737,7 +754,13 @@ typedef struct {
 extern RenderTarget gTarget;
 extern uint32_t gDisplayZimg; /* the depth image drawn with the screen */
 
-void gfx_open_frame(void);
+void gfx_open_frame_now(void);
+/* Opens the frame's display list if it isn't yet (gfx_frame.c). */
+static inline void gfx_open_frame(void) {
+    if (!gFrameOpen) {
+        gfx_open_frame_now();
+    }
+}
 /* Points the GE at the screen's buffers again. */
 void gfx_draw_to_screen(void);
 /* Waits for the GE to finish the display list so far, and goes on with a new one. */
@@ -829,9 +852,15 @@ extern GfxStats gStats;
 /* The start of each graphics task: dumps, captures and traces it asks for. */
 void gfx_debug_task_start(uint32_t task_number, uint32_t task);
 /* False for a draw left out (skip_draws.txt, replay step mode). */
-bool gfx_draw_enabled(void);
+/* Debug: draws left out (skip_draws.txt, replay step mode; gfx_debug.c). */
+extern bool gDrawFilter;
+bool gfx_draw_filtered(void);
+static inline bool gfx_draw_enabled(void) {
+    return !gDrawFilter || gfx_draw_filtered();
+}
 /* A buffer for this frame's screenshot, or NULL if none is wanted (or nothing was drawn to take one of). */
-uint32_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn);
+void gfx_pgo_dump(void); /* gfx_worker.c, in a profiling build (scripts/gfx_ab.sh gen) */
+uint16_t* gfx_debug_shot_buffer(uint32_t frame, bool drawn);
 void gfx_debug_save_shot(uint32_t frame);
 
 #endif

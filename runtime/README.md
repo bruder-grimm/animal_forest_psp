@@ -23,6 +23,8 @@ runtime/
     capture.c           SELECT + R captures of the whole game, and resuming from one
     preempt.c           preemption points in recompiled code
     spram.c             runs the renderer's hottest functions from the PSP's scratchpad
+    hwcount.c           the CPU's cache and stall counters (with kmod/hwcread.prx), for measuring
+    game_ab.c           a second copy of the game code in one binary (scripts/game_ab.sh)
     native_math.c       the game's matrix, trig, keyframe and field-info functions, natively
     timer.c             osSetTimer, osGetTime
     misc.c              the rest of libultra; the recompiler's error hooks
@@ -127,12 +129,16 @@ file.
 | `trace_tasks.txt` | log every draw of these graphics tasks | gfx_debug.c |
 | `skip_draws.txt` | leave out these draws (1-based) | gfx_debug.c |
 | `dump_tex.txt` | write the first 400 textures built | gfx_tex.c |
-| `soften.txt` | softening strength in percent (0 = off; default 30) | gfx_frame.c |
 | `cpu_mhz.txt` | `222` or `266`: run the CPU at that clock instead of 333 (to see what a slower PSP would do) | main.c |
 | `no_snap.txt`, `no_weld.txt`, `no_cut.txt`, `no_split.txt`, `hard_edges.txt`, `no_upright.txt` | turn off vertex snapping, welding of nearly coincident vertices, stencil cut-outs, split combiners, soft texture edges, keeping ground decals (shadows) off upright surfaces | gfx_draw.c, gfx_combiner.c |
 | `no_target_tex.txt` | never sample a render target where it is in VRAM: copy it back to RDRAM and build a texture | gfx_target.c |
 | `no_yield.txt` | ignore the game's graphics task yields | gfx_worker.c |
 | `no_spram.txt` | leave the renderer's hot functions in RAM instead of running them from the scratchpad | spram.c |
+| `no_vram_tex.txt` | keep every texture in RAM, none in the VRAM the 16-bit screen leaves free | gfx/gfx_tex.c |
+| `dither.txt` | 16 numbers (-8..7, row by row): the screen's 4x4 dither pattern instead of the default | gfx/gfx_frame.c |
+| `hwc_bench.txt` | at start-up, run workloads with known cache misses and log what the CPU's counters say (needs `hwcread.prx` next to the PRX: `gmake -C runtime/kmod`) | hwcount.c |
+| `hwc_sections.txt` | log a frame's cycles, cache misses and stalls per game thread and for the renderer every 120 frames (`scripts/hwc_summary.py`, `hwc_ab.py`; needs `hwcread.prx`) | hwcount.c |
+| `gfx_b.txt`, `game_b.txt` | in an A/B build (`scripts/gfx_ab.sh`, `game_ab.sh`), run the second copy of the renderer / the game code | spram.c, game_ab.c |
 | `no_me.txt` | run audio on the main CPU | audio/me_audio.c |
 | `no_me_resample.txt` | convert the output's rate on the main CPU, with the audio tasks still on the Media Engine | audio/resample.c |
 | `log.txt` | write the log (`afpsp.log`, and to PSPLink's shell); without it nothing is logged, and only a fatal stop leaves its reason in `afpsp.log` | log.c |

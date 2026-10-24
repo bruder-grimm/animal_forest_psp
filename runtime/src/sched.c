@@ -24,6 +24,7 @@
 #include <stdlib.h>
 
 #include "rt.h"
+#include "hwcount.h"
 
 #define MAX_THREADS 32
 
@@ -372,6 +373,7 @@ static void charge_current(void) {
 /* Waits for something to be posted, for at most timeout_us if that isn't 0:
  * with no game thread runnable, the CPU is idle. Returns how long that took (us). */
 static uint32_t wait_external(uint32_t timeout_us) {
+    rt_hwc_owner(rt_hwc_idle_owner());
     uint64_t t0 = sceKernelGetSystemTimeWide();
     SceUInt timeout = timeout_us;
     sceKernelWaitSema(sExtSignal, 1, timeout_us != 0 ? &timeout : NULL);
@@ -667,6 +669,7 @@ static void switch_out(ThreadState new_state) {
     slot_of(next)->state = TS_RUNNING;
     write_thread_state(next, OS_STATE_RUNNING);
     sCurrent = next;
+    rt_hwc_owner(rt_sched_hwc_owner());
 
     if (next == self) {
         return;
@@ -679,6 +682,11 @@ static void switch_out(ThreadState new_state) {
         thread_exit_now(my_sema);
     }
     wait_for_baton(self, my_sema);
+}
+
+/* The game thread holding the baton, as a counter owner (hwcount.c). */
+int rt_sched_hwc_owner(void) {
+    return sCurrent != NULL && sCurrent->id >= 0 && sCurrent->id < 16 ? sCurrent->id : HWC_IDLE;
 }
 
 void rt_check_preempt(void) {

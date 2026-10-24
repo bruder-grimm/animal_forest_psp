@@ -17,12 +17,6 @@ TexTransform gTexTransform = { 1.0f, 1.0f, 0.0f, 0.0f };
 TexKey gBoundKey;
 static bool sSplitSecond = false; /* gfx_bind_texture: only look up the split's BAKE_Y texture */
 
-float gfx_tile_shift(uint8_t shift) {
-    if (shift > 10) return (float)(1 << (16 - shift));
-    if (shift > 0) return 1.0f / (float)(1 << shift);
-    return 1.0f;
-}
-
 /* Rows of a tile start `line` units apart in texture memory; resolve where
  * that puts them in RDRAM (the loaders may have copied a sub-image). */
 static bool tile_source(const TileDesc* tile, uint32_t* addr_bits, uint32_t* row_bits, uint8_t* row_swap) {

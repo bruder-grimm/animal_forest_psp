@@ -183,6 +183,7 @@ void gfx_target_ready(void) {
 static void ge_draw_to_target(void) {
     sceGuDrawBufferList(GU_PSM_8888, (void*)TARGET_VRAM, TARGET_MAX);
     sceGuDepthBuffer((void*)TARGET_DEPTH_VRAM, TARGET_MAX);
+    sceGuDisable(GU_DITHER); /* 8888: the game's 16-bit pictures are made from it, undithered */
     sceGuEnable(GU_STENCIL_TEST);
     sceGuStencilFunc(GU_ALWAYS, 0xFF, 0xFF);
     sceGuStencilOp(GU_KEEP, GU_KEEP, GU_REPLACE);

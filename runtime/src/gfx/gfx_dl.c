@@ -374,6 +374,142 @@ RT_SPRAM static void tmem_load(uint32_t first, uint32_t count, uint32_t line, ui
 
 /* ---- the interpreter ---------------------------------------------------- */
 
+/*
+ * run_dl's rarely seen commands, out of the loop (cold): fewer than twenty a
+ * task, most of them none. Returns the display list's next pc, or
+ * RARE_END_DL when it ends here (G_CULLDL).
+ */
+#define RARE_END_DL 0xFFFFFFFFu
+static __attribute__((noinline, cold)) uint32_t rare_command(uint32_t op, uint32_t w0, uint32_t w1, uint32_t pc) {
+    switch (op) {
+        case G_LOAD_UCODE:
+            gRsp.s2dex = (w1 & 0x1FFFFFFF) == (UCODE_S2DEX2_TEXT & 0x1FFFFFFF);
+            break;
+
+        case G_MODIFYVTX: {
+            int where = (w0 >> 16) & 0xFF;
+            int vtx_index = ((w0 & 0xFFFF) >> 1) & 0x3F;
+            gfx_forget_packed(vtx_index, 1);
+            RspVertex* v = &gRsp.verts[vtx_index];
+            switch (where) {
+                case 0x10:
+                    v->r = ((w1 >> 24) & 0xFF) / 255.0f;
+                    v->g = ((w1 >> 16) & 0xFF) / 255.0f;
+                    v->b = ((w1 >> 8) & 0xFF) / 255.0f;
+                    v->a = (w1 & 0xFF) / 255.0f;
+                    break;
+                case 0x14:
+                    v->u = (int16_t)(w1 >> 16) * (gRsp.tex_scale_s / 65536.0f);
+                    v->v = (int16_t)w1 * (gRsp.tex_scale_t / 65536.0f);
+                    break;
+                default:
+                    RT_LOG_ONCE("G_MODIFYVTX where=%02X unsupported", where);
+                    break;
+            }
+            break;
+        }
+        case G_CULLDL: {
+            int first = ((w0 & 0xFFFF) >> 1) & 0x3F;
+            int last = ((w1 & 0xFFFF) >> 1) & 0x3F;
+            uint16_t all = 0xFFFF;
+            for (int i = first; i <= last; i++) {
+                all &= gRsp.verts[i].clip;
+            }
+            if (all & CLIP_OUTSIDE) {
+                return RARE_END_DL;
+            }
+            break;
+        }
+        case G_BRANCH_Z: {
+            RspVertex* v = &gRsp.verts[((w0 & 0xFFF) >> 1) & 0x3F];
+            float zs = v->cw != 0 ? (v->cz / v->cw) * gRsp.vscale[2] + gRsp.vtrans[2] : 0;
+            if (zs * 65536.0f <= (float)w1 || v->cw <= 0) {
+                pc = seg_addr(gRsp.pending_branch);
+            }
+            break;
+        }
+        case G_POPMTX: {
+            uint32_t count = w1 / 64;
+            if (count > (uint32_t)gRsp.mv_depth) count = (uint32_t)gRsp.mv_depth;
+            gRsp.mv_depth -= (int)count;
+            gRsp.mvp_dirty = true;
+            gRsp.lights_dirty = true;
+            break;
+        }
+        case G_RDPHALF_1:
+            gRsp.pending_branch = w1;
+            break;
+        case G_TEXRECT:
+        case G_TEXRECTFLIP: {
+            uint32_t w2 = rd_w32_fast(g_rdram, pc + 4);
+            uint32_t w3 = rd_w32_fast(g_rdram, pc + 12);
+            pc += 16;
+            gfx_tex_rect(w0, w1, w2, w3, op == G_TEXRECTFLIP);
+            break;
+        }
+        case G_SETSCISSOR:
+            gRdp.scissor[0] = (w0 >> 12) & 0xFFF;
+            gRdp.scissor[1] = w0 & 0xFFF;
+            gRdp.scissor[2] = (w1 >> 12) & 0xFFF;
+            gRdp.scissor[3] = w1 & 0xFFF;
+            if (gFrameOpen) {
+                gfx_flush_batch();
+                gfx_set_scissor();
+            }
+            break;
+        case G_LOADTILE: {
+            /* Copies a sub-rectangle of the texture image, one row per
+             * `line` units. */
+            TileDesc* t = &gRdp.tiles[(w1 >> 24) & 7];
+            uint32_t uls = ((w0 >> 12) & 0xFFF) >> 2, ult = (w0 & 0xFFF) >> 2;
+            uint32_t lrs = ((w1 >> 12) & 0xFFF) >> 2, lrt = (w1 & 0xFFF) >> 2;
+            uint32_t bits = kTexelBits[t->siz & 3];
+            uint32_t line = t->line ? t->line : ((lrs - uls + 1) * bits + 63) / 64;
+            uint32_t base = (gRdp.timg & 0xFFFFFF) << 3;
+            if (lrt >= ult && line != 0) {
+                tmem_load(t->tmem, (lrt - ult + 1) * line, line, base + (ult * gRdp.timg_width + uls) * bits,
+                          gRdp.timg_width * bits);
+            }
+            gfx_mark_dirty();
+            break;
+        }
+        case G_FILLRECT:
+            gfx_fill_rect((w1 >> 12) & 0xFFF, w1 & 0xFFF, (w0 >> 12) & 0xFFF, w0 & 0xFFF);
+            break;
+        case G_SETFILLCOLOR:
+            gRdp.fill = w1;
+            break;
+        case G_SETFOGCOLOR:
+            gRdp.fog = w1;
+            break;
+        case G_SETBLENDCOLOR:
+            gRdp.blend = w1;
+            gfx_mark_dirty();
+            break;
+        case G_SETENVCOLOR:
+            if (gRdp.env != w1) {
+                gRdp.env = w1;
+                gfx_mark_dirty();
+            }
+            break;
+        case G_SETZIMG:
+            gRdp.zimg = seg_addr(w1);
+            gfx_color_image_changed();
+            break;
+        case G_SETCIMG:
+            gRdp.cimg = seg_addr(w1);
+            gRdp.cimg_width = (w0 & 0xFFF) + 1;
+            gRdp.cimg_fmt = (w0 >> 21) & 7;
+            gRdp.cimg_siz = (w0 >> 19) & 3;
+            gfx_color_image_changed();
+            break;
+        default:
+            RT_LOG_ONCE("unknown display list command %02X at %08X", op, pc - 8);
+            break;
+    }
+    return pc;
+}
+
 static void run_dl(uint32_t dl) {
     uint32_t stack[MAX_DL_DEPTH];
     int depth = 0;
@@ -435,9 +571,6 @@ static void run_dl(uint32_t dl) {
             case G_RDPHALF_2:
             case G_SETPRIMDEPTH: /* (the primitive depth, which the renderer does not use) */
                 break;
-            case G_LOAD_UCODE:
-                gRsp.s2dex = (w1 & 0x1FFFFFFF) == (UCODE_S2DEX2_TEXT & 0x1FFFFFFF);
-                break;
 
             case G_VTX: {
                 int n = (w0 >> 12) & 0xFF;
@@ -446,48 +579,6 @@ static void run_dl(uint32_t dl) {
                 gRsp.vtx_first = (uint8_t)(end - n);
                 gRsp.vtx_count = (uint8_t)n;
                 gStats.vertices += n;
-                break;
-            }
-            case G_MODIFYVTX: {
-                int where = (w0 >> 16) & 0xFF;
-                int vtx_index = ((w0 & 0xFFFF) >> 1) & 0x3F;
-                gfx_forget_packed(vtx_index, 1);
-                RspVertex* v = &gRsp.verts[vtx_index];
-                switch (where) {
-                    case 0x10:
-                        v->r = ((w1 >> 24) & 0xFF) / 255.0f;
-                        v->g = ((w1 >> 16) & 0xFF) / 255.0f;
-                        v->b = ((w1 >> 8) & 0xFF) / 255.0f;
-                        v->a = (w1 & 0xFF) / 255.0f;
-                        break;
-                    case 0x14:
-                        v->u = (int16_t)(w1 >> 16) * (gRsp.tex_scale_s / 65536.0f);
-                        v->v = (int16_t)w1 * (gRsp.tex_scale_t / 65536.0f);
-                        break;
-                    default:
-                        RT_LOG_ONCE("G_MODIFYVTX where=%02X unsupported", where);
-                        break;
-                }
-                break;
-            }
-            case G_CULLDL: {
-                int first = ((w0 & 0xFFFF) >> 1) & 0x3F;
-                int last = ((w1 & 0xFFFF) >> 1) & 0x3F;
-                uint16_t all = 0xFFFF;
-                for (int i = first; i <= last; i++) {
-                    all &= gRsp.verts[i].clip;
-                }
-                if (all & CLIP_OUTSIDE) {
-                    goto end_dl;
-                }
-                break;
-            }
-            case G_BRANCH_Z: {
-                RspVertex* v = &gRsp.verts[((w0 & 0xFFF) >> 1) & 0x3F];
-                float zs = v->cw != 0 ? (v->cz / v->cw) * gRsp.vscale[2] + gRsp.vtrans[2] : 0;
-                if (zs * 65536.0f <= (float)w1 || v->cw <= 0) {
-                    pc = seg_addr(gRsp.pending_branch);
-                }
                 break;
             }
             case G_TRI1:
@@ -508,14 +599,6 @@ static void run_dl(uint32_t dl) {
                 gRsp.tex_on = ((w0 >> 1) & 0x7F) != 0 || (w0 & 1);
                 gfx_mark_dirty();
                 break;
-            case G_POPMTX: {
-                uint32_t count = w1 / 64;
-                if (count > (uint32_t)gRsp.mv_depth) count = (uint32_t)gRsp.mv_depth;
-                gRsp.mv_depth -= (int)count;
-                gRsp.mvp_dirty = true;
-                gRsp.lights_dirty = true;
-                break;
-            }
             case G_GEOMETRYMODE: {
                 uint32_t prev = gRsp.geometry_mode;
                 gRsp.geometry_mode = (gRsp.geometry_mode & (w0 & 0xFFFFFF)) | w1;
@@ -550,32 +633,11 @@ static void run_dl(uint32_t dl) {
                 }
                 pc = stack[--depth];
                 break;
-            case G_RDPHALF_1:
-                gRsp.pending_branch = w1;
-                break;
             case G_SETOTHERMODE_L:
                 set_other_mode(false, w0, w1);
                 break;
             case G_SETOTHERMODE_H:
                 set_other_mode(true, w0, w1);
-                break;
-            case G_TEXRECT:
-            case G_TEXRECTFLIP: {
-                uint32_t w2 = rd_w32_fast(rdram, pc + 4);
-                uint32_t w3 = rd_w32_fast(rdram, pc + 12);
-                pc += 16;
-                gfx_tex_rect(w0, w1, w2, w3, op == G_TEXRECTFLIP);
-                break;
-            }
-            case G_SETSCISSOR:
-                gRdp.scissor[0] = (w0 >> 12) & 0xFFF;
-                gRdp.scissor[1] = w0 & 0xFFF;
-                gRdp.scissor[2] = (w1 >> 12) & 0xFFF;
-                gRdp.scissor[3] = w1 & 0xFFF;
-                if (gFrameOpen) {
-                    gfx_flush_batch();
-                    gfx_set_scissor();
-                }
                 break;
             case G_RDPSETOTHERMODE:
                 gRdp.other_h = w0 & 0xFFFFFF;
@@ -613,22 +675,6 @@ static void run_dl(uint32_t dl) {
                 gfx_mark_dirty();
                 break;
             }
-            case G_LOADTILE: {
-                /* Copies a sub-rectangle of the texture image, one row per
-                 * `line` units. */
-                TileDesc* t = &gRdp.tiles[(w1 >> 24) & 7];
-                uint32_t uls = ((w0 >> 12) & 0xFFF) >> 2, ult = (w0 & 0xFFF) >> 2;
-                uint32_t lrs = ((w1 >> 12) & 0xFFF) >> 2, lrt = (w1 & 0xFFF) >> 2;
-                uint32_t bits = kTexelBits[t->siz & 3];
-                uint32_t line = t->line ? t->line : ((lrs - uls + 1) * bits + 63) / 64;
-                uint32_t base = (gRdp.timg & 0xFFFFFF) << 3;
-                if (lrt >= ult && line != 0) {
-                    tmem_load(t->tmem, (lrt - ult + 1) * line, line, base + (ult * gRdp.timg_width + uls) * bits,
-                              gRdp.timg_width * bits);
-                }
-                gfx_mark_dirty();
-                break;
-            }
             case G_SETTILE: {
                 TileDesc* t = &gRdp.tiles[(w1 >> 24) & 7];
                 t->fmt = (w0 >> 21) & 7;
@@ -645,19 +691,6 @@ static void run_dl(uint32_t dl) {
                 gfx_mark_dirty();
                 break;
             }
-            case G_FILLRECT:
-                gfx_fill_rect((w1 >> 12) & 0xFFF, w1 & 0xFFF, (w0 >> 12) & 0xFFF, w0 & 0xFFF);
-                break;
-            case G_SETFILLCOLOR:
-                gRdp.fill = w1;
-                break;
-            case G_SETFOGCOLOR:
-                gRdp.fog = w1;
-                break;
-            case G_SETBLENDCOLOR:
-                gRdp.blend = w1;
-                gfx_mark_dirty();
-                break;
             case G_SETPRIMCOLOR: {
                 /* AF's gDPSetPrimColor carries the prim LOD fraction in the low byte. */
                 float lod = (w0 & 0xFF) / 255.0f;
@@ -668,12 +701,6 @@ static void run_dl(uint32_t dl) {
                 }
                 break;
             }
-            case G_SETENVCOLOR:
-                if (gRdp.env != w1) {
-                    gRdp.env = w1;
-                    gfx_mark_dirty();
-                }
-                break;
             case G_SETCOMBINE:
                 gRdp.combine0 = w0 & 0xFFFFFF;
                 gRdp.combine1 = w1;
@@ -683,19 +710,11 @@ static void run_dl(uint32_t dl) {
                 gRdp.timg = seg_addr(w1);
                 gRdp.timg_width = (uint16_t)((w0 & 0xFFF) + 1);
                 break;
-            case G_SETZIMG:
-                gRdp.zimg = seg_addr(w1);
-                gfx_color_image_changed();
-                break;
-            case G_SETCIMG:
-                gRdp.cimg = seg_addr(w1);
-                gRdp.cimg_width = (w0 & 0xFFF) + 1;
-                gRdp.cimg_fmt = (w0 >> 21) & 7;
-                gRdp.cimg_siz = (w0 >> 19) & 3;
-                gfx_color_image_changed();
-                break;
             default:
-                RT_LOG_ONCE("unknown display list command %02X at %08X", op, pc - 8);
+                pc = rare_command(op, w0, w1, pc);
+                if (pc == RARE_END_DL) {
+                    goto end_dl;
+                }
                 break;
         }
     }

@@ -1,6 +1,6 @@
 /*
  * gfx_frame.c -- frames on the GE: colour buffers, projection, the viewport,
- * the game's copies of the screen, the softening pass and presenting.
+ * the game's copies of the screen and presenting.
  *
  * The N64 game draws into framebuffers in RDRAM and tells the VI which one to
  * show. Here every frame is drawn straight into one of three colour buffers
@@ -14,9 +14,11 @@
 #include <pspge.h>
 #include <pspkernel.h>
 #include <malloc.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gfx_internal.h"
+#include "hwcount.h"
 
 /*
  * The display list, in cache lines of its own. pspgu writes it through the
@@ -236,6 +238,62 @@ void gfx_set_scissor(void) {
     sceGuScissor(x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0);
 }
 
+/* ---- display list publication --------------------------------------------- */
+
+/*
+ * pspgu's sceGuGetMemory and sceGuDrawArray tell the GE how far the list is
+ * ready (sceGeListUpdateStallAddr, a system call of ~1 us) every time: two or
+ * three a batch. These replace them. Memory taken from the list needs none
+ * (the next draw publishes what was written there); a draw publishes at once
+ * when it is the first in a while, then every eighth, and sceGuFinish the
+ * rest -- the cadence sf64-psp measured best on the PSP (more draws between
+ * publications let the GE fall idle). pspgu's internals as in sf64-psp's
+ * gfx_psp_gu_device.c, the same in this PSPSDK.
+ */
+typedef struct {
+    unsigned int* start;
+    unsigned int* current;
+    int parent_context;
+} GuListState;
+extern GuListState* gu_list;
+extern int gu_curr_context;
+extern int gu_object_stack_depth;
+extern int ge_list_executed[2];
+static unsigned sDrawsToPublish = 1;
+
+static inline void gu_cmd(unsigned cmd, unsigned arg) {
+    *gu_list->current++ = (cmd << 24) | (arg & 0xFFFFFFu);
+}
+
+void sceGuDrawArray(int prim, int vtype, int count, const void* indices, const void* vertices) {
+    if (vtype) {
+        gu_cmd(0x12, (unsigned)vtype);
+    }
+    if (indices) {
+        gu_cmd(0x10, ((uintptr_t)indices >> 8) & 0xF0000u);
+        gu_cmd(0x02, (uintptr_t)indices);
+    }
+    if (vertices) {
+        gu_cmd(0x10, ((uintptr_t)vertices >> 8) & 0xF0000u);
+        gu_cmd(0x01, (uintptr_t)vertices);
+    }
+    gu_cmd(0x04, ((unsigned)prim << 16) | (unsigned)count);
+    if (gu_curr_context == GU_DIRECT && gu_object_stack_depth == 0 && --sDrawsToPublish == 0) {
+        sceGeListUpdateStallAddr(ge_list_executed[0], gu_list->current);
+        sDrawsToPublish = 8;
+    }
+}
+
+void* sceGuGetMemory(int size) {
+    size = (size + 3) & ~3;
+    unsigned int* at = gu_list->current;
+    unsigned int* next = (unsigned int*)((uintptr_t)at + (unsigned)size + 8);
+    at[0] = (16u << 24) | (((uintptr_t)next >> 8) & 0xF0000u); /* BASE */
+    at[1] = (8u << 24) | ((uintptr_t)next & 0xFFFFFFu);        /* JUMP over the memory */
+    gu_list->current = next;
+    return at + 2;
+}
+
 /* ---- colour buffers ----------------------------------------------------- */
 
 /*
@@ -248,7 +306,45 @@ void gfx_set_scissor(void) {
  *
  * (VRAM layout: gfx_internal.h)
  */
-static const uint32_t kColorBufs[3] = { 0x000000, 0x088000, 0x154000 };
+static const uint32_t kColorBufs[3] = { 0, SCREEN_BUF_BYTES, 2 * SCREEN_BUF_BYTES };
+
+/*
+ * The colour buffers have 5 bits a channel, as the N64's have, and are
+ * dithered with a 4x4 ordered pattern, added before the GE drops the low three
+ * bits. No pattern is right for every brightness: blending reads a pixel back
+ * as k << 3 | k >> 2, up to 7 above what was dropped to k, so with an unbiased
+ * pattern (0..7) translucent layers over bright pixels creep up to white, and
+ * with pspgu's (-4..3, half a step low) those over dark ones creep down (the
+ * waterfall's mist went). This one sits between, a little low (-3..4).
+ * dither.txt: 16 other values (-8..7, row by row). Render targets (8888) are
+ * not dithered.
+ */
+static ScePspIMatrix4 sDither = {
+    { -3, 1, -2, 2 }, { 3, -1, 4, 0 }, { -2, 2, -3, 1 }, { 4, 0, 3, -1 } };
+
+static void load_dither(void) {
+    static bool loaded = false;
+    char text[256];
+    if (!loaded && rt_data_read_text("dither.txt", text, sizeof(text)) > 0) {
+        int v[16], n = 0;
+        for (char* p = text; *p != '\0' && n < 16;) {
+            char* end;
+            long x = strtol(p, &end, 10);
+            if (end == p) {
+                p++;
+            } else {
+                v[n++] = (int)x;
+                p = end;
+            }
+        }
+        if (n == 16) {
+            memcpy(&sDither, v, sizeof(sDither));
+            rt_log("dither: %d %d %d %d ...", v[0], v[1], v[2], v[3]);
+        }
+    }
+    loaded = true;
+}
+
 static int sDrawBuf = 0;           /* where the open (or next) frame is drawn */
 static int sShownBuf = 1;          /* last buffer handed to the display */
 static int sPrevShownBuf = 2;      /* the one before it */
@@ -256,10 +352,7 @@ static uint32_t sShownVcount = 0;  /* vblank count when sShownBuf was handed ove
 static uint32_t sPrevShownVcount = 0; /* ... and when sPrevShownBuf was */
 static bool sFrameDrawn = false;   /* something was drawn since the last hand-over */
 
-void gfx_open_frame(void) {
-    if (gFrameOpen) {
-        return;
-    }
+void gfx_open_frame_now(void) {
     /*
      * The buffer we draw into was on screen until sPrevShownBuf replaced it, at
      * the first vertical blank after sPrevShownBuf was handed over. Only if two
@@ -269,14 +362,16 @@ void gfx_open_frame(void) {
      */
     uint32_t vw0 = sceKernelGetSystemTimeLow();
     while (sceDisplayGetVcount() == sPrevShownVcount) {
+        rt_hwc_owner(rt_sched_hwc_owner());
         sceDisplayWaitVblankStart();
+        rt_hwc_owner(HWC_RENDER);
     }
     gStats.vblank_wait_us += sceKernelGetSystemTimeLow() - vw0;
     gFrameOpen = true;
     sFrameDrawn = true;
     gfx_batches_new_frame();
     sceGuStart(GU_DIRECT, sGuList);
-    sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
+    sceGuDrawBufferList(SCREEN_PSM, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
     sceGuDepthBuffer((void*)DEPTH_VRAM, BUF_WIDTH);
     sceGuDisable(GU_STENCIL_TEST);
     gfx_gu_reset_cache();
@@ -292,7 +387,9 @@ void gfx_open_frame(void) {
      * rounding at the planes. */
     sceGuEnable(GU_CLIP_PLANES);
     sceGuDisable(GU_LIGHTING);
-    sceGuDisable(GU_DITHER);
+    load_dither();
+    sceGuSetDither(&sDither);
+    sceGuEnable(GU_DITHER);
     sceGuShadeModel(GU_SMOOTH);
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexScale(1.0f, 1.0f);
@@ -313,7 +410,8 @@ void gfx_open_frame(void) {
 /* Points the GE at the screen's colour and depth buffers again (from a render target). */
 void gfx_draw_to_screen(void) {
     map_screen();
-    sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
+    sceGuEnable(GU_DITHER);
+    sceGuDrawBufferList(SCREEN_PSM, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
     sceGuDepthBuffer((void*)DEPTH_VRAM, BUF_WIDTH);
     sceGuDisable(GU_STENCIL_TEST);
     gGu.stencil = GU_STENCIL_OFF;
@@ -327,13 +425,15 @@ void gfx_draw_to_screen(void) {
  */
 void gfx_finish_list(void) {
     sceGuFinish();
+    rt_hwc_owner(rt_sched_hwc_owner());
     sceGuSync(0, 0);
+    rt_hwc_owner(HWC_RENDER);
     sceGuStart(GU_DIRECT, sGuList);
     /* (pspgu opens every list with the colour buffer of sceGuDrawBuffer, which isn't ours) */
     if (gTarget.bound) {
         sceGuDrawBufferList(GU_PSM_8888, (void*)TARGET_VRAM, TARGET_MAX);
     } else {
-        sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
+        sceGuDrawBufferList(SCREEN_PSM, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
     }
     gfx_batches_new_frame();
 }
@@ -348,8 +448,8 @@ void rt_gfx_init(void) {
     gfx_tex_init();
     sceGuInit();
     sceGuStart(GU_DIRECT, sGuList);
-    sceGuDrawBuffer(GU_PSM_8888, (void*)0, BUF_WIDTH);
-    sceGuDispBuffer(PSP_SCREEN_W, PSP_SCREEN_H, (void*)0x88000, BUF_WIDTH);
+    sceGuDrawBuffer(SCREEN_PSM, (void*)0, BUF_WIDTH);
+    sceGuDispBuffer(PSP_SCREEN_W, PSP_SCREEN_H, (void*)SCREEN_BUF_BYTES, BUF_WIDTH);
     sceGuDepthBuffer((void*)DEPTH_VRAM, BUF_WIDTH);
     sceGuOffset(GU_OFFSET_X, GU_OFFSET_Y);
     sceGuViewport(2048, 2048, PSP_SCREEN_W, PSP_SCREEN_H);
@@ -374,10 +474,10 @@ void rt_gfx_init(void) {
     /* clear the third colour buffer too, so it never shows garbage */
     sceGuStart(GU_DIRECT, sGuList);
     for (int i = 0; i < 3; i++) {
-        sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[i], BUF_WIDTH);
+        sceGuDrawBufferList(SCREEN_PSM, (void*)kColorBufs[i], BUF_WIDTH);
         sceGuClear(GU_COLOR_BUFFER_BIT);
     }
-    sceGuDrawBufferList(GU_PSM_8888, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
+    sceGuDrawBufferList(SCREEN_PSM, (void*)kColorBufs[sDrawBuf], BUF_WIDTH);
     sceGuFinish();
     sceGuSync(0, 0);
 }
@@ -466,14 +566,14 @@ bool gfx_drawing_to_display(void) {
     return sNumDisplayFbs == 0 || gfx_is_display_fb(gRdp.cimg);
 }
 
-static uint32_t* sCapturePixels = NULL; /* allocated on the first capture */
+static uint16_t* sCapturePixels = NULL; /* allocated on the first capture */
 
 /* Copy what the PSP shows for N64 framebuffer `src` into RDRAM at `dst` as RGBA5551. */
 void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_t height) {
     src &= 0x1FFFFFFF;
     if (sCapturePixels == NULL) {
         /* whole cache lines: the invalidate after the GE has written it must not drop a neighbour's */
-        sCapturePixels = memalign(64, BUF_WIDTH * PSP_SCREEN_H * 4);
+        sCapturePixels = memalign(64, SCREEN_BUF_BYTES);
         if (sCapturePixels == NULL) {
             RT_LOG_ONCE("gfx: no memory for framebuffer captures");
             return;
@@ -485,13 +585,15 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
     uint32_t cw0 = sceKernelGetSystemTimeLow();
     gfx_open_frame();
     gfx_flush_batch();
-    sceGuCopyImage(GU_PSM_8888, 0, 0, PSP_SCREEN_W, PSP_SCREEN_H, BUF_WIDTH, VRAM_ADDR(vram), 0, 0,
+    sceGuCopyImage(SCREEN_PSM, 0, 0, PSP_SCREEN_W, PSP_SCREEN_H, BUF_WIDTH, VRAM_ADDR(vram), 0, 0,
                    BUF_WIDTH, sCapturePixels);
     sceGuFinish();
+    rt_hwc_owner(rt_sched_hwc_owner());
     sceGuSync(0, 0);
+    rt_hwc_owner(HWC_RENDER);
     gStats.capture_us += sceKernelGetSystemTimeLow() - cw0;
     gStats.captures++;
-    sceKernelDcacheInvalidateRange(sCapturePixels, BUF_WIDTH * PSP_SCREEN_H * 4);
+    sceKernelDcacheInvalidateRange(sCapturePixels, SCREEN_BUF_BYTES);
     gFrameOpen = false;
     gfx_open_frame();
 
@@ -504,7 +606,7 @@ void gfx_capture_framebuffer(uint32_t src, uint32_t dst, uint32_t width, uint32_
         for (uint32_t x = 0; x < width; x++) {
             int sx = (int)(((float)x + 0.5f - sScreen.crop_x) * sScreen.scale_x);
             sx = sx < sScreen.x0 ? sScreen.x0 : sx >= sScreen.x1 ? sScreen.x1 - 1 : sx;
-            MEM_HU(0, dst + 2 * (y * width + x)) = (uint16_t)(ge_to_rgba5551(sCapturePixels[sy * BUF_WIDTH + sx]) | 1);
+            MEM_HU(0, dst + 2 * (y * width + x)) = (uint16_t)screen_to_rgba5551(sCapturePixels[sy * BUF_WIDTH + sx]);
         }
     }
     /* A texture made from the last picture saved there (the screen behind a menu) is out of date. */
@@ -570,7 +672,7 @@ void gfx_copy_from_screen(uint32_t fb, float dx0, float dy0, float dx1, float dy
     sceGuDisable(GU_DEPTH_TEST);
     sceGuDisable(GU_FOG);
     sceGuEnable(GU_TEXTURE_2D);
-    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexMode(SCREEN_PSM, 0, 0, 0);
     sceGuTexImage(0, 512, 512, BUF_WIDTH, VRAM_ADDR(vram));
     sceGuTexFlush();
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
@@ -597,117 +699,6 @@ bool gfx_screen_position(uint32_t addr, uint32_t* fb, float* x, float* y) {
     return false;
 }
 
-/* ---- softening ---------------------------------------------------------- */
-
-/*
- * Softening. The N64's picture reaches the TV through the VI, which filters
- * polygon edges and blurs a little; the GE's picture, drawn straight at the
- * PSP's resolution, looks harsh beside it. So the finished frame is blended
- * with a blurred copy of itself, by the strength in soften.txt (percent; 0
- * turns it off, SOFTEN_DEFAULT without the file).
- *
- * The blur is the frame shrunk to half size with bilinear filtering (each
- * texel the average of 2x2 pixels) and drawn back over it enlarged, bilinear
- * again, with the strength as a fixed blend weight: two sprites, neither
- * reading the buffer it writes. The half-size copy lives in the render
- * target's VRAM and the spare VRAM after it (256x136x4 from TARGET_VRAM, ending
- * below 2 MB). Nothing is bound there between frames, and a render target's
- * depth is cleared by the game before use, so only the cached colour must be
- * forgotten.
- *
- * Measured on the PSP-1000: this is GE time at the end of every frame. A
- * version that blended four neighbour samples from banded copies of the
- * frame cost 7-29 ms; wide textured sprites are slow, so both passes are
- * drawn in strips 64 pixels wide.
- *
- * A scaled through-mode sprite is sampled at pixel centres, texel centres at
- * i + 0.5: shrinking samples half-size pixel i at 2i + 1, between pixels 2i
- * and 2i + 1, and enlarging samples pixel x at (x + 0.5) / 2 -- the plain
- * mapping both ways, with no shift (measured in PPSSPP).
- */
-#define SOFTEN_DEFAULT 30
-#define SOFT_VRAM TARGET_VRAM /* 256 x 136 x 4 = 0x22000: ends at 0x1FE000 */
-#define SOFT_W (PSP_SCREEN_W / 2)
-#define SOFT_H (PSP_SCREEN_H / 2)
-#define SOFT_STRIP 64
-static int sSoften = -1;    /* strength, 0..255 */
-
-/* A sprite from (x0,y0)-(x1,y1) sampling (u0,v0)-(u1,v1), in strips. */
-static void soften_sprite(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
-    int n = (int)((x1 - x0 + SOFT_STRIP - 1) / SOFT_STRIP);
-    float du = (u1 - u0) / (x1 - x0);
-    GuVertex* m = sceGuGetMemory(2 * n * sizeof(GuVertex));
-    for (int i = 0; i < n; i++) {
-        float a = x0 + i * SOFT_STRIP, b = a + SOFT_STRIP < x1 ? a + SOFT_STRIP : x1;
-        m[2 * i] = (GuVertex){ u0 + (a - x0) * du, v0, 0xFFFFFFFF, a, y0, 0 };
-        m[2 * i + 1] = (GuVertex){ u0 + (b - x0) * du, v1, 0xFFFFFFFF, b, y1, 0 };
-    }
-    sceGuDrawArray(GU_SPRITES, GU_VTYPE | GU_TRANSFORM_2D, 2 * n, NULL, m);
-}
-
-/* soften_frame's passes, queued into the current display list. */
-static void soften_passes(void) {
-    void* screen = (void*)kColorBufs[sDrawBuf];
-    gfx_gu_reset_cache();
-    gRdp.state_dirty = true;
-    gTarget.vram_addr = 0; /* the render target's VRAM is about to be overwritten */
-    sceGuDisable(GU_DEPTH_TEST);
-    sceGuDepthMask(1);
-    sceGuDisable(GU_ALPHA_TEST);
-    sceGuDisable(GU_STENCIL_TEST);
-    sceGuDisable(GU_FOG);
-    sceGuDisable(GU_SCISSOR_TEST);
-    sceGuPixelMask(0);
-    sceGuEnable(GU_TEXTURE_2D);
-    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
-    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
-
-    /* the picture (not the bars beside it, if any) at half size */
-    int x0 = sScreen.x0, x1 = sScreen.x1, hx0 = x0 / 2, hx1 = x1 / 2;
-    sceGuDisable(GU_BLEND);
-    sceGuDrawBufferList(GU_PSM_8888, (void*)SOFT_VRAM, 256);
-    sceGuTexImage(0, 512, 512, BUF_WIDTH, VRAM_ADDR(screen));
-    sceGuTexFlush();
-    soften_sprite(hx0, 0, hx1, SOFT_H, x0, 0, x1, PSP_SCREEN_H);
-    /* its last column and row repeated: the enlarged sprite's right and bottom
-     * pixels sample a quarter texel past them (and its left ones, where the
-     * picture does not start at the texture's edge) */
-    void* half = VRAM_ADDR(SOFT_VRAM);
-    sceGuCopyImage(GU_PSM_8888, hx1 - 1, 0, 1, SOFT_H, 256, half, hx1, 0, 256, half);
-    if (hx0 > 0) {
-        sceGuCopyImage(GU_PSM_8888, hx0, 0, 1, SOFT_H, 256, half, hx0 - 1, 0, 256, half);
-    }
-    sceGuCopyImage(GU_PSM_8888, 0, SOFT_H - 1, SOFT_W + 1, 1, 256, half, 0, SOFT_H, 256, half);
-
-    /* and back over it, enlarged */
-    sceGuDrawBufferList(GU_PSM_8888, screen, BUF_WIDTH);
-    sceGuTexSync();
-    sceGuTexImage(0, 256, 256, 256, VRAM_ADDR(SOFT_VRAM));
-    sceGuTexFlush();
-    uint32_t k = (uint32_t)sSoften, ik = 255 - k;
-    sceGuEnable(GU_BLEND);
-    sceGuBlendFunc(GU_ADD, GU_FIX, GU_FIX, k | (k << 8) | (k << 16), ik | (ik << 8) | (ik << 16));
-    soften_sprite(x0, 0, x1, PSP_SCREEN_H, hx0, 0, hx1, SOFT_H);
-    gfx_gu_reset_cache();
-}
-
-static void soften_frame(void) {
-    if (sSoften < 0) {
-        uint32_t pct = SOFTEN_DEFAULT;
-        if (rt_load_number_list("soften.txt", &pct, 1) == 1 && pct > 100) {
-            pct = 100;
-        }
-        sSoften = (int)(pct * 255 / 100);
-        rt_log("soften: %u%%", (unsigned)pct);
-    }
-    if (sSoften == 0) {
-        return;
-    }
-    soften_passes();
-}
-
 /* ---- presenting --------------------------------------------------------- */
 
 static void ge_sync(void* arg) {
@@ -725,6 +716,7 @@ static void log_stats(void) {
     char threads[160];
     rt_sched_report(threads, sizeof(threads), (uint32_t)span);
     rt_log("idle %u%% of the CPU", (unsigned)rt_idle_percent((uint32_t)span));
+    rt_hwc_report(120);
     /*
      * Where the renderer's time went: its share of wall time, the time per
      * task, how much of that it was on the CPU (the rest is preemption by the
@@ -734,13 +726,13 @@ static void log_stats(void) {
     uint32_t tb, tbk, tbus;
     gfx_tex_take_build_stats(&tb, &tbk, &tbus);
     uint32_t tasks = gStats.tasks - sStatTasks;
-    rt_log("gfx: render %u%% of wall time (%u us a task, %u us of them on the CPU), vblank waits %u us, %u captures (%u us), %u render targets (%u us), %u textures built (%u baked, %u us, %u put off), submit wait avg %u max %u us",
+    rt_log("gfx: render %u%% of wall time (%u us a task, %u us of them on the CPU), vblank waits %u us, %u captures (%u us), %u render targets (%u us), %u textures built (%u baked, %u us, %u put off), %u KB textures in VRAM, submit wait avg %u max %u us",
            span ? (unsigned)(gStats.render_us * 100 / span) : 0,
            tasks ? (unsigned)(gStats.render_us / tasks) : 0,
            tasks ? (unsigned)(gStats.render_cpu_us / tasks) : 0,
            (unsigned)gStats.vblank_wait_us, (unsigned)gStats.captures, (unsigned)gStats.capture_us,
            (unsigned)gStats.target_copies, (unsigned)gStats.target_us, (unsigned)tb, (unsigned)tbk, (unsigned)tbus,
-           (unsigned)gfx_tex_take_deferred(),
+           (unsigned)gfx_tex_take_deferred(), (unsigned)(gfx_tex_vram_used() / 1024),
            (unsigned)(gStats.submit_wait_n ? gStats.submit_wait_sum / gStats.submit_wait_n : 0),
            (unsigned)gStats.submit_wait_max);
     rt_log("frame %u (poll %u): %u gfx tasks, %u yields, %u verts, %u draws, %u tris (in %u, trivial %u, culled %u, clipped %u, %u GE verts) | busy %u%% = %u us a frame (gfx %u%%, blocked %u%%, audio %u%%) |%s",
@@ -767,18 +759,17 @@ static void log_stats(void) {
 void gfx_present_frame(uint32_t framebuffer) {
     gStats.frames++;
     note_display_fb(framebuffer);
-    uint32_t* shot = gfx_debug_shot_buffer(gStats.frames, gFrameOpen);
+    uint16_t* shot = gfx_debug_shot_buffer(gStats.frames, gFrameOpen);
     if (gFrameOpen) {
         gfx_flush_batch();
-        if (!gTarget.bound) {
-            soften_frame();
-        }
         if (shot != NULL) {
-            sceGuCopyImage(GU_PSM_8888, 0, 0, PSP_SCREEN_W, PSP_SCREEN_H, BUF_WIDTH, VRAM_ADDR(kColorBufs[sDrawBuf]),
+            sceGuCopyImage(SCREEN_PSM, 0, 0, PSP_SCREEN_W, PSP_SCREEN_H, BUF_WIDTH, VRAM_ADDR(kColorBufs[sDrawBuf]),
                            0, 0, BUF_WIDTH, shot);
         }
         sceGuFinish();
+        rt_hwc_owner(rt_sched_hwc_owner());
         rt_sched_native_wait(ge_sync, NULL);
+        rt_hwc_owner(HWC_RENDER);
         gFrameOpen = false;
         /* The GE is done with this frame: buffers it might have read are free. */
         gfx_tex_flush_retired();
@@ -792,7 +783,7 @@ void gfx_present_frame(uint32_t framebuffer) {
      * keep showing what is there: there is no new picture to show.
      */
     if (sFrameDrawn) {
-        sceDisplaySetFrameBuf(VRAM_ADDR(kColorBufs[sDrawBuf]), BUF_WIDTH, PSP_DISPLAY_PIXEL_FORMAT_8888,
+        sceDisplaySetFrameBuf(VRAM_ADDR(kColorBufs[sDrawBuf]), BUF_WIDTH, PSP_DISPLAY_PIXEL_FORMAT_5551,
                               PSP_DISPLAY_SETBUF_NEXTVSYNC);
         int free_buf = sPrevShownBuf;
         sPrevShownBuf = sShownBuf;

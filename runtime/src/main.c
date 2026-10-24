@@ -10,6 +10,7 @@
 
 #include "audio/me_audio.h"
 #include "rt.h"
+#include "hwcount.h"
 
 PSP_MODULE_INFO("AnimalForestPSP", PSP_MODULE_USER, 0, 1);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
@@ -237,6 +238,8 @@ int main(int argc, char* argv[]) {
     rt_rtc_init();
     rt_input_init();
     rt_gfx_init();
+    rt_hwc_bench();   /* debug: hwc_bench.txt */
+    rt_hwc_sections_init(); /* debug: hwc_sections.txt */
     rt_gfx_replay();  /* debug: replay.txt, never returns if present */
     rt_audio_init();
     rt_me_audio_init();

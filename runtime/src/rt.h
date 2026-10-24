@@ -326,6 +326,11 @@ void rt_sched_native_wait(void (*fn)(void*), void* arg);
 void rt_sched_sleep(uint64_t us);
 /* Makes running game code enter the scheduler at its next preemption point (from any PSP thread). */
 void rt_sched_poke(void);
+/* The game thread holding the baton as a counter owner (hwcount.h). */
+int rt_sched_hwc_owner(void);
+/* An A/B build's second copy of the game code (game_ab.c; game_b.txt runs it): set up, and f's twin there. */
+void rt_game_b_init(void);
+void* rt_game_b_func(void* f);
 
 /*
  * Captures (capture.c). rt_sched_quiet: whether every other game thread is
