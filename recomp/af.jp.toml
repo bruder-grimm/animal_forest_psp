@@ -13,8 +13,10 @@ unpaired_lo16_warnings = false
 bss_section_suffix = "_bss"
 # Rebuild overlay HI16/LO16 relocations from the ROM's own .ovl tables.
 overlay_reloc_suffix = "_reloc"
-# GPRs as C locals in each function, relying on the MIPS calling convention
-# (RL_* in runtime/include/recomp_psp.h): about a quarter less code.
+# GPRs and FPU registers as C locals in each function, relying on the MIPS
+# calling convention (RL_* in runtime/include/recomp_psp.h): about a quarter
+# less code. (Environment, for A/B builds: N64RECOMP_NO_RL_FLOW writes all of
+# a0-a3/sp at every call, N64RECOMP_NO_FPR_LOCALS keeps the FPU in ctx.)
 register_locals = true
 # The game relocates overlays itself; the runtime only needs section load addresses.
 emit_section_relocs = false
@@ -106,6 +108,9 @@ native = [
     "mFI_UtNum2BlockNum",
     "mFI_UtNum2UtCol",
     "mFI_Wpos2UtNum",
+    # The audio frame (Nas_smzAudioFrame): runtime/src/audio/synth.c leaves its
+    # synthesis to the Media Engine.
+    "func_800E319C_jp",
 ]
 
 # The scheduler polls the RSP status register (0xA4040010) directly. Point
@@ -128,6 +133,19 @@ value = 0x3C118000 # lui $s1, 0x8000
 [[patches.hook]]
 func = "Overlay_Load"
 text = "recomp_overlay_load_hook(rdram, ctx);"
+
+# The audio synthesis on the Media Engine (runtime/src/audio/synth.c): the
+# job made while the audio task was built is finished before the next one is
+# built, and handed to the ME once the task is complete.
+[[patches.hook]]
+func = "func_800EE020_jp"
+before_vram = 0x800EE030
+text = "rt_synth_before_build(rdram, ctx);"
+
+[[patches.hook]]
+func = "func_800EE020_jp"
+before_vram = 0x800EE038
+text = "rt_synth_start(rdram, ctx);"
 
 # --- English fan translation ("Animal Forest (U) [!]", md5 f827d11e...) ----------
 # That ROM is a data-only patch of the JP build: dmadata is byte-identical, boot and

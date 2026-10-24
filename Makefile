@@ -29,6 +29,10 @@ RT_SRCS := $(foreach d,$(RT_DIRS),$(wildcard $(d)/*.c))
 RT_ASM_SRCS := $(foreach d,$(RT_DIRS),$(wildcard $(d)/*.S))
 
 GEN_OBJS := $(patsubst $(GEN)/%.c,$(BUILD)/gen/%.o,$(GEN_SRCS))
+# The audio engine's synthesis, copied from the generated code for the Media
+# Engine (scripts/me_copy.py, runtime/src/audio/synth.c): what these call is copied too.
+ME_ROOTS := func_800E2D20_jp func_800E4600_jp func_800EBF90_jp
+ME_GEN_OBJ := $(BUILD)/me/me_synth_gen.o
 RT_OBJS := $(patsubst runtime/src/%.c,$(BUILD)/rt/%.o,$(RT_SRCS)) $(patsubst runtime/src/%.S,$(BUILD)/rt/%.o,$(RT_ASM_SRCS))
 
 INCLUDES := -Iruntime/include -Iruntime/src -I$(GEN) -I$(PSPDEV)/psp/include -I$(PSPSDK)/include
@@ -67,6 +71,14 @@ $(BUILD)/gen/%.o: $(GEN)/%.c runtime/include/recomp_psp.h
 	@echo "CC  $<"
 	@$(CC) $(GEN_CFLAGS) -c $< -o $@
 
+$(BUILD)/me/me_synth_gen.c: $(GEN_SRCS) scripts/me_copy.py Makefile
+	@mkdir -p $(dir $@)
+	@python3 scripts/me_copy.py $(GEN) $@ $(ME_ROOTS)
+
+$(ME_GEN_OBJ): $(BUILD)/me/me_synth_gen.c runtime/include/recomp_psp.h
+	@echo "CC  $<"
+	@$(CC) $(GEN_CFLAGS) -c $< -o $@
+
 # Header dependencies come from -MMD (the .d files included at the end).
 $(BUILD)/rt/%.o: runtime/src/%.c
 	@mkdir -p $(dir $@)
@@ -83,13 +95,13 @@ $(BUILD)/rt/sections.o: $(GEN)/recomp_overlays.inl $(GEN)/funcs.h
 
 # Every link gets a new build id (runtime/src/capture.c: a capture can only be
 # resumed by the build that took it); build_id.txt has it for the tools.
-$(ELF): $(GEN_OBJS) $(RT_OBJS)
+$(ELF): $(GEN_OBJS) $(ME_GEN_OBJ) $(RT_OBJS)
 	@echo "LD  $@"
 	@id=$$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n'); \
 	 echo "const unsigned int rt_build_id = 0x$$id;" > $(BUILD)/build_id.c; \
 	 echo "$$id" | tr a-f A-F > $(BUILD)/build_id.txt
 	@$(CC) $(RT_CFLAGS) -c $(BUILD)/build_id.c -o $(BUILD)/build_id.o
-	@$(CC) $(LDFLAGS) $(PSPSDK)/lib/prxexports.o $(RT_OBJS) $(BUILD)/build_id.o $(GEN_OBJS) $(LIBS) -o $@
+	@$(CC) $(LDFLAGS) $(PSPSDK)/lib/prxexports.o $(RT_OBJS) $(BUILD)/build_id.o $(GEN_OBJS) $(ME_GEN_OBJ) $(LIBS) -o $@
 	@psp-fixup-imports $@
 
 $(PRX): $(ELF)

@@ -21,6 +21,13 @@ void rt_me_audio_submit(const AspTask* task);
 /* Waits unless the samples at addr are known to be finished. */
 void rt_me_audio_before_read(uint32_t addr);
 void rt_me_audio_report(char* buf, int size);
+/*
+ * Synthesis jobs (synth.c), one at a time, run after any audio task. Collect
+ * says who has the job: the ME ran it, or the main CPU must (the ME had not
+ * started it and never will, or the ME stopped).
+ */
+bool rt_me_synth_submit(void);
+bool rt_me_synth_collect(bool checking);
 /* For code that runs on the ME (resample.c): its data cache, by whole lines. */
 void rt_me_cache_invalidate(uint32_t addr, uint32_t size);
 void rt_me_cache_writeback(uint32_t addr, uint32_t size);

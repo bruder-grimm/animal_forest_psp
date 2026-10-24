@@ -35,6 +35,14 @@ extern uint8_t* g_rdram;
 /* 0x80000300-0x8000035B: libultra's globals and osAppNMIBuffer (the game uses both). */
 #define RT_TAG_SCRATCH   0x800003E0u  /* 32 bytes: a word of the letter tag or a free string (english/letters.c) */
 
+/*
+ * The stack of the game code the Media Engine runs (audio/synth.c): past the
+ * guard above RDRAM, where generated code reaches it through the same base
+ * fold as RDRAM (MEM_PTR) but the game never does. main.c makes the room.
+ */
+#define RT_ME_STACK_SIZE 0x2000u
+#define RT_ME_STACK_TOP  (0x80000000u + RDRAM_SIZE + RDRAM_GUARD + RT_ME_STACK_SIZE)
+
 /* Word, halfword and byte access to RDRAM by N64 address (see recomp_psp.h). */
 static inline uint32_t rd_w32(uint32_t addr) {
     uint8_t* rdram = g_rdram;
@@ -270,6 +278,7 @@ void rt_save_capture(RtCapture* c);
 void rt_sections_capture(RtCapture* c);
 void rt_misc_capture(RtCapture* c);
 void rt_audio_capture(RtCapture* c);
+void rt_synth_capture(RtCapture* c);
 void rt_gfx_capture(RtCapture* c);
 void rt_en_dialogue_capture(RtCapture* c);
 void rt_en_names_capture(RtCapture* c);
@@ -331,6 +340,8 @@ int rt_sched_hwc_owner(void);
 /* An A/B build's second copy of the game code (game_ab.c; game_b.txt runs it): set up, and f's twin there. */
 void rt_game_b_init(void);
 void* rt_game_b_func(void* f);
+/* While held, the running game thread does not hand over at preemption points (preempt.c). */
+void rt_preempt_hold(bool hold);
 
 /*
  * Captures (capture.c). rt_sched_quiet: whether every other game thread is
@@ -378,6 +389,8 @@ uint32_t rt_rom_block_loads(void);
 uint32_t rt_rom_block_us(void); /* time spent reading ROM blocks */
 void rt_dma_report(char* buf, int size);
 bool rt_pi_idle(void); /* no PI DMA queued or in progress */
+/* A cartridge read (physical address) into RDRAM, done now on the calling thread. */
+void rt_pi_read_now(uint32_t phys, uint32_t ram, uint32_t size);
 
 /* ---- controllers and the cartridge clock (si.c) ------------------------- */
 

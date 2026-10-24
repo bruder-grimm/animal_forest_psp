@@ -40,12 +40,17 @@ typedef uint32_t gpr;
  */
 extern volatile uint8_t g_preempt_hint;
 void rt_preempt(void);
+#ifdef RT_ME_COPY
+/* The Media Engine's copies of game functions (scripts/me_copy.py) have no scheduler to enter. */
+#define RECOMP_PREEMPT() do { } while (0)
+#else
 #define RECOMP_PREEMPT()      \
     do {                      \
         if (g_preempt_hint) { \
             rt_preempt();     \
         }                     \
     } while (0)
+#endif
 
 #define RDRAM_SIZE 0x00400000u
 #define RDRAM_MASK (RDRAM_SIZE - 1)
@@ -207,7 +212,13 @@ static inline void do_swr(uint8_t* rdram, gpr offset, gpr reg, gpr val) {
 #define DDIVU(a, b, lo, hi) recomp_unsupported_64bit(__func__)
 
 /* FPU rounding mode (cop1 control register bits 0-1), tracked in software. */
+#ifdef RT_ME_COPY
+/* The Media Engine's own, in a cache line nothing else uses (audio/synth.c). */
+extern uint32_t me_fpu_round_mode[16];
+#define recomp_fpu_round_mode (me_fpu_round_mode[0])
+#else
 extern uint32_t recomp_fpu_round_mode;
+#endif
 
 static inline uint32_t get_cop1_cs(void) {
     return recomp_fpu_round_mode;
@@ -378,6 +389,9 @@ void rt_en_board_cursor(uint8_t* rdram, recomp_context* ctx);
 void rt_en_board_end(uint8_t* rdram, recomp_context* ctx);
 bool rt_en_resetti_match(uint8_t* rdram, recomp_context* ctx);
 bool rt_en_resetti_rude(uint8_t* rdram, recomp_context* ctx);
+/* runtime/src/audio/synth.c: the audio synthesis on the Media Engine */
+void rt_synth_before_build(uint8_t* rdram, recomp_context* ctx);
+void rt_synth_start(uint8_t* rdram, recomp_context* ctx);
 
 recomp_func_t* get_function(int32_t vram);
 

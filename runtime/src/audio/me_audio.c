@@ -20,6 +20,9 @@
  * flushes its cache before handing a task over and reads the samples through
  * the uncached alias. The handshake itself uses the uncached alias.
  *
+ * It also makes the command lists of the audio tasks (synth.c), as a second
+ * kind of job: an audio task waiting goes first.
+ *
  * Between tasks the ME also converts the game's samples to the DAC's rate, a
  * chunk at a time (rt_rs_me_poll, resample.c): its idle loop is that work
  * plus a look at two counters, and a task that arrives waits for one chunk at
@@ -39,6 +42,7 @@
 
 #include "me_audio.h"
 #include "resample.h"
+#include "synth.h"
 #include "rt.h"
 
 #define ME_TIMEOUT_US 200000
@@ -55,6 +59,15 @@ typedef struct {
     u32 starts;     /* times the ME has started our code */
     u32 fcr31;      /* its FPU control word at the first start, set again at every later one */
     AspTask task;
+    /* Synthesis jobs: synth_seq is bumped by the main CPU, synth_ack set to it
+     * by the ME when it is done with the job, having run it (synth_ran) or not.
+     * The main CPU can take a job back that the ME has not claimed: each
+     * side writes its flag, then reads the other's (rt_me_synth_collect). */
+    u32 synth_seq;
+    u32 synth_ack;
+    u32 synth_ran;
+    u32 synth_claim;
+    u32 synth_cancel;
 } __attribute__((aligned(64))) MeShared;
 
 static MeShared sShared;
@@ -105,6 +118,7 @@ static int start_me_core(void) {
 static bool sMeReady = false;
 static bool sMeStarted = false;   /* the ME runs our code (even if it timed out since) */
 static u32 sSubmitTime = 0;
+static u32 sSynthTime = 0;
 
 /* How many tasks the ME ran, and how often the main CPU had to wait for one. */
 static u32 sWaits = 0;
@@ -142,6 +156,20 @@ void meLibOnProcess(void) {
             done = seq;
             sh->out = out;
             sh->ack = seq;
+            meLibSync();
+        } else if (sh->synth_seq != sh->synth_ack) {
+            u32 job = sh->synth_seq;
+            sh->synth_claim = job;
+            meLibSync();
+            u32 run = sh->synth_cancel != job;
+            if (run) {
+                meLibDcacheWritebackInvalidateAll();
+                rt_synth_me_run((uint8_t*)sh->rdram);
+                /* Its results in memory before the main CPU hears it is done. */
+                meLibDcacheWritebackInvalidateAll();
+            }
+            sh->synth_ran = run;
+            sh->synth_ack = job;
             meLibSync();
         } else if (sh->quit != 0) {
             /* rt_me_audio_shutdown: the task in hand is done; stop for good. */
@@ -385,6 +413,60 @@ void rt_me_audio_shutdown(void) {
         rt_log("me: did not stop within 500 ms");
     }
     sMeStarted = false;
+}
+
+/* Hands the ME a synthesis job, whose data the main CPU has put in memory. */
+bool rt_me_synth_submit(void) {
+    volatile MeShared* sh = SHARED;
+    if (!sMeReady) {
+        return false;
+    }
+    sh->rdram = (u32)g_rdram;
+    sSynthTime = sceKernelGetSystemTimeLow();
+    sh->synth_seq = sh->synth_seq + 1;
+    return true;
+}
+
+static void wait_synth(void* arg) {
+    volatile MeShared* sh = SHARED;
+    while (sh->synth_ack != sh->synth_seq) {
+        if (sceKernelGetSystemTimeLow() - sSynthTime > ME_TIMEOUT_US) {
+            sMeReady = false;
+            kcall(hold_reset, 0);
+            rt_log("me: synthesis timed out (seq %u, ack %u, alive %u), stopped it; using the main CPU from now on",
+                   (unsigned)sh->synth_seq, (unsigned)sh->synth_ack, (unsigned)sh->alive);
+            return;
+        }
+        sceKernelDelayThread(100);
+    }
+}
+
+/*
+ * True if the ME ran the job, false if the main CPU has to. A job the ME has
+ * not claimed yet is taken back; the ME will see that and skip it. Checking
+ * (synth.c), the ME always gets it, and no other game thread runs meanwhile.
+ */
+bool rt_me_synth_collect(bool checking) {
+    volatile MeShared* sh = SHARED;
+    u32 job = sh->synth_seq;
+    if (sh->synth_ack == job) {
+        return sh->synth_ran != 0;
+    }
+    if (!checking) {
+        sh->synth_cancel = job;
+        asm volatile("sync" ::: "memory");
+        if (sh->synth_claim != job) {
+            return false;
+        }
+    }
+    uint64_t t0 = sceKernelGetSystemTimeWide();
+    if (checking) {
+        wait_synth(NULL);
+    } else {
+        rt_sched_native_wait(wait_synth, NULL);
+    }
+    g_audio_us += sceKernelGetSystemTimeWide() - t0;
+    return sh->synth_ack == job && sh->synth_ran != 0;
 }
 
 void rt_me_audio_submit(const AspTask* task) {

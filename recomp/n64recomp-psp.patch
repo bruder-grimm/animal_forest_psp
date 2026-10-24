@@ -13,25 +13,52 @@ index e7b4431..9cedd25 100644
      
      struct DataSymbol {
 diff --git a/include/recompiler/generator.h b/include/recompiler/generator.h
-index 145bcd0..c7f32dc 100644
+index 145bcd0..8243c0f 100644
 --- a/include/recompiler/generator.h
 +++ b/include/recompiler/generator.h
-@@ -5,6 +5,10 @@
+@@ -1,10 +1,31 @@
+ #ifndef __GENERATOR_H__
+ #define __GENERATOR_H__
+ 
++#include <unordered_map>
+ #include "recompiler/context.h"
  #include "operations.h"
  
  namespace N64Recomp {
 +    // PSP fork: GPRs as C locals (cgenerator.cpp).
 +    extern bool register_locals;
 +    std::string wrap_hook_text(const std::string& text);
++    // PSP fork, register_locals: per function, the a0-a3/sp it takes from the context (register
++    // number bits) and the v0/v1 its own instructions write (bits 0, 1) -- compute_register_flow.
++    extern std::vector<uint32_t> rl_inputs;
++    extern std::vector<uint8_t> rl_ret_writes;
++    // ... the FPU argument pairs it takes (bit 0: f12/f13, bit 1: f14/f15) and whether its own
++    // instructions write f0/f1 (bit 0).
++    extern std::vector<uint8_t> rl_finputs;
++    extern std::vector<uint8_t> rl_fret_writes;
++    // per call site ((function index << 32) | delay slot vram): the FPU argument pairs to write back --
++    // those the function set since its last call and the callee may read
++    extern std::unordered_map<uint64_t, uint8_t> rl_fflush;
++    extern uint32_t rl_cur_vram; // the instruction being emitted, and its function
++    extern size_t rl_cur_func;
++    // PSP fork: the FPU registers as C locals too (cgenerator.cpp; main.cpp sets it).
++    extern bool fpr_locals;
++    void compute_register_flow(const Context& context);
 +
      struct InstructionContext {
          int rd;
          int rs;
 diff --git a/src/cgenerator.cpp b/src/cgenerator.cpp
-index 94f85c5..29ef1e2 100644
+index 94f85c5..2fa272e 100644
 --- a/src/cgenerator.cpp
 +++ b/src/cgenerator.cpp
-@@ -78,13 +78,36 @@ static std::vector<BinaryOpFields> c_op_fields = []() {
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include <cstdlib>
+ #include <fstream>
+ 
+ #include "fmt/format.h"
+@@ -78,32 +79,95 @@ static std::vector<BinaryOpFields> c_op_fields = []() {
      return ret;
  }();
  
@@ -41,6 +68,10 @@ index 94f85c5..29ef1e2 100644
 +// back v0/v1. The saved registers never go through the context at all (the
 +// callee restores them). Hooks, syscalls and events see the whole register file.
 +bool N64Recomp::register_locals = false;
++// FPU registers as locals too (union fpr, one per register; FR=0, so an odd register's 32 bits are the
++// high half of the even one): a call writes back the f12/f14 pairs the callee takes, reads back f0;
++// a return writes back f0 if the function set it; hooks and syscalls see all of them.
++bool N64Recomp::fpr_locals = false;
 +
  static std::string gpr_to_string(int gpr_index) {
      if (gpr_index == 0) {
@@ -53,40 +84,106 @@ index 94f85c5..29ef1e2 100644
  }
  
 +// Text around a call of another function (pre, post), and around code that may read or write any register.
-+static const char* call_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ARGS(); " : ""; }
-+static const char* call_post() { return N64Recomp::register_locals ? " RL_RELOAD_RET();" : ""; }
-+static const char* all_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ALL(); " : ""; }
-+static const char* all_post() { return N64Recomp::register_locals ? " RL_RELOAD_ALL();" : ""; }
++static std::string fpr_flush_all();
++static std::string fpr_reload_all();
++static std::string fpr_flush(uint8_t pairs);
++static std::string fpr_reload_ret();
++// The FPU argument pairs to write back at the call being emitted (3: both, if the analysis didn't see it).
++static uint8_t fpr_flush_here(uint8_t fallback) {
++    auto it = N64Recomp::rl_fflush.find(((uint64_t)N64Recomp::rl_cur_func << 32) | N64Recomp::rl_cur_vram);
++    return it != N64Recomp::rl_fflush.end() ? it->second : fallback;
++}
++static std::string call_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ARGS(); " + fpr_flush(fpr_flush_here(3)) : ""; }
++static std::string call_post() { return N64Recomp::register_locals ? " RL_RELOAD_RET();" + fpr_reload_ret() : ""; }
++static std::string all_pre() { return N64Recomp::register_locals ? "RL_FLUSH_ALL(); " + fpr_flush_all() : ""; }
++static std::string all_post() { return N64Recomp::register_locals ? " RL_RELOAD_ALL();" + fpr_reload_all() : ""; }
 +
 +std::string N64Recomp::wrap_hook_text(const std::string& text) {
 +    if (!register_locals) {
 +        return text;
 +    }
-+    return fmt::format("{{ RL_FLUSH_ALL(); {} RL_RELOAD_ALL(); }}", text);
++    return fmt::format("{{ {} {} {} }}", all_pre(), text, all_post());
 +}
 +
++static const char* fpr_prefix() { return N64Recomp::fpr_locals ? "" : "ctx->"; }
++
  static std::string fpr_to_string(int fpr_index) {
-     return fmt::format("ctx->f{}.fl", fpr_index);
+-    return fmt::format("ctx->f{}.fl", fpr_index);
++    return fmt::format("{}f{}.fl", fpr_prefix(), fpr_index);
  }
-@@ -395,11 +418,15 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
+ 
+ static std::string fpr_double_to_string(int fpr_index) {
+-    return fmt::format("ctx->f{}.d", fpr_index);
++    return fmt::format("{}f{}.d", fpr_prefix(), fpr_index);
+ }
+ 
+ static std::string fpr_u32l_to_string(int fpr_index) {
+     if (fpr_index & 1) {
++        if (N64Recomp::fpr_locals) {
++            return fmt::format("f{}.u32h", fpr_index - 1); // (what ctx->f_odd reaches with FR=0)
++        }
+         return fmt::format("ctx->f_odd[({} - 1) * 2]", fpr_index);
+     }
+     else {
+-        return fmt::format("ctx->f{}.u32l", fpr_index);
++        return fmt::format("{}f{}.u32l", fpr_prefix(), fpr_index);
+     }
+ }
+ 
+ static std::string fpr_u64_to_string(int fpr_index) {
+-    return fmt::format("ctx->f{}.u64", fpr_index);
++    return fmt::format("{}f{}.u64", fpr_prefix(), fpr_index);
++}
++
++// Writing back / reading back FPU locals around calls and hooks.
++static std::string fpr_flush(uint8_t pairs /* bit 0: f12, bit 1: f14 */) {
++    if (!N64Recomp::fpr_locals) return "";
++    std::string out;
++    if (pairs & 1) out += "ctx->f12 = f12; ";
++    if (pairs & 2) out += "ctx->f14 = f14; ";
++    return out;
++}
++static std::string fpr_reload_ret() { return N64Recomp::fpr_locals ? " f0 = ctx->f0;" : ""; }
++static std::string fpr_flush_all() {
++    if (!N64Recomp::fpr_locals) return "";
++    std::string out;
++    for (int i = 0; i < 32; i++) out += fmt::format("ctx->f{0} = f{0}; ", i);
++    return out;
++}
++static std::string fpr_reload_all() {
++    if (!N64Recomp::fpr_locals) return "";
++    std::string out;
++    for (int i = 0; i < 32; i++) out += fmt::format(" f{0} = ctx->f{0};", i);
++    return out;
+ }
+ 
+ static std::string unsigned_reloc(const N64Recomp::InstructionContext& context) {
+@@ -394,12 +458,20 @@ void N64Recomp::CGenerator::get_binary_expr_string(BinaryOpType type, const Bina
+ 
  void N64Recomp::CGenerator::emit_function_start(const std::string& function_name, size_t func_index) const {
      (void)func_index;
++    fmt::print(output_file, "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* RECOMP_RESTRICT ctx) {{\n", function_name);
      fmt::print(output_file,
 -        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
-+        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* RECOMP_RESTRICT ctx) {{\n"
          // these variables shouldn't need to be preserved across function boundaries, so make them local for more efficient output
 -        "    uint64_t hi = 0, lo = 0, result = 0;\n"
+-        "    int c1cs = 0;\n", // cop1 conditional signal
+-        function_name);
 +        // (PSP fork: hi/lo are register-width so 32-bit targets don't carry 64-bit temporaries)
 +        "    gpr hi = 0, lo = 0; uint64_t result = 0;\n"
-         "    int c1cs = 0;\n", // cop1 conditional signal
-         function_name);
++        "    int c1cs = 0;\n"); // cop1 conditional signal
 +    if (register_locals) {
 +        fmt::print(output_file, "    RL_DECLARE();\n");
++    }
++    if (fpr_locals) {
++        std::string decl = "    fpr";
++        for (int i = 0; i < 32; i++) decl += fmt::format("{} f{} = ctx->f{}", i ? "," : "", i, i);
++        fmt::print(output_file, "{};\n", decl);
 +    }
  }
  
  void N64Recomp::CGenerator::emit_function_end() const {
-@@ -407,25 +434,25 @@ void N64Recomp::CGenerator::emit_function_end() const {
+@@ -407,25 +479,55 @@ void N64Recomp::CGenerator::emit_function_end() const {
  }
  
  void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
@@ -104,11 +201,41 @@ index 94f85c5..29ef1e2 100644
      const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
 -    fmt::print(output_file, "{}(rdram, ctx);\n", sym.name);
 +    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", call_pre(), sym.name, call_post());
++}
++
++// The write-back before a direct call: only what the callee takes from the context (rl_inputs).
++static std::string flush_for(size_t function_index) {
++    if (!N64Recomp::register_locals) {
++        return "";
++    }
++    if (function_index >= N64Recomp::rl_inputs.size()) {
++        return call_pre();
++    }
++    uint8_t fin = function_index < N64Recomp::rl_finputs.size() ? N64Recomp::rl_finputs[function_index] : 3;
++    uint32_t in = N64Recomp::rl_inputs[function_index];
++    // N64RECOMP_RL_POISON: what the callee shouldn't need is set to garbage instead, so that a reader the
++    // analysis missed fails loudly (a test build only).
++    static const bool poison = getenv("N64RECOMP_RL_POISON") != nullptr;
++    std::string out;
++    for (int r : {4, 5, 6, 7, 29}) {
++        if (in & (1u << r)) {
++            out += fmt::format("ctx->r{0} = r{0}; ", r);
++        } else if (poison) {
++            out += fmt::format("ctx->r{0} = 0xDEAD00{0:02X}; ", r);
++        }
++    }
++    out += fpr_flush(fpr_flush_here(fin));
++    if (poison && N64Recomp::fpr_locals) {
++        // what the callee shouldn't read at all
++        if (!(fin & 1)) out += "ctx->f12.u64 = 0x7FF0DEAD7FF0DEADull; ";
++        if (!(fin & 2)) out += "ctx->f14.u64 = 0x7FF0DEAD7FF0DEADull; ";
++    }
++    return out;
  }
  
  void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
 -    fmt::print(output_file, "{}(rdram, ctx);\n", context.functions[function_index].name);
-+    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", call_pre(), context.functions[function_index].name, call_post());
++    fmt::print(output_file, "{}{}(rdram, ctx);{}\n", flush_for(function_index), context.functions[function_index].name, call_post());
  }
  
  void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name) const {
@@ -117,16 +244,36 @@ index 94f85c5..29ef1e2 100644
  }
  
  void N64Recomp::CGenerator::emit_goto(const std::string& target) const {
-@@ -482,7 +509,7 @@ void N64Recomp::CGenerator::emit_return(const Context& context, size_t func_inde
+@@ -482,7 +584,18 @@ void N64Recomp::CGenerator::emit_return(const Context& context, size_t func_inde
      if (context.trace_mode) {
          fmt::print(output_file, "TRACE_RETURN()\n    ");
      }
 -    fmt::print(output_file, "return;\n");
-+    fmt::print(output_file, "{}return;\n", register_locals ? "RL_WRITE_RET(); " : "");
++    std::string ret;
++    if (register_locals) {
++        // only the v0/v1 this function's own instructions write: otherwise the local is what the context holds
++        uint8_t w = func_index < rl_ret_writes.size() ? rl_ret_writes[func_index] : 3;
++        if (w & 1) ret += "ctx->r2 = r2; ";
++        if (w & 2) ret += "ctx->r3 = r3; ";
++    }
++    if (fpr_locals) {
++        uint8_t fw = func_index < rl_fret_writes.size() ? rl_fret_writes[func_index] : 1;
++        if (fw & 1) ret += "ctx->f0 = f0; ";
++    }
++    fmt::print(output_file, "{}return;\n", ret);
  }
  
  void N64Recomp::CGenerator::emit_check_fr(int fpr) const {
-@@ -525,7 +552,8 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
+@@ -490,7 +603,7 @@ void N64Recomp::CGenerator::emit_check_fr(int fpr) const {
+ }
+ 
+ void N64Recomp::CGenerator::emit_check_nan(int fpr, bool is_double) const {
+-    fmt::print(output_file, "NAN_CHECK(ctx->f{}.{}); ", fpr, is_double ? "d" : "fl");
++    fmt::print(output_file, "NAN_CHECK({}f{}.{}); ", fpr_prefix(), fpr, is_double ? "d" : "fl");
+ }
+ 
+ void N64Recomp::CGenerator::emit_cop0_status_read(int reg) const {
+@@ -525,7 +638,8 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
              break;
          case InstrId::cpu_div:
              // Cast to 64-bits before division to prevent artihmetic exception for s32(0x80000000) / -1
@@ -136,7 +283,7 @@ index 94f85c5..29ef1e2 100644
              break;
          case InstrId::cpu_ddiv:
              fmt::print(output_file, "DDIV(S64({}), S64({}), &lo, &hi);\n", gpr_to_string(reg1), gpr_to_string(reg2));
-@@ -543,7 +571,7 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
+@@ -543,7 +657,7 @@ void N64Recomp::CGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2) co
  }
  
  void N64Recomp::CGenerator::emit_syscall(uint32_t instr_vram) const {
@@ -145,7 +292,7 @@ index 94f85c5..29ef1e2 100644
  }
  
  void N64Recomp::CGenerator::emit_do_break(uint32_t instr_vram) const {
-@@ -555,7 +583,7 @@ void N64Recomp::CGenerator::emit_pause_self() const {
+@@ -555,7 +669,7 @@ void N64Recomp::CGenerator::emit_pause_self() const {
  }
  
  void N64Recomp::CGenerator::emit_trigger_event(uint32_t event_index) const {
@@ -402,7 +549,7 @@ index 4fbd1ce..42c08c0 100644
              // This is safe to do as the entire full_immediate in present in relocs due to the pairing that was done earlier, so the HI16 does not
              // need to directly preceed the matching LO16 anymore.
 diff --git a/src/main.cpp b/src/main.cpp
-index 669c4a1..fe36cc9 100644
+index 669c4a1..fe81b24 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -12,7 +12,9 @@
@@ -443,15 +590,18 @@ index 669c4a1..fe36cc9 100644
      // Stub out any functions specified in the config file.
      for (const std::string& stubbed_func : config.stubbed_funcs) {
          // Check if the specified function exists.
-@@ -551,6 +567,7 @@ int main(int argc, char** argv) {
+@@ -551,6 +567,10 @@ int main(int argc, char** argv) {
  
      // Propogate the trace mode parameter.
      context.trace_mode = config.trace_mode;
 +    N64Recomp::register_locals = config.register_locals;
++    // (N64RECOMP_NO_FPR_LOCALS in the environment: the FPU registers in the context, as before -- for
++    // comparing the two in one binary.)
++    N64Recomp::fpr_locals = config.register_locals && getenv("N64RECOMP_NO_FPR_LOCALS") == nullptr;
  
      // Apply any single-instruction patches.
      for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
-@@ -731,6 +748,27 @@ int main(int argc, char** argv) {
+@@ -731,8 +751,35 @@ int main(int argc, char** argv) {
  
      std::vector<size_t> export_function_indices{};
  
@@ -478,8 +628,16 @@ index 669c4a1..fe36cc9 100644
 +
      bool failed_strict_mode = false;
  
++    // (N64RECOMP_NO_RL_FLOW in the environment: every call writes back all of a0-a3/sp and every
++    // return v0/v1, as before -- for comparing the two in one binary.)
++    if (N64Recomp::register_locals && getenv("N64RECOMP_NO_RL_FLOW") == nullptr) {
++        N64Recomp::compute_register_flow(context);
++    }
++
      //#pragma omp parallel for
-@@ -770,7 +808,7 @@ int main(int argc, char** argv) {
+     for (size_t i = 0; i < context.functions.size(); i++) {
+         const auto& func = context.functions[i];
+@@ -770,7 +817,7 @@ int main(int argc, char** argv) {
  
              // Recompile the function.
              if (config.single_file_output || config.functions_per_output_file > 1) {
@@ -488,7 +646,7 @@ index 669c4a1..fe36cc9 100644
                  if (!config.single_file_output) {
                      cur_file_function_count++;
                      if (cur_file_function_count >= config.functions_per_output_file) {
-@@ -785,7 +823,8 @@ int main(int argc, char** argv) {
+@@ -785,7 +832,8 @@ int main(int argc, char** argv) {
                  fmt::print(stderr, "Error recompiling {}\n", func.name);
                  std::exit(EXIT_FAILURE);
              }
@@ -498,7 +656,7 @@ index 669c4a1..fe36cc9 100644
              fmt::print(func_header_file,
                         "void {}(uint8_t* rdram, recomp_context* ctx);\n", func.name);
          }
-@@ -860,7 +899,7 @@ int main(int argc, char** argv) {
+@@ -860,7 +908,7 @@ int main(int argc, char** argv) {
              bool result;
              size_t prev_num_statics = static_funcs_by_section[new_func.section_index].size();
              if (config.single_file_output || config.functions_per_output_file > 1) {
@@ -507,7 +665,7 @@ index 669c4a1..fe36cc9 100644
                  if (!config.single_file_output) {
                      cur_file_function_count++;
                      if (cur_file_function_count >= config.functions_per_output_file) {
-@@ -892,6 +931,14 @@ int main(int argc, char** argv) {
+@@ -892,6 +940,14 @@ int main(int argc, char** argv) {
          }
      }
  
@@ -522,7 +680,7 @@ index 669c4a1..fe36cc9 100644
      if (config.has_entrypoint) {
          std::ofstream lookup_file{ config.output_func_path / "lookup.cpp" };
          
-@@ -929,7 +976,8 @@ int main(int argc, char** argv) {
+@@ -929,7 +985,8 @@ int main(int argc, char** argv) {
          for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
              const auto& section = context.sections[section_index];
              const auto& section_funcs = context.section_functions[section_index];
@@ -532,7 +690,7 @@ index 669c4a1..fe36cc9 100644
  
              if (section.has_mips32_relocs || !section_funcs.empty()) {
                  std::string_view section_name_trimmed{ section.name };
-@@ -957,8 +1005,12 @@ int main(int argc, char** argv) {
+@@ -957,8 +1014,12 @@ int main(int argc, char** argv) {
                  for (size_t func_index : section_funcs) {
                      const auto& func = context.functions[func_index];
                      size_t func_size = func.reimplemented ? 0 : func.words.size() * sizeof(func.words[0]);
@@ -547,10 +705,24 @@ index 669c4a1..fe36cc9 100644
                              func.name, func.rom - section.rom_addr, func_size);
                      }
 diff --git a/src/recompilation.cpp b/src/recompilation.cpp
-index c228433..37882d0 100644
+index c228433..602d8da 100644
 --- a/src/recompilation.cpp
 +++ b/src/recompilation.cpp
-@@ -128,7 +128,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+@@ -1,4 +1,5 @@
+ #include <vector>
++#include <algorithm>
+ #include <set>
+ #include <unordered_set>
+ #include <unordered_map>
+@@ -120,6 +121,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+     needs_link_branch = false;
+     is_branch_likely = false;
+     uint32_t instr_vram = instr.getVram();
++    N64Recomp::rl_cur_vram = instr_vram; // (a call is emitted right after its delay slot: the slot's vram then)
+     InstrId instr_id = instr.getUniqueId();
+ 
+     auto print_indent = [&]() {
+@@ -128,7 +130,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
  
      auto hook_find = func.function_hooks.find(instr_index);
      if (hook_find != func.function_hooks.end()) {
@@ -559,55 +731,69 @@ index c228433..37882d0 100644
          if (indent) {
              print_indent();
          }
-@@ -759,6 +759,120 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
+@@ -759,9 +761,406 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
      return true;
  }
  
-+// PSP fork: with register_locals the generated code trusts the calling
-+// convention. This flags the places in a function where it is not followed:
-+// a read of a temporary (at, v0-v1, t0-t9) that nothing in the function wrote
-+// first -- an input the caller left in a register the convention doesn't pass
-+// -- and a read of a temporary or an argument register after a call that
-+// nothing wrote since, other than the v0/v1 the callee returns. Must-written
-+// dataflow over the function's instructions; delay slots run before their
-+// branch takes effect, a likely branch's slot only on the taken path.
-+static void check_calling_convention(const N64Recomp::Context& context, const N64Recomp::Function& func,
-+                                     const std::vector<rabbitizer::InstructionCpu>& instructions,
-+                                     const N64Recomp::FunctionStats& stats) {
-+    using InstrId = rabbitizer::InstrId::UniqueId;
-+    const uint32_t TEMPS = (1u << 1) | (1u << 2) | (1u << 3) | (0xFFu << 8) | (1u << 24) | (1u << 25);
-+    const uint32_t ARGS = 0xFu << 4;
-+    const uint32_t ALL = 0xFFFFFFFFu;
++// PSP fork: the control flow of a function's instructions, for the register_locals analyses below.
++// A branch or jump and its delay slot are one node; the slot's instruction is a node of its own too,
++// for when something branches to it. edges[i]: (successor, registers the edge adds, whether a call
++// returns on it). Branches and jumps out of the function have no edge.
++namespace {
++using InstrId = rabbitizer::InstrId::UniqueId;
++struct FlowEdge { size_t to; uint32_t add; bool call; };
++
++uint32_t flow_writes(const rabbitizer::InstructionCpu& in) {
++    uint32_t w = 0;
++    if (in.modifiesRd()) w |= 1u << (int)in.GetO32_rd();
++    if (in.modifiesRt()) w |= 1u << (int)in.GetO32_rt();
++    if (in.modifiesRs()) w |= 1u << (int)in.GetO32_rs();
++    if (in.doesLink()) w |= 1u << 31;
++    return w;
++}
++
++uint32_t flow_reads(const rabbitizer::InstructionCpu& in) {
++    uint32_t r = 0;
++    if (in.readsRs()) r |= 1u << (int)in.GetO32_rs();
++    if (in.readsRt()) r |= 1u << (int)in.GetO32_rt();
++    if (in.readsRd()) r |= 1u << (int)in.GetO32_rd();
++    return r & ~1u;
++}
++
++// FPU registers by pair (FR=0: an odd register is the high half of the even one below it); bit k = f(2k), f(2k+1).
++uint32_t flow_fwrites(const rabbitizer::InstructionCpu& in) {
++    uint32_t w = 0;
++    if (in.modifiesFd()) w |= 1u << ((int)in.GetO32_fd() >> 1);
++    if (in.modifiesFs()) w |= 1u << ((int)in.GetO32_fs() >> 1);
++    if (in.modifiesFt()) w |= 1u << ((int)in.GetO32_ft() >> 1);
++    return w;
++}
++
++uint32_t flow_freads(const rabbitizer::InstructionCpu& in) {
++    uint32_t r = 0;
++    if (in.readsFd()) r |= 1u << ((int)in.GetO32_fd() >> 1);
++    if (in.readsFs()) r |= 1u << ((int)in.GetO32_fs() >> 1);
++    if (in.readsFt()) r |= 1u << ((int)in.GetO32_ft() >> 1);
++    return r;
++}
++
++bool flow_is_call(const rabbitizer::InstructionCpu& in, int64_t target_index) {
++    auto id = in.getUniqueId();
++    return id == InstrId::cpu_jal || id == InstrId::cpu_jalr ||
++           ((id == InstrId::cpu_bgezal || id == InstrId::cpu_bltzal) && target_index < 0);
++}
++
++std::vector<std::vector<FlowEdge>> flow_edges(const N64Recomp::Function& func,
++                                              const std::vector<rabbitizer::InstructionCpu>& instructions,
++                                              const N64Recomp::FunctionStats& stats) {
 +    size_t n = instructions.size();
-+    if (n == 0) {
-+        return;
-+    }
 +    auto index_of = [&](uint32_t vram) -> int64_t {
 +        if (vram < func.vram || vram >= func.vram + 4 * n) {
 +            return -1;
 +        }
 +        return (vram - func.vram) / 4;
 +    };
-+    auto writes = [](const rabbitizer::InstructionCpu& in) {
-+        uint32_t w = 0;
-+        if (in.modifiesRd()) w |= 1u << (int)in.GetO32_rd();
-+        if (in.modifiesRt()) w |= 1u << (int)in.GetO32_rt();
-+        if (in.modifiesRs()) w |= 1u << (int)in.GetO32_rs();
-+        if (in.doesLink()) w |= 1u << 31;
-+        return w;
-+    };
-+    auto reads = [](const rabbitizer::InstructionCpu& in) {
-+        uint32_t r = 0;
-+        if (in.readsRs()) r |= 1u << (int)in.GetO32_rs();
-+        if (in.readsRt()) r |= 1u << (int)in.GetO32_rt();
-+        if (in.readsRd()) r |= 1u << (int)in.GetO32_rd();
-+        return r & ~1u;
-+    };
-+    // A branch or jump and its delay slot are one node; the slot's instruction
-+    // is a node of its own too, for when something branches to it.
-+    // edges[i]: (successor, registers the edge adds, whether a call returns on it).
-+    struct Edge { size_t to; uint32_t add; bool call; };
-+    std::vector<std::vector<Edge>> edges(n);
++    std::vector<std::vector<FlowEdge>> edges(n);
 +    for (size_t i = 0; i < n; i++) {
 +        const auto& in = instructions[i];
 +        auto id = in.getUniqueId();
@@ -615,10 +801,8 @@ index c228433..37882d0 100644
 +            if (i + 1 < n) edges[i].push_back({i + 1, 0, false});
 +            continue;
 +        }
-+        uint32_t slot_w = writes(instructions[i + 1]);
-+        bool is_call = id == InstrId::cpu_jal || id == InstrId::cpu_jalr ||
-+                       ((id == InstrId::cpu_bgezal || id == InstrId::cpu_bltzal) && index_of(in.getBranchVramGeneric()) < 0);
-+        if (is_call) {
++        uint32_t slot_w = flow_writes(instructions[i + 1]);
++        if (flow_is_call(in, index_of(in.getBranchVramGeneric()))) {
 +            if (i + 2 < n) edges[i].push_back({i + 2, slot_w, true});
 +        } else if (id == InstrId::cpu_jr) {
 +            for (const auto& jtbl : stats.jump_tables) {
@@ -638,6 +822,276 @@ index c228433..37882d0 100644
 +            }
 +        }
 +    }
++    return edges;
++}
++} // namespace
++
++// PSP fork, register_locals: which of a0-a3 and sp each function may take from the context (it
++// reads them before writing them, itself or through what it calls), and which of v0/v1 its own
++// instructions write. A direct call then writes back only the callee's inputs, and a return only
++// the v0/v1 the function wrote: anything else in the context still holds what the callee will
++// find in its locals. Ignored, reimplemented, stubbed and hooked functions, and calls this cannot
++// resolve exactly as the code generator will (relocated, static, indirect, syscalls), take all of
++// them. Calls leave the caller's locals as they were, so they don't unset anything here.
++std::vector<uint32_t> N64Recomp::rl_inputs;
++std::vector<uint8_t> N64Recomp::rl_ret_writes;
++std::vector<uint8_t> N64Recomp::rl_finputs;
++std::vector<uint8_t> N64Recomp::rl_fret_writes;
++std::unordered_map<uint64_t, uint8_t> N64Recomp::rl_fflush;
++uint32_t N64Recomp::rl_cur_vram = 0;
++size_t N64Recomp::rl_cur_func = 0;
++
++void N64Recomp::compute_register_flow(const Context& context) {
++    const uint32_t ARGSP = (0xFu << 4) | (1u << 29);
++    // FPU argument pairs f12/f13 and f14/f15 (bits 6, 7 of a pair mask; bits 0, 1 of rl_finputs)
++    const uint32_t FARGS = (1u << 6) | (1u << 7);
++    size_t nf = context.functions.size();
++    rl_inputs.assign(nf, ARGSP);
++    rl_ret_writes.assign(nf, 3);
++    rl_finputs.assign(nf, 3);
++    rl_fret_writes.assign(nf, 1);
++    struct Site { uint32_t valid; uint32_t fvalid; int64_t callee; uint32_t vram = 0; }; // callee -1: anything
++    std::vector<uint32_t> direct(nf, ARGSP);
++    std::vector<uint32_t> fdirect(nf, FARGS);
++    std::vector<std::vector<Site>> sites(nf);
++    std::vector<bool> analysed(nf, false);
++    size_t unknown_sites = 0, known_sites = 0;
++    for (size_t fi = 0; fi < nf; fi++) {
++        const Function& func = context.functions[fi];
++        if (func.ignored || func.reimplemented || func.stubbed || func.words.empty() || !func.function_hooks.empty()) {
++            continue;
++        }
++        std::vector<rabbitizer::InstructionCpu> instructions;
++        instructions.reserve(func.words.size());
++        uint32_t vram = func.vram;
++        for (uint32_t word : func.words) {
++            instructions.emplace_back(byteswap(word), vram);
++            vram += 4;
++        }
++        FunctionStats stats{};
++        if (!analyze_function(context, func, instructions, stats)) {
++            continue;
++        }
++        size_t n = instructions.size();
++        auto edges = flow_edges(func, instructions, stats);
++        // valid[i]: of a0-a3/sp, those written on every path from the entry to i
++        std::vector<uint32_t> valid(n, ARGSP), fvalid(n, FARGS);
++        std::vector<bool> reached(n, false);
++        valid[0] = 0;
++        fvalid[0] = 0;
++        reached[0] = true;
++        std::vector<size_t> work{0};
++        while (!work.empty()) {
++            size_t i = work.back();
++            work.pop_back();
++            uint32_t out = (valid[i] | flow_writes(instructions[i])) & ARGSP;
++            uint32_t fout = (fvalid[i] | flow_fwrites(instructions[i])) & FARGS;
++            for (const FlowEdge& e : edges[i]) {
++                uint32_t v = (out | e.add) & ARGSP;
++                // (a delay slot's FPU writes: e.add only has GPRs, so a slot that writes f12/f14 is left out -- safe)
++                uint32_t fv = fout;
++                uint32_t merged = reached[e.to] ? (valid[e.to] & v) : v;
++                uint32_t fmerged = reached[e.to] ? (fvalid[e.to] & fv) : fv;
++                if (!reached[e.to] || merged != valid[e.to] || fmerged != fvalid[e.to]) {
++                    reached[e.to] = true;
++                    valid[e.to] = merged;
++                    fvalid[e.to] = fmerged;
++                    work.push_back(e.to);
++                }
++            }
++        }
++        const Section& section = context.sections[func.section_index];
++        // The callee as the code generator resolves it (print_func_call_by_address), or -1.
++        auto callee_of = [&](const rabbitizer::InstructionCpu& in) -> int64_t {
++            uint32_t target_section = func.section_index;
++            auto rit = std::lower_bound(section.relocs.begin(), section.relocs.end(), (uint32_t)in.getVram(),
++                                        [](const Reloc& r, uint32_t a) { return r.address < a; });
++            if (rit != section.relocs.end() && rit->address == in.getVram()) {
++                const Reloc& r = *rit;
++                if (r.reference_symbol || r.target_section == SectionEvent || r.type != RelocType::R_MIPS_26) {
++                    return -1;
++                }
++                if (r.target_section < 65500) {
++                    target_section = r.target_section;
++                }
++            }
++            size_t matched = (size_t)-1;
++            if (resolve_jal(context, target_section, (uint32_t)in.getBranchVramGeneric(), matched) != JalResolutionResult::Match) {
++                return -1;
++            }
++            return (int64_t)matched;
++        };
++        uint32_t d = 0, fd = 0;
++        uint8_t ret = 0, fret = 0;
++        for (size_t i = 0; i < n; i++) {
++            const auto& in = instructions[i];
++            uint32_t w = flow_writes(in);
++            uint32_t fw = flow_fwrites(in);
++            ret |= (uint8_t)(((w >> 2) & 1) | (((w >> 3) & 1) << 1));
++            fret |= (uint8_t)(fw & 1);
++            if (!reached[i]) continue;
++            d |= flow_reads(in) & ARGSP & ~valid[i];
++            fd |= flow_freads(in) & FARGS & ~fvalid[i];
++            if (!in.hasDelaySlot() || i + 1 >= n) {
++                auto id = in.getUniqueId();
++                if (id == InstrId::cpu_syscall || id == InstrId::cpu_break) {
++                    sites[fi].push_back({valid[i], fvalid[i], -1});
++                }
++                continue;
++            }
++            uint32_t slot_valid = (valid[i] | w) & ARGSP;
++            uint32_t slot_fvalid = (fvalid[i] | fw) & FARGS;
++            d |= flow_reads(instructions[i + 1]) & ARGSP & ~slot_valid;
++            fd |= flow_freads(instructions[i + 1]) & FARGS & ~slot_fvalid;
++            uint32_t at_site = (slot_valid | flow_writes(instructions[i + 1])) & ARGSP;
++            uint32_t at_fsite = (slot_fvalid | flow_fwrites(instructions[i + 1])) & FARGS;
++            auto id = in.getUniqueId();
++            uint32_t target = (uint32_t)in.getBranchVramGeneric();
++            bool outside = target < func.vram || target >= func.vram + 4 * n;
++            if (id == InstrId::cpu_jal) {
++                sites[fi].push_back({at_site, at_fsite, callee_of(in), (uint32_t)in.getVram()});
++            } else if (id == InstrId::cpu_jalr || id == InstrId::cpu_bgezal || id == InstrId::cpu_bltzal) {
++                if (id == InstrId::cpu_jalr || outside) sites[fi].push_back({at_site, at_fsite, -1, (uint32_t)in.getVram()});
++            } else if (id == InstrId::cpu_jr) {
++                bool table = false;
++                for (const auto& jtbl : stats.jump_tables) table |= jtbl.jr_vram == in.getVram();
++                if (!table && (int)in.GetO32_rs() != 31) {
++                    sites[fi].push_back({at_site, at_fsite, -1, (uint32_t)in.getVram()});
++                }
++            } else if ((in.isBranch() || id == InstrId::cpu_j) && outside) {
++                sites[fi].push_back({at_site, at_fsite, callee_of(in), (uint32_t)in.getVram()});
++            }
++        }
++        // a branch or jump that ends the instructions without its delay slot: no edge, nothing called
++        direct[fi] = d;
++        fdirect[fi] = fd;
++        rl_ret_writes[fi] = ret;
++        rl_fret_writes[fi] = fret;
++        analysed[fi] = true;
++    }
++    for (size_t fi = 0; fi < nf; fi++) {
++        if (analysed[fi]) {
++            rl_inputs[fi] = direct[fi];
++            rl_finputs[fi] = (uint8_t)(fdirect[fi] >> 6);
++        }
++        for (const Site& st : sites[fi]) (st.callee < 0 ? unknown_sites : known_sites)++;
++    }
++    // Fixed point: inputs only grow, from each function's own reads.
++    bool changed = true;
++    int rounds = 0;
++    while (changed) {
++        changed = false;
++        rounds++;
++        for (size_t fi = 0; fi < nf; fi++) {
++            if (!analysed[fi]) continue;
++            uint32_t in = rl_inputs[fi];
++            uint32_t fin = (uint32_t)rl_finputs[fi] << 6;
++            for (const Site& st : sites[fi]) {
++                uint32_t need = st.callee < 0 ? ARGSP : rl_inputs[(size_t)st.callee];
++                uint32_t fneed = st.callee < 0 ? FARGS : ((uint32_t)rl_finputs[(size_t)st.callee] << 6);
++                in |= need & ~st.valid;
++                fin |= fneed & ~st.fvalid;
++            }
++            if (in != rl_inputs[fi] || (fin >> 6) != rl_finputs[fi]) {
++                rl_inputs[fi] = in;
++                rl_finputs[fi] = (uint8_t)(fin >> 6);
++                changed = true;
++            }
++        }
++    }
++    // FPU argument pairs: written back before a call only if this function set them since its last call
++    // (or since its entry, when the locals were read from the context) and the callee may read them --
++    // what the old code, with the FPU registers in the context, left there. May-analysis, per call site
++    // (keyed by its delay slot's vram, where the code generator is when it emits the call).
++    size_t fsites = 0, fkept = 0;
++    for (size_t fi = 0; fi < nf; fi++) {
++        if (!analysed[fi]) continue;
++        const Function& func = context.functions[fi];
++        std::vector<rabbitizer::InstructionCpu> instructions;
++        instructions.reserve(func.words.size());
++        uint32_t vram = func.vram;
++        for (uint32_t word : func.words) {
++            instructions.emplace_back(byteswap(word), vram);
++            vram += 4;
++        }
++        FunctionStats stats{};
++        if (!analyze_function(context, func, instructions, stats)) continue;
++        size_t n = instructions.size();
++        auto edges = flow_edges(func, instructions, stats);
++        std::unordered_map<uint32_t, uint32_t> need_at; // call vram -> pairs the callee may read
++        for (const Site& st : sites[fi]) {
++            need_at[st.vram] = st.callee < 0 ? FARGS : ((uint32_t)rl_finputs[(size_t)st.callee] << 6);
++        }
++        std::vector<uint32_t> dirty(n, 0);
++        std::vector<bool> reached(n, false);
++        reached[0] = true;
++        std::vector<size_t> work{0};
++        while (!work.empty()) {
++            size_t i = work.back();
++            work.pop_back();
++            const auto& in = instructions[i];
++            uint32_t out = (dirty[i] | flow_fwrites(in)) & FARGS;
++            uint32_t slot_w = (in.hasDelaySlot() && i + 1 < n) ? (flow_fwrites(instructions[i + 1]) & FARGS) : 0;
++            for (const FlowEdge& e : edges[i]) {
++                uint32_t v = out | slot_w;
++                if (e.call) {
++                    auto it = need_at.find(in.getVram());
++                    uint32_t need = it != need_at.end() ? it->second : FARGS;
++                    v &= ~need; // written back at the call
++                }
++                if (!reached[e.to] || (dirty[e.to] | v) != dirty[e.to]) {
++                    reached[e.to] = true;
++                    dirty[e.to] |= v;
++                    work.push_back(e.to);
++                }
++            }
++        }
++        for (const Site& st : sites[fi]) {
++            int64_t i = ((int64_t)st.vram - (int64_t)func.vram) / 4;
++            if (i < 0 || (size_t)i >= n) continue;
++            uint32_t at = (dirty[i] | flow_fwrites(instructions[i])) & FARGS;
++            if (instructions[i].hasDelaySlot() && (size_t)i + 1 < n) at |= flow_fwrites(instructions[i + 1]) & FARGS;
++            uint32_t flush = at & need_at[st.vram];
++            rl_fflush[((uint64_t)fi << 32) | (st.vram + 4)] = (uint8_t)(flush >> 6);
++            fsites++;
++            fkept += __builtin_popcount(flush);
++        }
++    }
++    fmt::print("register flow: FPU argument pairs written back at {} of {} call-site slots\n", fkept, 2 * fsites);
++
++    size_t flushed = 0, full = 0;
++    for (size_t fi = 0; fi < nf; fi++) {
++        for (const Site& st : sites[fi]) {
++            uint32_t need = st.callee < 0 ? ARGSP : rl_inputs[(size_t)st.callee];
++            flushed += __builtin_popcount(need);
++            full += 5;
++        }
++    }
++    fmt::print("register flow: {} rounds, {} direct call sites resolved, {} not; {} of {} argument/sp write-backs kept\n",
++               rounds, known_sites, unknown_sites, flushed, full);
++}
++
++// PSP fork: with register_locals the generated code trusts the calling
++// convention. This flags the places in a function where it is not followed:
++// a read of a temporary (at, v0-v1, t0-t9) that nothing in the function wrote
++// first -- an input the caller left in a register the convention doesn't pass
++// -- and a read of a temporary or an argument register after a call that
++// nothing wrote since, other than the v0/v1 the callee returns. Must-written
++// dataflow over the function's instructions; delay slots run before their
++// branch takes effect, a likely branch's slot only on the taken path.
++static void check_calling_convention(const N64Recomp::Context& context, const N64Recomp::Function& func,
++                                     const std::vector<rabbitizer::InstructionCpu>& instructions,
++                                     const N64Recomp::FunctionStats& stats) {
++    const uint32_t TEMPS = (1u << 1) | (1u << 2) | (1u << 3) | (0xFFu << 8) | (1u << 24) | (1u << 25);
++    const uint32_t ARGS = 0xFu << 4;
++    const uint32_t ALL = 0xFFFFFFFFu;
++    size_t n = instructions.size();
++    if (n == 0) {
++        return;
++    }
++    auto edges = flow_edges(func, instructions, stats);
++    auto writes = flow_writes;
++    auto reads = flow_reads;
 +    // in_valid[i]: registers certainly written (or passed in) on every path to i.
 +    std::vector<uint32_t> in_valid(n, ALL);
 +    std::vector<bool> reached(n, false);
@@ -648,7 +1102,7 @@ index c228433..37882d0 100644
 +        size_t i = work.back();
 +        work.pop_back();
 +        uint32_t out = in_valid[i] | writes(instructions[i]);
-+        for (const Edge& e : edges[i]) {
++        for (const FlowEdge& e : edges[i]) {
 +            uint32_t v = out | e.add;
 +            if (e.call) {
 +                v = (v & ~(TEMPS | ARGS)) | (1u << 2) | (1u << 3);
@@ -680,7 +1134,11 @@ index c228433..37882d0 100644
  template <typename GeneratorType>
  bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context& context, size_t func_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
      const N64Recomp::Function& func = context.functions[func_index];
-@@ -781,7 +895,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
++    N64Recomp::rl_cur_func = func_index;
+     //fmt::print("Recompiling {}\n", func.name);
+     std::vector<rabbitizer::InstructionCpu> instructions;
+ 
+@@ -781,7 +1180,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
  
          auto hook_find = func.function_hooks.find(-1);
          if (hook_find != func.function_hooks.end()) {
@@ -689,7 +1147,7 @@ index c228433..37882d0 100644
          }
  
          // First pass, disassemble each instruction and collect branch labels
-@@ -806,6 +920,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
+@@ -806,6 +1205,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
              return false;
          }
  

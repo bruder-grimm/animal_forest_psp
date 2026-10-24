@@ -22,6 +22,7 @@
 
 #include "audio/me_audio.h"
 #include "audio/resample.h"
+#include "audio/synth.h"
 #include "rt.h"
 
 #define VI_NTSC_CLOCK 48681812
@@ -421,7 +422,7 @@ static void log_stats(void) {
     sProduced = sConsumed = 0;
 
     char me[32] = "";
-    char dma[96] = "";
+    char dma[160] = "";
     char rs[96] = "";
     rt_me_audio_report(me, sizeof(me));
     rt_rs_report(rs, sizeof(rs));
@@ -434,6 +435,7 @@ static void log_stats(void) {
         sOutRunPrev = run;
     }
     rt_dma_report(dma, sizeof(dma));
+    rt_synth_report(dma + strlen(dma), (int)(sizeof(dma) - strlen(dma)));
     rt_log("audio: %u tasks, fill %u, underruns %u, overflows %u, bad opcodes %u, rom blocks read %u (%u ms)%s cpu %u, retraces lost %u | hw %u late/%u chunks, worst gap %u us (chunk %u us) | %s | %s",
            (unsigned)sTaskCount, (unsigned)ring_fill(), (unsigned)sUnderruns, (unsigned)sOverflows,
            (unsigned)asp_opcode_counts[31], (unsigned)rt_rom_block_loads(), (unsigned)(rt_rom_block_us() / 1000), me,
@@ -468,6 +470,7 @@ void rt_audio_run_task(uint32_t task) {
         .data_ptr = rd_w32(task + 0x30),
         .data_size = rd_w32(task + 0x34),
     };
+    rt_synth_before_task(t.data_ptr, &t.data_size);
     /*
      * Both cores run these. The Media Engine takes the task unless it is still
      * working on the previous one -- in a busy village a task can outlast the

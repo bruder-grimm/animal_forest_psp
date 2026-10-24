@@ -35,7 +35,8 @@ runtime/
     sp.c                RSP tasks: graphics to gfx/, audio to audio.c
     audio.c             audio tasks, the AI, sound output
     audio/              the audio microcode (aspmain.c), the Media Engine (me_audio.c, me_boot.S),
-                        the output's rate conversion (resample.c)
+                        the output's rate conversion (resample.c), the game's synthesis on the
+                        Media Engine (synth.c, with copies of game functions from scripts/me_copy.py)
     gfx/                the renderer (see gfx/gfx_internal.h)
     english/            the game in English: dialogue, names, letters, menus, typing, dates
                         (see english/english.h)
@@ -53,13 +54,16 @@ the runtime into game functions (`[[patches.hook]]`), which is how the
 English text (`rt_en_*`) and overlay tracking work.
 `RT_STUB`/`RT_STUB_RETURN` (rt.h) declare the many that do nothing.
 
-**Registers.** The generated code keeps the MIPS registers in C locals
-(`register_locals` in the toml, `RL_*` in recomp_psp.h) and trusts the
-calling convention: at a call only a0-a3 and sp are written to `ctx`, after
-it only v0/v1 are read back, and a return writes v0/v1. So a replacement
-reads its arguments from `ctx` and writes its result there as before, but it
-must not expect the caller's other registers in `ctx`, and a callee's change
-to s0-s8 or sp never reaches the caller. Hooks are different: around one the
+**Registers.** The generated code keeps the MIPS registers, the FPU's
+included, in C locals (`register_locals` in the toml, `RL_*` in
+recomp_psp.h) and trusts the calling convention. The recompiler works out
+which of a0-a3/sp each game function reads, and at a call writes only those
+to `ctx` (all five for a call it can't follow or a function the runtime
+provides), plus f12/f14 when they were set since the last call; after the
+call it reads back v0/v1 and f0, and a return writes only the ones the
+function sets. So a replacement reads its arguments from `ctx` and writes its
+result there as before, but it must not expect the caller's other registers
+in `ctx`, and a callee's change to s0-s8 or sp never reaches the caller. Hooks are different: around one the
 whole register file goes through `ctx`, so `[[patches.hook]]` text may read
 and write any register. The recompiler reports code that doesn't follow the
 convention as `ABI:` lines in logs/recompile.log (five known, harmless).
@@ -97,7 +101,10 @@ sceGu; see the file list at the top of `gfx/gfx_internal.h`.
 microcode (audio/aspmain.c), checked bit-exact against the real microcode.
 On hardware they run on the Media Engine, the PSP's
 second CPU (audio/me_audio.c); anywhere else on the main CPU. The samples go
-to a ring buffer that a thread plays through sceAudio (audio.c).
+to a ring buffer that a thread plays through sceAudio (audio.c). On hardware
+the ME also makes the tasks' command lists -- the synthesis half of the
+game's audio frame, `func_800E319C_jp` -- with its own copies of the game's
+functions (audio/synth.c).
 
 ## Files next to the EBOOT
 
@@ -141,6 +148,8 @@ file.
 | `gfx_b.txt`, `game_b.txt` | in an A/B build (`scripts/gfx_ab.sh`, `game_ab.sh`), run the second copy of the renderer / the game code | spram.c, game_ab.c |
 | `no_me.txt` | run audio on the main CPU | audio/me_audio.c |
 | `no_me_resample.txt` | convert the output's rate on the main CPU, with the audio tasks still on the Media Engine | audio/resample.c |
+| `no_me_synth.txt` | make the audio tasks' command lists on the main CPU, with the tasks still on the Media Engine | audio/synth.c |
+| `check_me_synth.txt` | every 16th audio frame, make the command list both ways from the same RDRAM and log the words that differ (slow; without an ME the copies run on the main CPU) | audio/synth.c |
 | `log.txt` | write the log (`afpsp.log`, and to PSPLink's shell); without it nothing is logged, and only a fatal stop leaves its reason in `afpsp.log` | log.c |
 | `sync_log.txt` | the log, with every line written before going on (for a crash that loses the last lines) | log.c |
 | `audio_wav.txt` | `start length` (s): record the output to `afpsp_audio.wav` | audio.c |

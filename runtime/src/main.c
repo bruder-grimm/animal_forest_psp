@@ -22,11 +22,12 @@ PSP_HEAP_THRESHOLD_SIZE_KB(1024);
 
 /*
  * RDRAM, with zeros on both sides for generated code that steps just outside
- * it (MEM_PTR). Static, so it is at the same address in every run of a build:
- * the game threads' stacks hold pointers into it, and a capture keeps those
+ * it (MEM_PTR), and the Media Engine's game stack after it (RT_ME_STACK_TOP).
+ * Static, so it is at the same address in every run of a build: the game
+ * threads' stacks hold pointers into it, and a capture keeps those
  * (capture.c).
  */
-static uint8_t sRdramBlock[RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD] __attribute__((aligned(64)));
+static uint8_t sRdramBlock[RDRAM_GUARD + RDRAM_SIZE + RDRAM_GUARD + RT_ME_STACK_SIZE] __attribute__((aligned(64)));
 uint8_t* g_rdram = sRdramBlock + RDRAM_GUARD;
 
 /* ROM layout facts (makerom entry code: bss clear + stack setup). */

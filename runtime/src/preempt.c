@@ -16,7 +16,17 @@
  */
 #include "rt.h"
 
+static bool sHold = false;
+
+/* Keeps the running game thread from handing over at preemption points (synth.c's check). */
+void rt_preempt_hold(bool hold) {
+    sHold = hold;
+}
+
 void __attribute__((noinline)) rt_preempt(void) {
+    if (sHold) {
+        return;
+    }
     g_preempt_hint = 0;
     rt_process_external();
     rt_check_preempt();

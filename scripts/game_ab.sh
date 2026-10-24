@@ -11,11 +11,14 @@
 #        counts, without the code-growing passes, its hot functions grouped
 #        together. (Not -freorder-blocks-and-partition: the split-off halves are
 #        reached by 16-bit branches, which can't span the grouped hot code.)
+#   src  an A/B build whose second copy is compiled from another recompiler
+#        output, B_GEN (a work/recomp_out made by a changed recompiler): a
+#        recompiler change measured in one binary. The function lists must match.
 #
 # game_b.txt next to the PRX runs the second copy. Uses build/psp's runtime and
 # game objects: run gmake first. Output: build/ab/game_<MODE>/afpsp.prx (+ .elf).
 set -e
-MODE=${1:?usage: game_ab.sh aa|gen|pgo}
+MODE=${1:?usage: game_ab.sh aa|gen|pgo|src}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 PSPDEV=${PSPDEV:-$HOME/pspdev}
@@ -38,12 +41,12 @@ GROWTH_OFF="-fno-unroll-loops -fno-peel-loops -fno-tracer -fno-ipa-cp-clone -fno
  -fno-loop-interchange -fno-loop-unroll-and-jam -fno-tree-loop-distribution -fno-predictive-commoning
  -fno-unroll-completely-grow-size"
 
-compile_gen() { # dir extra-flags...
+compile_gen() { # dir extra-flags...  (sources from $SRC_GEN, default $GEN)
     local dir=$1; shift
     mkdir -p "$dir"
     local flags="$GEN_CFLAGS $*"
     export flags dir
-    ls $GEN/funcs_*.c | xargs -P "$JOBS" -I{} sh -c 'f={}; n=$(basename "${f%.c}"); psp-gcc $flags -c "$f" -o "$dir/$n.o"'
+    ls ${SRC_GEN:-$GEN}/funcs_*.c | xargs -P "$JOBS" -I{} sh -c 'f={}; n=$(basename "${f%.c}"); psp-gcc $flags -c "$f" -o "$dir/$n.o"'
 }
 
 RT_OBJS=$(for f in runtime/src/*.[cS] runtime/src/audio/*.[cS] runtime/src/english/*.[cS] runtime/src/gfx/*.[cS]; do
@@ -105,6 +108,11 @@ gen)
     rt=$(echo "$RT_OBJS" | grep -v '/gfx/gfx_worker.o$' | grep -v '/gfx/gfx_debug.o$')
     link "$rt $OUT/rt/gfx_worker.o $OUT/rt/gfx_debug.o" "$PGO_OBJ"/*.o -lgcov
     ;;
+src)
+    SRC_GEN=${B_GEN:?B_GEN=directory of the other recompiler output} compile_gen "$OUT/B"
+    pack_b "$OUT/B"/*.o
+    link "$RT_OBJS" $BASE/gen/*.o "$OUT/game_B.o" "$OUT/game_ab_pairs.o"
+    ;;
 pgo)
     compile_gen "$PGO_OBJ" -fprofile-use="$ROOT/$PGO_DIR" $PROFILE_PATH -fprofile-partial-training -fprofile-correction \
         $GROWTH_OFF ${PGO_FLAGS:-}
@@ -112,5 +120,5 @@ pgo)
     link "$RT_OBJS" $BASE/gen/*.o "$OUT/game_B.o" "$OUT/game_ab_pairs.o"
     ;;
 *)
-    echo "usage: game_ab.sh aa|gen|pgo"; exit 1 ;;
+    echo "usage: game_ab.sh aa|gen|pgo|src"; exit 1 ;;
 esac

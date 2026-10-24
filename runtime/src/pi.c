@@ -345,6 +345,11 @@ static void do_dma(uint32_t phys, uint32_t ram, uint32_t size, uint32_t directio
     rt_rom_read_to_rdram(rom_offset, ram, size);
 }
 
+/* A cartridge read done now, on the calling thread (audio/synth.c). */
+void rt_pi_read_now(uint32_t phys, uint32_t ram, uint32_t size) {
+    do_dma(phys, ram, size, 0);
+}
+
 static uint32_t read_io_word(uint32_t phys) {
     uint8_t b[4];
     uint32_t rom_offset = phys_to_rom(phys);

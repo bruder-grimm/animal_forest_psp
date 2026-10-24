@@ -157,6 +157,8 @@ void rt_cap_io(RtCapture* c, const char* tag, void* data, uint32_t size) {
 
 /* Every part, in order: the same code writes a capture and reads it back. */
 static void capture_state(RtCapture* c) {
+    /* A synthesis job still out finishes first: it posts messages. */
+    rt_synth_capture(c);
     /* The timers and the messages they post are copied at one moment: neither twice nor lost. */
     if (c->saving) {
         rt_timer_hold(true);
